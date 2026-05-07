@@ -142,8 +142,16 @@ void ExtMessagePool::complete_external_messages(std::vector<ExtMessage::Hash> to
       auto &msgs = ext_msgs_[priority];
       auto msg_opt = msgs.ext_messages_.find(msg_id);
       if (msg_opt && msgs.ext_messages_.size() < SOFT_MEMPOOL_LIMIT && msg_opt.value()->can_postpone()) {
+        LOG(WARNING) << "EXT_POOL postpone: hash=" << hash.to_hex() << " gen=" << msg_opt.value()->generation
+                     << " mempool=" << msgs.ext_messages_.size() << "/" << SOFT_MEMPOOL_LIMIT
+                     << " priority=" << priority;
         msg_opt.value()->postpone();
       } else {
+        if (msg_opt) {
+          LOG(WARNING) << "EXT_POOL erase-no-postpone: hash=" << hash.to_hex() << " gen=" << msg_opt.value()->generation
+                       << " mempool=" << msgs.ext_messages_.size() << "/" << SOFT_MEMPOOL_LIMIT
+                       << " can_postpone=" << msg_opt.value()->can_postpone();
+        }
         erase_message(priority, msg_id);
       }
     }
@@ -207,7 +215,22 @@ void ExtMessagePool::alarm() {
     cleanup_external_messages(ShardIdFull{basechainId, shardIdAll});
     cleanup_mempool_at_ = td::Timestamp::in(250.0);
   }
+  if (stats_log_at_.is_in_past()) {
+    size_t total_msgs = 0;
+    size_t addrs = 0;
+    for (auto &[prio, msgs] : ext_msgs_) {
+      total_msgs += msgs.ext_messages_.size();
+      addrs += msgs.ext_addr_messages_.size();
+    }
+    LOG(WARNING) << "EXT_POOL stats: total=" << total_msgs << "/" << SOFT_MEMPOOL_LIMIT
+                 << " unique_addrs=" << addrs << " check_ok=" << total_check_ext_messages_ok_
+                 << " check_err=" << total_check_ext_messages_error_
+                 << " applied_cleanup_req=" << applied_ext_msgs_delete_requests_
+                 << " applied_deleted=" << applied_ext_msgs_deleted_;
+    stats_log_at_ = td::Timestamp::in(1.0);
+  }
   alarm_timestamp().relax(cleanup_mempool_at_);
+  alarm_timestamp().relax(stats_log_at_);
   std::erase_if(callbacks_, [&](const std::unique_ptr<ExtMsgCallback> &callback) -> bool {
     if (callback->timeout && callback->timeout.is_in_past()) {
       return true;
@@ -223,8 +246,9 @@ void ExtMessagePool::add_message_to_mempool(td::Ref<ExtMessage> message, int pri
   StdSmcAddress addr = message->addr();
   auto &msgs = ext_msgs_[priority];
   if (msgs.ext_messages_.size() > opts_->max_mempool_num()) {
-    LOG(INFO) << "cannot add message addr=" << wc << ":" << addr.to_hex() << " prio=" << priority
-              << " to mempool: mempool is full (limit=" << opts_->max_mempool_num() << ")";
+    LOG(WARNING) << "EXT_POOL hard-full: hash=" << message->hash().to_hex() << " addr=" << wc << ":" << addr.to_hex()
+                 << " prio=" << priority << " mempool=" << msgs.ext_messages_.size() << "/"
+                 << opts_->max_mempool_num();
     return;
   }
   auto msg = std::make_shared<MempoolMsg>(message);
@@ -233,8 +257,9 @@ void ExtMessagePool::add_message_to_mempool(td::Ref<ExtMessage> message, int pri
   auto address = msg->address();
   auto it = msgs.ext_addr_messages_.find(address);
   if (it != msgs.ext_addr_messages_.end() && it->second.size() >= PER_ADDRESS_LIMIT) {
-    LOG(INFO) << "cannot add message addr=" << wc << ":" << addr.to_hex() << " prio=" << priority
-              << " to mempool: per address limit reached (limit=" << PER_ADDRESS_LIMIT << ")";
+    LOG(WARNING) << "EXT_POOL per-addr-mempool-limit: hash=" << message->hash().to_hex() << " addr=" << wc << ":"
+                 << addr.to_hex() << " prio=" << priority << " addr_msgs=" << it->second.size() << "/"
+                 << PER_ADDRESS_LIMIT;
     return;
   }
   auto it2 = ext_messages_hashes_.find(id.hash);

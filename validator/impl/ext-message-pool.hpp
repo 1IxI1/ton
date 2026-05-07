@@ -144,6 +144,7 @@ class ExtMessagePool : public td::actor::Actor {
   td::uint64 applied_ext_msgs_delete_requests_{0}, applied_ext_msgs_deleted_{0};
 
   td::Timestamp cleanup_mempool_at_ = td::Timestamp::now();
+  td::Timestamp stats_log_at_ = td::Timestamp::now();
 
   void add_message_to_mempool(td::Ref<ExtMessage> message, int priority, td::optional<td::uint32> msg_seqno);
   bool erase_message(int priority, const MessageId &id);
