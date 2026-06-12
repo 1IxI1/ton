@@ -59,8 +59,6 @@ void ExtMessagePool::install_collator_queue(ShardIdFull shard, std::unique_ptr<E
                      Bits256::zero()};
 
   // Take O(log n) shard slices from each priority level
-  using Treap = td::PersistentTreap<MessageId, std::shared_ptr<MempoolMsg>>;
-  using Snapshot = std::vector<std::pair<int, Treap>>;
   Snapshot snapshot;
   for (auto it = ext_msgs_.rbegin(); it != ext_msgs_.rend(); ++it) {
     auto [_, in_shard, __] = it->second.ext_messages_.split_range(shard_lo, shard_hi);
@@ -70,38 +68,8 @@ void ExtMessagePool::install_collator_queue(ShardIdFull shard, std::unique_ptr<E
   }
 
   // Spawn a coroutine that drains the shard slices randomly into the queue
-  auto push_existing = [](ExtMsgQueue queue, td::CancellationToken token, ShardIdFull shard, Snapshot snapshot,
-                          bool sync_only) -> td::actor::Task<> {
-    SCOPE_EXIT {
-      if (sync_only) {
-        queue.close();
-      }
-    };
-    td::Timer t;
-    size_t pushed = 0;
-    for (auto &[priority, treap] : snapshot) {
-      while (!treap.empty()) {
-        if (token.check().is_error()) {
-          co_return {};
-        }
-        size_t idx = td::Random::fast_uint32() % treap.size();
-        auto [key, msg] = treap.at(idx);
-        treap = treap.erase_at(idx);  // local snapshot only
-        if (msg->expired() || !msg->is_active()) {
-          continue;
-        }
-        bool ok = co_await queue.push(std::make_pair(msg->message, priority));
-        if (!ok) {
-          co_return {};
-        }
-        ++pushed;
-      }
-    }
-    LOG(WARNING) << "install_collator_queue: pushed " << pushed << " existing messages to shard " << shard << " in "
-                 << t.elapsed() << "s";
-    co_return {};
-  };
-  push_existing(callback->queue, callback->cancellation_token, shard, std::move(snapshot), callback->sync_only)
+  push_existing_to_queue(callback->queue, callback->cancellation_token, shard, std::move(snapshot),
+                         callback->sync_only)
       .start()
       .detach();
 
@@ -109,6 +77,46 @@ void ExtMessagePool::install_collator_queue(ShardIdFull shard, std::unique_ptr<E
     alarm_timestamp().relax(callback->timeout);
     callbacks_.push_back(std::move(callback));
   }
+}
+
+td::actor::Task<> ExtMessagePool::push_existing_to_queue(ExtMsgQueue queue, td::CancellationToken token,
+                                                         ShardIdFull shard, Snapshot snapshot, bool sync_only) {
+  // Runs detached on the pool actor: `this` stays valid for the lifetime of the process and
+  // accessing `held_externals_` after co_await is safe (we resume on the same actor).
+  SCOPE_EXIT {
+    if (sync_only) {
+      queue.close();
+    }
+  };
+  td::Timer t;
+  size_t pushed = 0;
+  size_t held = 0;
+  for (auto &[priority, treap] : snapshot) {
+    while (!treap.empty()) {
+      if (token.check().is_error()) {
+        co_return {};
+      }
+      size_t idx = td::Random::fast_uint32() % treap.size();
+      auto [key, msg] = treap.at(idx);
+      treap = treap.erase_at(idx);  // local snapshot only
+      if (msg->expired() || !msg->is_active()) {
+        continue;
+      }
+      if (is_held(key.hash)) {
+        // Already included in an in-flight candidate; don't offer it to this collation.
+        ++held;
+        continue;
+      }
+      bool ok = co_await queue.push(std::make_pair(msg->message, priority));
+      if (!ok) {
+        co_return {};
+      }
+      ++pushed;
+    }
+  }
+  LOG(WARNING) << "install_collator_queue: pushed " << pushed << " existing messages (" << held
+               << " held by in-flight candidates) to shard " << shard << " in " << t.elapsed() << "s";
+  co_return {};
 }
 
 void ExtMessagePool::cleanup_external_messages(ShardIdFull shard) {
@@ -193,12 +201,157 @@ bool ExtMessagePool::erase_message(int priority, const MessageId &id) {
   return true;
 }
 
+void ExtMessagePool::candidate_externals_seen(td::Bits256 candidate_id, std::vector<td::Ref<ExtMessage>> messages) {
+  if (messages.empty() || candidate_externals_.contains(candidate_id)) {
+    return;
+  }
+  while (candidate_externals_.size() >= MAX_TRACKED_CANDIDATES) {
+    // Bound memory: drop the record closest to expiry (unholds its externals).
+    auto victim = candidate_externals_.begin();
+    for (auto it = candidate_externals_.begin(); it != candidate_externals_.end(); ++it) {
+      if (it->second.expires_at < victim->second.expires_at) {
+        victim = it;
+      }
+    }
+    drop_candidate_externals(victim);
+  }
+  for (const auto &message : messages) {
+    ++held_externals_[message->hash()];
+  }
+  ++total_candidates_seen_;
+  total_ext_msgs_held_ += messages.size();
+  LOG(INFO) << "ext pool: holding " << messages.size() << " externals included in candidate "
+            << candidate_id.to_hex().substr(0, 16);
+  auto expires_at = td::Timestamp::in(CANDIDATE_EXTERNALS_TTL);
+  candidate_externals_.emplace(candidate_id, CandidateExternals{std::move(messages), expires_at});
+  alarm_timestamp().relax(expires_at);
+}
+
+void ExtMessagePool::history_collapsed(std::vector<td::Bits256> finalized, std::vector<td::Bits256> rejected) {
+  // Process the finalized chain first so that re-adding from rejected candidates can skip
+  // messages that also made it into the finalized chain.
+  size_t finalized_candidates = 0, dropped = 0;
+  for (const auto &candidate_id : finalized) {
+    auto it = candidate_externals_.find(candidate_id);
+    if (it == candidate_externals_.end()) {
+      continue;
+    }
+    ++finalized_candidates;
+    for (const auto &message : it->second.messages) {
+      auto hash = message->hash();
+      remember_finalized(hash);
+      remember_finalized(message->hash_norm());
+      unhold(hash);
+      // Erase the message and all its normalized duplicates from the mempool for good.
+      auto it_norm = ext_messages_hashes_norm_.find(message->hash_norm());
+      if (it_norm != ext_messages_hashes_norm_.end()) {
+        auto ids = it_norm->second;
+        for (const auto &message_id : ids) {
+          dropped += erase_message(message_id.priority, message_id.id);
+        }
+      }
+    }
+    total_ext_msgs_finalized_ += it->second.messages.size();
+    candidate_externals_.erase(it);
+  }
+  total_candidates_finalized_ += finalized_candidates;
+
+  size_t rejected_candidates = 0, readded = 0, skipped = 0;
+  for (const auto &candidate_id : rejected) {
+    auto it = candidate_externals_.find(candidate_id);
+    if (it == candidate_externals_.end()) {
+      continue;
+    }
+    ++rejected_candidates;
+    for (const auto &message : it->second.messages) {
+      auto hash = message->hash();
+      unhold(hash);
+      if (was_recently_finalized(hash) || was_recently_finalized(message->hash_norm()) || is_held(hash)) {
+        ++skipped;
+        continue;
+      }
+      if (readd_message(message)) {
+        ++readded;
+      }
+    }
+    candidate_externals_.erase(it);
+  }
+  total_candidates_rejected_ += rejected_candidates;
+  total_ext_msgs_readded_ += readded;
+
+  if (rejected_candidates != 0 || finalized_candidates != 0) {
+    LOG(WARNING) << "ext pool: readded " << readded << " externals from " << rejected_candidates
+                 << " rejected candidates (skipped " << skipped << " finalized-or-held); dropped " << dropped
+                 << " externals included in " << finalized_candidates << " finalized candidates";
+  }
+}
+
+void ExtMessagePool::unhold(const ExtMessage::Hash &hash) {
+  auto it = held_externals_.find(hash);
+  if (it == held_externals_.end()) {
+    return;
+  }
+  if (--it->second == 0) {
+    held_externals_.erase(it);
+  }
+}
+
+void ExtMessagePool::drop_candidate_externals(std::map<td::Bits256, CandidateExternals>::iterator it) {
+  // Candidate fate unknown (TTL or eviction): just make its externals available again. If it was
+  // actually finalized, the messages will be rejected as stale by the next collation and expire.
+  for (const auto &message : it->second.messages) {
+    unhold(message->hash());
+  }
+  candidate_externals_.erase(it);
+}
+
+bool ExtMessagePool::readd_message(const td::Ref<ExtMessage> &message) {
+  auto it = ext_messages_hashes_.find(message->hash());
+  if (it != ext_messages_hashes_.end()) {
+    // Still in the mempool (it was merely held); reactivate it in case completion postponed it
+    // and offer it to running collations right away.
+    auto [priority, id] = it->second;
+    auto msg_opt = ext_msgs_[priority].ext_messages_.find(id);
+    CHECK(msg_opt);
+    if (msg_opt.value()->expired()) {
+      return false;
+    }
+    msg_opt.value()->active = true;
+    msg_opt.value()->reactivate_at = {};
+    offer_to_callbacks(message, priority);
+    return true;
+  }
+  // Not in the mempool (e.g. only seen in a peer's candidate, or already erased as stale):
+  // insert it back. Note: this does not touch the per-address admission counter.
+  size_t before = ext_messages_hashes_.size();
+  add_message_to_mempool(message, 0, {});
+  return ext_messages_hashes_.size() != before;
+}
+
+void ExtMessagePool::offer_to_callbacks(const td::Ref<ExtMessage> &message, int priority) {
+  std::erase_if(callbacks_, [&](const std::unique_ptr<ExtMsgCallback> &callback) -> bool {
+    if (callback->cancellation_token.check().is_error()) {
+      return true;
+    }
+    if (shard_contains(callback->shard, message->shard())) {
+      callback->queue.try_push(std::make_pair(message, priority)).detach();
+    }
+    return false;
+  });
+}
+
 std::vector<std::pair<std::string, std::string>> ExtMessagePool::prepare_stats() {
   std::vector<std::pair<std::string, std::string>> vec;
   vec.emplace_back("total.ext_msg_check",
                    PSTRING() << "ok:" << total_check_ext_messages_ok_ << " error:" << total_check_ext_messages_error_);
   vec.emplace_back("total.ext_msg_applied_cleanup", PSTRING() << "requested:" << applied_ext_msgs_delete_requests_
                                                               << " deleted:" << applied_ext_msgs_deleted_);
+  vec.emplace_back("total.ext_msg_candidates", PSTRING() << "seen:" << total_candidates_seen_
+                                                         << " finalized:" << total_candidates_finalized_
+                                                         << " rejected:" << total_candidates_rejected_);
+  vec.emplace_back("total.ext_msg_simplex", PSTRING() << "held:" << total_ext_msgs_held_
+                                                      << " finalized:" << total_ext_msgs_finalized_
+                                                      << " readded:" << total_ext_msgs_readded_);
   return vec;
 }
 
@@ -209,6 +362,22 @@ void ExtMessagePool::alarm() {
     cleanup_mempool_at_ = td::Timestamp::in(250.0);
   }
   alarm_timestamp().relax(cleanup_mempool_at_);
+  for (auto it = candidate_externals_.begin(); it != candidate_externals_.end();) {
+    auto cur = it++;
+    if (cur->second.expires_at.is_in_past()) {
+      LOG(INFO) << "ext pool: candidate " << cur->first.to_hex().substr(0, 16) << " with "
+                << cur->second.messages.size() << " externals expired without a finalization verdict";
+      drop_candidate_externals(cur);
+    } else {
+      alarm_timestamp().relax(cur->second.expires_at);
+    }
+  }
+  if (rotate_finalized_externals_at_.is_in_past()) {
+    finalized_externals_prev_ = std::move(finalized_externals_cur_);
+    finalized_externals_cur_.clear();
+    rotate_finalized_externals_at_ = td::Timestamp::in(CANDIDATE_EXTERNALS_TTL);
+  }
+  alarm_timestamp().relax(rotate_finalized_externals_at_);
   std::erase_if(callbacks_, [&](const std::unique_ptr<ExtMsgCallback> &callback) -> bool {
     if (callback->timeout && callback->timeout.is_in_past()) {
       return true;
@@ -254,15 +423,9 @@ void ExtMessagePool::add_message_to_mempool(td::Ref<ExtMessage> message, int pri
   ext_messages_hashes_[id.hash] = {priority, id};
   ext_messages_hashes_norm_[hash_norm].insert(NormalizedMessageId{priority, id});
   LOG(INFO) << "adding message addr=" << wc << ":" << addr.to_hex() << " prio=" << priority << " to mempool";
-  std::erase_if(callbacks_, [&](const std::unique_ptr<ExtMsgCallback> &callback) -> bool {
-    if (callback->cancellation_token.check().is_error()) {
-      return true;
-    }
-    if (shard_contains(callback->shard, message->shard())) {
-      callback->queue.try_push(std::make_pair(message, priority)).detach();
-    }
-    return false;
-  });
+  if (!is_held(id.hash)) {
+    offer_to_callbacks(message, priority);
+  }
 }
 
 td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_message(td::Ref<ExtMessage> message,

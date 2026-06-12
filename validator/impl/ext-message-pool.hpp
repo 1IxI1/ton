@@ -42,6 +42,15 @@ class ExtMessagePool : public td::actor::Actor {
   void complete_external_messages(std::vector<ExtMessage::Hash> to_delay, std::vector<ExtMessage::Hash> to_delete);
   void erase_external_messages(std::vector<ExtMessage::Hash> to_delete);
 
+  // Simplex awareness: a candidate (ours or a peer's) includes these externals. Hold them so
+  // that the next collation does not double-include them, and remember them by candidate so they
+  // can be returned to the mempool if the candidate's history is later rejected.
+  void candidate_externals_seen(td::Bits256 candidate_id, std::vector<td::Ref<ExtMessage>> messages);
+  // A final certificate collapsed histories: externals of `finalized` candidates are dropped for
+  // good, externals of `rejected` candidates are re-added to the available set (unless they are
+  // also part of the finalized chain).
+  void history_collapsed(std::vector<td::Bits256> finalized, std::vector<td::Bits256> rejected);
+
   void update_last_masterchain_state(td::Ref<MasterchainState> state) {
     last_masterchain_state_ = std::move(state);
   }
@@ -145,6 +154,40 @@ class ExtMessagePool : public td::actor::Actor {
 
   td::Timestamp cleanup_mempool_at_ = td::Timestamp::now();
 
+  // ===== Simplex awareness =====
+  struct CandidateExternals {
+    std::vector<td::Ref<ExtMessage>> messages;
+    td::Timestamp expires_at;
+  };
+  std::map<td::Bits256, CandidateExternals> candidate_externals_;  // candidate id hash -> externals
+  std::map<ExtMessage::Hash, size_t> held_externals_;              // raw hash -> #in-flight candidates with it
+  // Raw and normalized hashes of externals recently seen in finalized candidates; two-generation
+  // rotation with a window covering CANDIDATE_EXTERNALS_TTL.
+  std::set<ExtMessage::Hash> finalized_externals_cur_, finalized_externals_prev_;
+  td::Timestamp rotate_finalized_externals_at_ = td::Timestamp::in(CANDIDATE_EXTERNALS_TTL);
+
+  td::uint64 total_candidates_seen_{0}, total_candidates_finalized_{0}, total_candidates_rejected_{0};
+  td::uint64 total_ext_msgs_held_{0}, total_ext_msgs_finalized_{0}, total_ext_msgs_readded_{0};
+
+  bool is_held(const ExtMessage::Hash &hash) const {
+    return held_externals_.contains(hash);
+  }
+  bool was_recently_finalized(const ExtMessage::Hash &hash) const {
+    return finalized_externals_cur_.contains(hash) || finalized_externals_prev_.contains(hash);
+  }
+  void remember_finalized(const ExtMessage::Hash &hash) {
+    finalized_externals_cur_.insert(hash);
+  }
+  void unhold(const ExtMessage::Hash &hash);
+  void drop_candidate_externals(std::map<td::Bits256, CandidateExternals>::iterator it);
+  // Returns true if the message is available in the mempool afterwards.
+  bool readd_message(const td::Ref<ExtMessage> &message);
+  void offer_to_callbacks(const td::Ref<ExtMessage> &message, int priority);
+
+  using Snapshot = std::vector<std::pair<int, td::PersistentTreap<MessageId, std::shared_ptr<MempoolMsg>>>>;
+  td::actor::Task<> push_existing_to_queue(ExtMsgQueue queue, td::CancellationToken token, ShardIdFull shard,
+                                           Snapshot snapshot, bool sync_only);
+
   void add_message_to_mempool(td::Ref<ExtMessage> message, int priority, td::optional<td::uint32> msg_seqno);
   bool erase_message(int priority, const MessageId &id);
 
@@ -173,6 +216,8 @@ class ExtMessagePool : public td::actor::Actor {
 
   std::vector<std::unique_ptr<ExtMsgCallback>> callbacks_;
 
+  static constexpr double CANDIDATE_EXTERNALS_TTL = 60.0;
+  static constexpr size_t MAX_TRACKED_CANDIDATES = 256;
   static constexpr double MAX_EXT_MSG_PER_ADDR_TIME_WINDOW = 10.0;
   static constexpr size_t MAX_EXT_MSG_PER_ADDR = 3 * 10;
   static constexpr size_t PER_ADDRESS_LIMIT = 256;
