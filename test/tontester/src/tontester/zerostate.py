@@ -134,6 +134,16 @@ GRAM = 1_000_000_000
 # AllOnes = (2^256 - 1) / 15 = 0x1111...1111
 _ALL_ONES = ((1 << 256) - 1) // 15
 
+# Global capability bits (ton/ton-types.h GlobalCapabilities).
+_CAP_CREATE_STATS = 2
+_CAP_BOUNCE_MSG_BODY = 4
+_CAP_REPORT_VERSION = 8
+_CAP_SHORT_DEQUEUE = 32
+_CAP_STORE_OUT_MSG_QUEUE_SIZE = 64
+_CAP_MSG_METADATA = 128
+_CAP_DEFER_MESSAGES = 256
+_CAP_FULL_COLLATED_DATA = 512
+
 
 @dataclass
 class SimplexConsensusConfig:
@@ -149,6 +159,9 @@ class NetworkConfig:
     monitor_min_split: int = 0
     split: int = 0
     global_version: int = 14
+    # Include capFullCollatedData in param 8 so shard-block validation runs
+    # purely from collated-data proofs (no celldb state reads); mainnet parity.
+    full_collated_data: bool = True
     shard_validators: int = 1
     block_limit_mul: int = 1
     gas_limit_mul: int = 1
@@ -371,8 +384,19 @@ def _build_config_params(
     mint_dict[239] = 666_666_666_666
     params.append(ConfigParam_7(to_mint=extra_currencies(dict=mint_dict)))
 
-    # Param 8: version + capabilities
-    cap_value = 2 | 4 | 8 | 32 | 64 | 128
+    # Param 8: version + capabilities.
+    # Mainnet parity (fetched 2026-06-12): version=14, capabilities=0x3EE.
+    cap_value = (
+        _CAP_CREATE_STATS
+        | _CAP_BOUNCE_MSG_BODY
+        | _CAP_REPORT_VERSION
+        | _CAP_SHORT_DEQUEUE
+        | _CAP_STORE_OUT_MSG_QUEUE_SIZE
+        | _CAP_MSG_METADATA
+        | _CAP_DEFER_MESSAGES
+    )
+    if config.full_collated_data:
+        cap_value |= _CAP_FULL_COLLATED_DATA
     params.append(
         ConfigParam_8(field=capabilities(version=config.global_version, capabilities=cap_value))
     )
@@ -522,37 +546,47 @@ def _build_config_params(
         )
     )
 
-    # Param 22: mc block limits
+    # Params 22/23: block limits. Baselines are the CURRENT mainnet values
+    # (fetched 2026-06-12 via toncenter getConfigParam); block_limit_mul scales
+    # the bytes/lt soft+hard limits and gas_limit_mul the gas soft+hard limits.
     mul = config.block_limit_mul
+
+    # Param 22: mc block limits (mainnet: bytes 128K/512K/1M, gas 200K/1M/2.5M,
+    # lt 1000/5000/10000)
     params.append(
         config_mc_block_limits(
             field=block_limits(
                 bytes=param_limits(
-                    underload=128 * 1024, soft_limit=512 * 1024 * mul, hard_limit=1024 * 1024 * mul
+                    underload=131_072, soft_limit=524_288 * mul, hard_limit=1_048_576 * mul
                 ),
                 gas=param_limits(
-                    underload=2_000_000,
-                    soft_limit=100_000_000 * gas_mul,
-                    hard_limit=100_000_000 * gas_mul,
+                    underload=200_000,
+                    soft_limit=1_000_000 * gas_mul,
+                    hard_limit=2_500_000 * gas_mul,
                 ),
-                lt_delta=param_limits(underload=1000, soft_limit=500_000, hard_limit=1_000_000),
+                lt_delta=param_limits(
+                    underload=1000, soft_limit=5000 * mul, hard_limit=10_000 * mul
+                ),
             )
         )
     )
 
-    # Param 23: block limits
+    # Param 23: block limits (mainnet: bytes 256K/1M/2M, gas 2M/10M/20M,
+    # lt 1000/5000/10000)
     params.append(
         config_block_limits(
             field=block_limits(
                 bytes=param_limits(
-                    underload=128 * 1024, soft_limit=512 * 1024 * mul, hard_limit=1024 * 1024 * mul
+                    underload=262_144, soft_limit=1_048_576 * mul, hard_limit=2_097_152 * mul
                 ),
                 gas=param_limits(
                     underload=2_000_000,
-                    soft_limit=100_000_000 * gas_mul,
-                    hard_limit=100_000_000 * gas_mul,
+                    soft_limit=10_000_000 * gas_mul,
+                    hard_limit=20_000_000 * gas_mul,
                 ),
-                lt_delta=param_limits(underload=1000, soft_limit=500_000, hard_limit=1_000_000),
+                lt_delta=param_limits(
+                    underload=1000, soft_limit=5000 * mul, hard_limit=10_000 * mul
+                ),
             )
         )
     )
@@ -612,8 +646,8 @@ def _build_config_params(
                 fast_attempts=3,
                 attempt_duration=8,
                 catchain_max_deps=4,
-                max_block_bytes=2097152,
-                max_collated_bytes=10485760,
+                max_block_bytes=2097152 * mul,
+                max_collated_bytes=10485760 * mul,
                 proto_version=5,
                 catchain_max_blocks_coeff=10000,
             )
