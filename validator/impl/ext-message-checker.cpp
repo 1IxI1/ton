@@ -22,7 +22,6 @@
 #include "td/utils/Timer.h"
 #include "vm/dict.h"
 
-#include "ext-message-pool.hpp"
 #include "fabric.h"
 
 namespace ton::validator {
@@ -38,12 +37,9 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
 
   WorkchainId wc = message->wc();
   StdSmcAddress addr = message->addr();
-
-  // Cheap per-address rate-limit check on the pool before the expensive stages (the pool
-  // re-checks it authoritatively when it bumps the counter at finalization).
-  timer = td::Timer();
-  co_await td::actor::ask(pool_, &ExtMessagePool::admission_precheck, wc, addr);
-  result.timings.precheck = timer.elapsed();
+  // Note: the per-address rate limit is enforced by the pool at finalization (a mid-check
+  // round-trip to the pool costs more than it saves: under load it adds milliseconds of
+  // pool-mailbox latency per message and idles the workers).
 
   timer = td::Timer();
   auto state = co_await resolve_state(mc_state, message->shard());

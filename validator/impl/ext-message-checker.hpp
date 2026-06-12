@@ -24,8 +24,6 @@
 
 namespace ton::validator {
 
-class ExtMessagePool;
-
 // Off-pool worker for the expensive, pool-state-independent part of external message admission:
 // TLB parse + size limits, account state resolution (cold celldb reads), wallet seqno extraction
 // and the full VM execution of recv_external (incl. the ed25519 signature check inside the VM).
@@ -35,15 +33,13 @@ class ExtMessagePool;
 // mempool/treap mutation, candidate holds) on the pool actor itself.
 class ExtMessageChecker : public td::actor::Actor {
  public:
-  ExtMessageChecker(td::actor::ActorId<ValidatorManager> manager, td::actor::ActorId<ExtMessagePool> pool)
-      : manager_(std::move(manager)), pool_(std::move(pool)) {
+  explicit ExtMessageChecker(td::actor::ActorId<ValidatorManager> manager) : manager_(std::move(manager)) {
   }
 
   // Per-stage wall-clock costs of one check, reported back with every result so the pool can
   // aggregate a per-stage cost map for its periodic admission stats.
   struct StageTimings {
     double parse{0};        // TLB validation + size limits
-    double precheck{0};     // round-trip to the pool for the per-address admission counter
     double fetch_state{0};  // shard state resolution (incl. waits) + per-mc-block config extraction
     double lookup{0};       // accounts dict descent (cold celldb reads land here)
     double vm{0};           // account unpack + full VM execution (incl. ed25519 inside the VM)
@@ -67,7 +63,6 @@ class ExtMessageChecker : public td::actor::Actor {
 
  private:
   td::actor::ActorId<ValidatorManager> manager_;
-  td::actor::ActorId<ExtMessagePool> pool_;
 
   // Per-masterchain-block caches. These are worker-local on purpose: ConfigInfo and dictionary
   // objects must not be shared across threads; the underlying state cells are shared and that

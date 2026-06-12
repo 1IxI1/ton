@@ -26,8 +26,7 @@ namespace ton::validator {
 void ExtMessagePool::init_checkers() {
   checker_inflight_.assign(NUM_CHECKERS, 0);
   for (size_t i = 0; i < NUM_CHECKERS; ++i) {
-    checkers_.push_back(
-        td::actor::create_actor<ExtMessageChecker>(PSTRING() << "extmsgcheck" << i, manager_, actor_id(this)));
+    checkers_.push_back(td::actor::create_actor<ExtMessageChecker>(PSTRING() << "extmsgcheck" << i, manager_));
   }
 }
 
@@ -78,7 +77,6 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   auto checked = r_checked.move_as_ok();
   auto &t = admission_window_.timings;
   t.parse += checked.timings.parse;
-  t.precheck += checked.timings.precheck;
   t.fetch_state += checked.timings.fetch_state;
   t.lookup += checked.timings.lookup;
   t.vm += checked.timings.vm;
@@ -90,6 +88,9 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   WorkchainId wc = message->wc();
   StdSmcAddress addr = message->addr();
   auto finalize = [&]() -> td::Result<CheckResult> {
+    if (checked_ext_msg_counter_.get_msg_count(wc, addr) >= MAX_EXT_MSG_PER_ADDR) {
+      return td::Status::Error(PSTRING() << "too many external messages to address " << wc << ":" << addr.to_hex());
+    }
     td::actor::StartedTask<> wait_allow_broadcast;
     if (checked.is_wallet) {
       TRY_RESULT_ASSIGN(wait_allow_broadcast, finalize_wallet_check(message, checked));
@@ -126,13 +127,6 @@ void ExtMessagePool::release_check_slot() {
     admission_waiters_.pop_front();
     waiter.set_value(td::Unit{});
   }
-}
-
-td::Result<td::Unit> ExtMessagePool::admission_precheck(WorkchainId wc, StdSmcAddress addr) {
-  if (checked_ext_msg_counter_.get_msg_count(wc, addr) >= MAX_EXT_MSG_PER_ADDR) {
-    return td::Status::Error(PSTRING() << "too many external messages to address " << wc << ":" << addr.to_hex());
-  }
-  return td::Unit{};
 }
 
 td::Result<td::actor::StartedTask<>> ExtMessagePool::finalize_wallet_check(
@@ -172,12 +166,10 @@ void ExtMessagePool::log_admission_stats() {
     char buf[320];
     snprintf(buf, sizeof(buf),
              "ext admission: in=%.0f/s admitted=%.0f/s rejected=%.0f/s busy_workers=%zu/%zu inflight=%zu wait_q=%zu "
-             "avg_check_ms=%.2f (parse=%.2f precheck=%.2f state=%.2f lookup=%.2f vm=%.2f)",
+             "avg_check_ms=%.2f (parse=%.2f state=%.2f lookup=%.2f vm=%.2f)",
              (double)w.in / dt, (double)w.admitted / dt, (double)w.rejected / dt, busy, checkers_.size(), inflight,
-             admission_waiters_.size(),
-             w.checked ? w.check_time / (double)w.checked * 1e3 : 0.0,
+             admission_waiters_.size(), w.checked ? w.check_time / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.parse / (double)w.checked * 1e3 : 0.0,
-             w.checked ? w.timings.precheck / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.fetch_state / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.lookup / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.vm / (double)w.checked * 1e3 : 0.0);

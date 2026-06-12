@@ -39,8 +39,6 @@ class ExtMessagePool : public td::actor::Actor {
     td::actor::StartedTask<> wait_allow_broadcast;
   };
   td::actor::Task<CheckResult> check_add_external_message(td::BufferSlice data, int priority, bool add_to_mempool);
-  // Cheap pre-check called back by ExtMessageChecker workers before the expensive stages.
-  td::Result<td::Unit> admission_precheck(WorkchainId wc, StdSmcAddress addr);
   void install_collator_queue(ShardIdFull shard, std::unique_ptr<ExtMsgCallback> callback);
   void cleanup_external_messages(ShardIdFull shard);
   void complete_external_messages(std::vector<ExtMessage::Hash> to_delay, std::vector<ExtMessage::Hash> to_delete);
@@ -253,7 +251,7 @@ class ExtMessagePool : public td::actor::Actor {
   static constexpr size_t PER_ADDRESS_LIMIT = 256;
   static constexpr size_t SOFT_MEMPOOL_LIMIT = 1024;
   static constexpr size_t NUM_CHECKERS = 16;
-  static constexpr size_t MAX_INFLIGHT_CHECKS = 4 * NUM_CHECKERS;
+  static constexpr size_t MAX_INFLIGHT_CHECKS = 8 * NUM_CHECKERS;
   static constexpr size_t MAX_ADMISSION_WAITERS = 20000;
   static constexpr double ADMISSION_STATS_PERIOD = 5.0;
 };
