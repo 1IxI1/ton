@@ -18,7 +18,9 @@
 */
 #include <algorithm>
 #include <cassert>
+#include <condition_variable>
 #include <ctime>
+#include <mutex>
 
 #include "adnl/utils.hpp"
 #include "block/block-auto.h"
@@ -30,6 +32,7 @@
 #include "td/actor/SharedFuture.h"
 #include "td/db/utils/BlobView.h"
 #include "td/utils/Random.h"
+#include "td/utils/port/thread.h"
 #include "ton/ton-io.hpp"
 #include "ton/ton-shard.h"
 #include "vm/boc.h"
@@ -55,6 +58,101 @@ static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
 
 static constexpr int MAX_ATTEMPTS = 5;
+
+namespace {
+
+/**
+ * Process-wide background thread pool that prefetches account paths from the accounts dictionary
+ * of a previous shard state.
+ *
+ * The collator's own account lookups are serial synchronous celldb reads: each account costs a
+ * dictionary descent of cold RocksDB point reads executed one after another on the collator
+ * thread. Whenever the collator learns about an account it will touch later in the same collation
+ * (destination of a newly-generated internal message, destination of a pending external), it
+ * enqueues a request here; a worker thread performs the same dictionary descent in the background
+ * so that by the time the collator reaches the account, the relevant cells are warm.
+ *
+ * Thread-safety: each request captures a Ref to the raw (not UsageCell-wrapped) accounts
+ * dictionary root of the previous shard state, so a walk never touches the collator's mutable
+ * AugmentedDictionary or the CellUsageTree (neither is thread-safe). The shared cell tree itself
+ * consists of immutable DataCells and ExtCells: concurrent ExtCell::load_data_cell() calls are
+ * thread-safe (td::AtomicRef + store_if_empty), and the celldb CellDbReader implementations
+ * backing the ExtCells document load_cell()/load_ext_cell() as thread-safe (the V1 reader even
+ * exists specifically "to make ExtCell thread safe", see DynamicBagOfCellsDb.cpp; the V2 reader
+ * is routinely shared between threads). As a bonus, a background walk materializes loaded
+ * DataCells into the very ExtCell instances the collator traverses later (the UsageCell-wrapped
+ * tree wraps the same underlying cells), so a prefetched account path usually requires no DB
+ * reads at all on the collator thread.
+ *
+ * Lifetime: a leaky singleton with detached worker threads; queued requests own everything they
+ * need (the root Ref keeps the celldb reader alive), so an aborted collation requires no cleanup.
+ * Prefetch is strictly best-effort: requests beyond the queue bound are dropped and all walk
+ * errors are swallowed.
+ */
+class AccountPrefetchPool {
+ public:
+  struct Request {
+    Ref<vm::Cell> accounts_dict_root;
+    ton::StdSmcAddress addr;
+  };
+
+  static AccountPrefetchPool& instance() {
+    static AccountPrefetchPool* pool = new AccountPrefetchPool{};  // leaky singleton
+    return *pool;
+  }
+
+  // Returns false if the queue is full and the request was dropped
+  bool try_enqueue(Request request) {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      if (queue_.size() >= MAX_QUEUE_SIZE) {
+        return false;
+      }
+      queue_.push(std::move(request));
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+ private:
+  static constexpr size_t MAX_QUEUE_SIZE = 8192;
+  static constexpr size_t WORKER_THREADS = 8;
+
+  AccountPrefetchPool() {
+    for (size_t i = 0; i < WORKER_THREADS; ++i) {
+      td::thread worker([this] { run(); });
+      worker.set_name(PSLICE() << "accprefetch#" << i);
+      worker.detach();
+    }
+  }
+
+  void run() {
+    while (true) {
+      Request request;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty(); });
+        request = std::move(queue_.front());
+        queue_.pop();
+      }
+      try {
+        // The result is discarded: the lookup is performed only to pull the cells along the
+        // account path into celldb caches and to materialize the shared ExtCell instances
+        vm::AugmentedDictionary dict{std::move(request.accounts_dict_root), 256, block::tlb::aug_ShardAccounts};
+        dict.lookup(request.addr.bits(), 256);
+      } catch (vm::VmError&) {
+        // prefetch is best-effort
+      } catch (vm::VmVirtError&) {
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<Request> queue_;
+};
+
+}  // namespace
 
 /**
  * Constructs a Collator object.
@@ -1143,6 +1241,8 @@ bool Collator::unpack_merge_last_state() {
   // 0. mechanically merge two ShardStateUnsplit into split_state constructor
   CHECK(prev_states.size() == 2);
   CHECK(prev_states.at(0).not_null() && prev_states.at(1).not_null());
+  init_account_prefetch(prev_states.at(0)->root_cell());
+  init_account_prefetch(prev_states.at(1)->root_cell());
   // create a virtual split_state ... = ShardState
   if (!block::gen::t_ShardState.cell_pack_split_state(prev_state_root_pure_, prev_states[0]->root_cell(),
                                                       prev_states[1]->root_cell())) {
@@ -1195,6 +1295,7 @@ bool Collator::unpack_last_state() {
   CHECK(prev_states.size() == 1);
   CHECK(prev_states.at(0).not_null());
   prev_state_root_pure_ = prev_states.at(0)->root_cell();
+  init_account_prefetch(prev_state_root_pure_);
   // prepare for creating a MerkleUpdate based on previous state
   state_usage_tree_ = std::make_shared<vm::CellUsageTree>();
   if (full_collated_data_ && !is_masterchain()) {
@@ -4846,6 +4947,93 @@ bool Collator::process_new_messages(bool& enqueue_only) {
     }
   }
   return true;
+}
+
+/**
+ * Captures the accounts dictionary root of a previous shard state for asynchronous account path prefetch.
+ *
+ * The root is taken from the raw (not UsageCell-wrapped) state root, so that background walks
+ * (see AccountPrefetchPool) never touch the collator's CellUsageTree or its mutable account_dict.
+ *
+ * @param pure_state_root Raw root cell of the previous shard state.
+ */
+void Collator::init_account_prefetch(const Ref<vm::Cell>& pure_state_root) {
+  if (is_masterchain()) {
+    // prefetch is aimed at basechain collation; masterchain accounts are few and warm
+    return;
+  }
+  try {
+    block::gen::ShardStateUnsplit::Record state;
+    if (!tlb::unpack_cell(pure_state_root, state)) {
+      return;  // prefetch is best-effort
+    }
+    auto accounts_root = vm::load_cell_slice(std::move(state.accounts)).prefetch_ref();
+    if (accounts_root.not_null()) {
+      prefetch_account_dict_roots_.push_back(std::move(accounts_root));
+    }
+  } catch (vm::VmError&) {
+  } catch (vm::VmVirtError&) {
+  }
+}
+
+/**
+ * Requests an asynchronous background walk of the accounts dictionary of the previous state,
+ * warming celldb caches for a future synchronous lookup of the same account by the collator.
+ *
+ * @param addr The address of the account that the collator is expected to touch later.
+ */
+void Collator::prefetch_account_path(const ton::StdSmcAddress& addr) {
+  if (prefetch_account_dict_roots_.empty()) {
+    return;
+  }
+  if (lookup_account(addr.bits())) {
+    return;  // already materialized in this collation
+  }
+  if (!prefetched_accounts_.insert(addr).second) {
+    return;  // already requested
+  }
+  auto& pool = AccountPrefetchPool::instance();
+  for (const auto& root : prefetch_account_dict_roots_) {
+    if (pool.try_enqueue({root, addr})) {
+      ++prefetch_issued_;
+    } else {
+      ++prefetch_dropped_;
+    }
+  }
+}
+
+/**
+ * Fires an account path prefetch for the destination of a message, if it is an internal message
+ * with a destination in this shard.
+ *
+ * @param msg The message (Message Any) root cell.
+ */
+void Collator::prefetch_msg_dest_account(const Ref<vm::Cell>& msg) {
+  if (prefetch_account_dict_roots_.empty()) {
+    return;
+  }
+  try {
+    auto cs = vm::load_cell_slice(msg);
+    if (block::gen::t_CommonMsgInfo.get_tag(cs) != block::gen::CommonMsgInfo::int_msg_info) {
+      return;
+    }
+    block::gen::CommonMsgInfo::Record_int_msg_info info;
+    if (!tlb::unpack(cs, info)) {
+      return;
+    }
+    WorkchainId dest_wc;
+    StdSmcAddress dest_addr;
+    if (!block::tlb::t_MsgAddressInt.extract_std_address(std::move(info.dest), dest_wc, dest_addr)) {
+      return;
+    }
+    if (dest_wc != workchain() || !is_our_address(dest_addr)) {
+      return;
+    }
+    prefetch_account_path(dest_addr);
+  } catch (vm::VmError&) {
+    // prefetch is best-effort
+  } catch (vm::VmVirtError&) {
+  }
 }
 
 /**

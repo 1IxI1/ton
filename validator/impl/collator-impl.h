@@ -252,6 +252,16 @@ class Collator final : public td::actor::Actor {
   std::set<td::Bits256> account_dict_estimator_added_accounts_;
   unsigned account_dict_ops_{0};
 
+  // Asynchronous prefetch of account paths in the accounts dictionary of the previous state
+  // (see AccountPrefetchPool in collator.cpp)
+  std::vector<Ref<vm::Cell>> prefetch_account_dict_roots_;
+  std::set<ton::StdSmcAddress> prefetched_accounts_;
+  td::uint32 prefetch_issued_{0};
+  td::uint32 prefetch_dropped_{0};
+  void init_account_prefetch(const Ref<vm::Cell>& pure_state_root);
+  void prefetch_account_path(const ton::StdSmcAddress& addr);
+  void prefetch_msg_dest_account(const Ref<vm::Cell>& msg);
+
   bool msg_metadata_enabled_ = false;
   bool deferring_messages_enabled_ = false;
   bool store_out_msg_queue_size_ = false;
