@@ -67,6 +67,7 @@ class BenchParams:
     keep_net: bool
     smoke: bool
     probe_addr: str | None
+    node_verbosity: int
 
 
 def _parse_args(argv: list[str] | None = None) -> BenchParams:
@@ -105,6 +106,12 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         default=None,
         help="wc0 account address (64 hex chars) to probe in --smoke mode",
     )
+    _ = parser.add_argument(
+        "--node-verbosity",
+        type=int,
+        default=1,
+        help="validator-engine log verbosity (keep low for high-rate runs)",
+    )
     args = parser.parse_args(argv)
     return BenchParams(
         manifest=cast(Path, args.manifest).absolute(),
@@ -119,6 +126,7 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         keep_net=cast(bool, args.keep_net),
         smoke=cast(bool, args.smoke),
         probe_addr=cast(str | None, args.probe_addr),
+        node_verbosity=cast(int, args.node_verbosity),
     )
 
 
@@ -293,7 +301,9 @@ async def _amain(params: BenchParams) -> int:
         )
 
         await dht.run()
-        await node.run(StartOptions(args=("--disable-state-serializer",)))
+        await node.run(
+            StartOptions(args=("--disable-state-serializer",), verbosity=params.node_verbosity)
+        )
 
         l.info(f"waiting for wc0 seqno >= {MIN_WC0_SEQNO} (proves the external state loaded)")
         async with asyncio.timeout(STARTUP_TIMEOUT):
