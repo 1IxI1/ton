@@ -65,6 +65,7 @@ class ExtMessageQ : public ExtMessage {
               ton::StdSmcAddress addr, Hash hash, Hash hash_norm);
   static td::Result<td::Ref<ExtMessageQ>> create_ext_message(td::BufferSlice data,
                                                              block::SizeLimitsConfig::ExtMsgLimits limits);
+  static td::Result<td::Ref<ExtMessageQ>> create_ext_message(td::Ref<vm::Cell> root);  // Skips message size checks.
   static td::Status run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
                                            td::Ref<vm::Cell> msg_root, std::unique_ptr<block::ConfigInfo> config);
 };

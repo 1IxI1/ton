@@ -128,6 +128,30 @@ td::Result<Ref<ExtMessageQ>> ExtMessageQ::create_ext_message(td::BufferSlice dat
   return Ref<ExtMessageQ>{true, std::move(data), std::move(ext_msg), dest_prefix, wc, addr, hash, hash_norm};
 }
 
+td::Result<Ref<ExtMessageQ>> ExtMessageQ::create_ext_message(Ref<vm::Cell> root) {
+  vm::CellSlice cs{vm::NoVmOrd{}, root};
+  if (cs.prefetch_ulong(2) != 2) {
+    return td::Status::Error("external message must begin with ext_in_msg_info$10");
+  }
+  ton::Bits256 hash{root->get_hash().bits()};
+  block::gen::CommonMsgInfo::Record_ext_in_msg_info info;
+  if (!tlb::unpack_cell_inexact(root, info)) {
+    return td::Status::Error("cannot unpack external message header");
+  }
+  auto dest_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.dest);
+  if (!dest_prefix.is_valid()) {
+    return td::Status::Error("destination of an inbound external message is an invalid blockchain address");
+  }
+  ton::StdSmcAddress addr;
+  ton::WorkchainId wc;
+  if (!block::tlb::t_MsgAddressInt.extract_std_address(info.dest, wc, addr)) {
+    return td::Status::Error(PSLICE() << "Can't parse destination address");
+  }
+  TRY_RESULT(hash_norm, get_ext_in_msg_hash_norm(root));
+  TRY_RESULT(data, vm::std_boc_serialize(root));
+  return Ref<ExtMessageQ>{true, std::move(data), std::move(root), dest_prefix, wc, addr, hash, hash_norm};
+}
+
 td::Status ExtMessageQ::run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
                                                td::Ref<vm::Cell> msg_root, std::unique_ptr<block::ConfigInfo> config) {
   Ref<vm::Cell> old_mparams;

@@ -111,6 +111,11 @@ td::Result<td::Ref<ExtMessage>> create_ext_message(td::BufferSlice data, block::
   return std::move(res);
 }
 
+td::Result<td::Ref<ExtMessage>> create_ext_message(td::Ref<vm::Cell> message) {
+  TRY_RESULT(res, ExtMessageQ::create_ext_message(std::move(message)));
+  return std::move(res);
+}
+
 td::Result<td::Ref<IhrMessage>> create_ihr_message(td::BufferSlice data) {
   TRY_RESULT(res, IhrMessageQ::create_ihr_message(std::move(data)));
   return std::move(res);
