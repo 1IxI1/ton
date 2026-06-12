@@ -94,6 +94,16 @@ class ManagerFacadeImpl : public ManagerFacade {
                             std::move(data), mode);
   }
 
+  void ext_messages_seen_in_candidate(td::Bits256 candidate_id, std::vector<td::Ref<ExtMessage>> messages) override {
+    td::actor::send_closure(manager_, &ValidatorManager::ext_messages_seen_in_candidate, candidate_id,
+                            std::move(messages));
+  }
+
+  void ext_messages_history_collapsed(std::vector<td::Bits256> finalized, std::vector<td::Bits256> rejected) override {
+    td::actor::send_closure(manager_, &ValidatorManager::ext_messages_history_collapsed, std::move(finalized),
+                            std::move(rejected));
+  }
+
   void update_collator_options(td::Ref<ValidatorManagerOptions> opts) {
     opts_ = std::move(opts);
   }
@@ -311,6 +321,7 @@ class BridgeImpl final : public IValidatorGroup {
     simplex::CandidateResolver::register_in(runtime);
     simplex::Consensus::register_in(runtime);
     simplex::Db::register_in(runtime);
+    simplex::ExternalsTracker::register_in(runtime);
     simplex::Pool::register_in(runtime);
     simplex::StateResolver::register_in(runtime);
 

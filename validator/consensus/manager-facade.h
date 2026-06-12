@@ -31,6 +31,17 @@ class ManagerFacade : public td::actor::Actor {
 
   virtual void send_block_candidate_broadcast(BlockIdExt id, td::BufferSlice data, int mode) {
   }
+
+  // External messages included in a candidate (ours or a peer's): the mempool should stop
+  // offering them to collations while the candidate's fate is undecided.
+  virtual void ext_messages_seen_in_candidate(td::Bits256 candidate_id, std::vector<td::Ref<ExtMessage>> messages) {
+  }
+
+  // A final certificate collapsed histories: candidates in `finalized` are now part of the chain
+  // (their externals must be dropped for good), candidates in `rejected` are discarded (their
+  // externals must be returned to the mempool).
+  virtual void ext_messages_history_collapsed(std::vector<td::Bits256> finalized, std::vector<td::Bits256> rejected) {
+  }
 };
 
 }  // namespace ton::validator::consensus

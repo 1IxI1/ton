@@ -95,6 +95,7 @@ set(VALIDATOR_SOURCE
   consensus/simplex/collator-schedule.cpp
   consensus/simplex/consensus.cpp
   consensus/simplex/db.cpp
+  consensus/simplex/externals-tracker.cpp
   consensus/simplex/pool.cpp
   consensus/simplex/state-resolver.cpp
   consensus/simplex/stats.cpp

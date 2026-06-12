@@ -340,6 +340,12 @@ class ValidatorManager : public ValidatorManagerInterface {
   virtual void complete_external_messages(std::vector<ExtMessage::Hash> to_delay,
                                           std::vector<ExtMessage::Hash> to_delete) = 0;
   virtual void cleanup_applied_external_messages(BlockHandle handle, td::Ref<BlockData> block) = 0;
+  // Simplex-aware mempool hooks: candidate inclusion holds externals, history collapse either
+  // drops them (finalized chain) or returns them to the mempool (rejected candidates).
+  virtual void ext_messages_seen_in_candidate(td::Bits256 candidate_id, std::vector<td::Ref<ExtMessage>> messages) {
+  }
+  virtual void ext_messages_history_collapsed(std::vector<td::Bits256> finalized, std::vector<td::Bits256> rejected) {
+  }
   virtual void complete_ihr_messages(std::vector<IhrMessage::Hash> to_delay,
                                      std::vector<IhrMessage::Hash> to_delete) = 0;
 

@@ -1257,6 +1257,18 @@ void ValidatorManagerImpl::cleanup_applied_external_messages(BlockHandle handle,
                           std::move(handle), std::move(block));
 }
 
+void ValidatorManagerImpl::ext_messages_seen_in_candidate(td::Bits256 candidate_id,
+                                                          std::vector<td::Ref<ExtMessage>> messages) {
+  td::actor::send_closure(ext_message_pool_, &ExtMessagePool::candidate_externals_seen, candidate_id,
+                          std::move(messages));
+}
+
+void ValidatorManagerImpl::ext_messages_history_collapsed(std::vector<td::Bits256> finalized,
+                                                          std::vector<td::Bits256> rejected) {
+  td::actor::send_closure(ext_message_pool_, &ExtMessagePool::history_collapsed, std::move(finalized),
+                          std::move(rejected));
+}
+
 void ValidatorManagerImpl::complete_ihr_messages(std::vector<IhrMessage::Hash> to_delay,
                                                  std::vector<IhrMessage::Hash> to_delete) {
 }

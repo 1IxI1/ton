@@ -133,4 +133,8 @@ struct DefaultCollatorSchedule {
   static void provide_for(td::actor::Runtime&);
 };
 
+struct ExternalsTracker {
+  static void register_in(td::actor::Runtime&);
+};
+
 }  // namespace ton::validator::consensus::simplex
