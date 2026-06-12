@@ -39,11 +39,17 @@ Hardware: /mnt/bench = 4TB Samsung 990 PRO (ext4, noatime). All big artifacts li
 - v5 wallet i: ed25519 seed = SHA256(seed || "w5" || u64le(i)). Data cell =
   `1(bit) | seqno=0:u32 | wallet_id=0:u32 | pubkey:256 | 0(bit, empty ext dict)` (322 bits).
   Address = SHA256(StateInit{code=W5, data}); StateInit = `00 1 ref(code) 1 ref(data) 0` (5 bits, 2 refs).
-- jetton wallet of owner O: data = `coins(JBAL) | addr_std(0,O) | addr_std(0,M) | ref(JW_CODE)`.
-- master M: minter data = `coins(total_supply) | addr_none | ref(empty content) | ref(JW_CODE)`
-  (per in-repo jetton-minter.fc layout), addr = SHA256(StateInit).
+- jetton wallet of owner O: stored data = `coins(JBAL) | addr_std(0,O) | addr_std(0,M) | ref(JW_CODE)`.
+  Its ADDRESS is SHA256(StateInit{JW_CODE, data with coins(0)}) — i.e. derived from the
+  zero-balance initial data, matching the jetton contracts'
+  calculate_user_jetton_wallet_address(); otherwise transfers would target a different
+  (uninitialized) account.
+- master M: minter data = `coins(total_supply = N*JBAL) | addr_none | ref(empty content) | ref(JW_CODE)`
+  (per in-repo jetton-minter.fc layout), addr = SHA256(StateInit). Balance 1 TON.
 - ballast i: addr = SHA256(seed || "bl" || u64le(i)); active account, shared trivial code
-  cell, data = chain of cells with splitmix64 filler keyed by (seed,i,k).
+  cell (bytes "tonbench-ballast"), data = chain of cells, 127 bytes splitmix64 filler each,
+  rng state per cell k seeded from (low 8 bytes of addr) ^ (0xB10A57C811 * (k+1))
+  (addr already encodes (seed, i)).
 - Balances: v5 = 100 TON, jw = 1 TON + 1e15 jetton units, ballast = 1 TON. last_paid = gen_utime.
 
 ## Account/state TLB (must byte-match what the validator expects)
