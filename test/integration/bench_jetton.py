@@ -69,6 +69,7 @@ class BenchParams:
     probe_addr: str | None
     node_verbosity: int
     engine_args: tuple[str, ...]
+    spam_args: tuple[str, ...]
 
 
 def _parse_args(argv: list[str] | None = None) -> BenchParams:
@@ -120,6 +121,13 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         dest="engine_args",
         help="extra validator-engine CLI arg (repeatable), e.g. --engine-arg=--celldb-cache-size=34359738368",
     )
+    _ = parser.add_argument(
+        "--spam-arg",
+        action="append",
+        default=[],
+        dest="spam_args",
+        help="extra bench-spam CLI arg (repeatable), e.g. --spam-arg=--connections=8",
+    )
     args = parser.parse_args(argv)
     return BenchParams(
         manifest=cast(Path, args.manifest).absolute(),
@@ -136,6 +144,7 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         probe_addr=cast(str | None, args.probe_addr),
         node_verbosity=cast(int, args.node_verbosity),
         engine_args=tuple(cast(list[str], args.engine_args)),
+        spam_args=tuple(cast(list[str], args.spam_args)),
     )
 
 
@@ -249,6 +258,7 @@ async def _run_spam(install: Install, repo_root: Path, node: FullNode, params: B
             str(results_json),
             "--blocks-csv",
             str(blocks_csv),
+            *params.spam_args,
         ]
     )
 
