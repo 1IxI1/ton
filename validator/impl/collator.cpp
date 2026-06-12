@@ -4399,9 +4399,10 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
     }
     auto ext_msg = ext_msg_ref->root_cell();
     ton::Bits256 hash{ext_msg->get_hash().bits()};
-    int r = process_external_message(std::move(ext_msg));
+    int r = process_external_message(ext_msg);
     if (r > 0) {
       ++stats_.ext_msgs_accepted;
+      accepted_ext_msgs_.push_back(std::move(ext_msg));
     } else {
       ++stats_.ext_msgs_rejected;
     }
@@ -6624,9 +6625,15 @@ bool Collator::create_block_candidate() {
   auto new_block_id_ext = ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(),
                                           block::compute_file_hash(blk_slice.as_slice())};
   // 3. create a BlockCandidate
-  block_candidate = std::make_unique<BlockCandidate>(params_.creator, new_block_id_ext,
-                                                     block::compute_file_hash(cdata_slice.as_slice()),
-                                                     blk_slice.clone(), cdata_slice.clone());
+  block_candidate = std::make_unique<BlockCandidate>(BlockCandidate{
+      params_.creator,
+      new_block_id_ext,
+      block::compute_file_hash(cdata_slice.as_slice()),
+      blk_slice.clone(),
+      cdata_slice.clone(),
+      {},
+      std::move(accepted_ext_msgs_),
+  });
   bool need_out_msg_queue_broadcasts = false;  // Not supported yet
   if (need_out_msg_queue_broadcasts) {
     // we can't generate two proofs at the same time for the same root (it is not currently supported by cells)

@@ -22,6 +22,7 @@
 #include <cinttypes>
 
 #include "crypto/common/bitstring.h"
+#include "crypto/vm/cells/Cell.h"
 #include "td/utils/Slice.h"
 #include "td/utils/UInt.h"
 #include "td/utils/Variant.h"
@@ -459,10 +460,19 @@ struct BlockCandidate {
 
   // used only locally
   std::vector<td::Ref<OutMsgQueueProofBroadcast>> out_msg_queue_proof_broadcasts = {};
+  // Externals accepted into this block; filled only for locally collated candidates.
+  std::optional<std::vector<td::Ref<vm::Cell>>> accepted_ext_messages = std::nullopt;
 
   BlockCandidate clone() const {
     return BlockCandidate{
-        pubkey, id, collated_file_hash, data.clone(), collated_data.clone(), out_msg_queue_proof_broadcasts};
+        pubkey,
+        id,
+        collated_file_hash,
+        data.clone(),
+        collated_data.clone(),
+        out_msg_queue_proof_broadcasts,
+        accepted_ext_messages,
+    };
   }
 };
 
