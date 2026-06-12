@@ -44,6 +44,8 @@ namespace ton {
 namespace validator {
 using td::Ref;
 
+struct CollatorIoMuxState;
+
 class Collator final : public td::actor::Actor {
  public:
   static constexpr int supported_version() {
@@ -127,6 +129,7 @@ class Collator final : public td::actor::Actor {
   void tear_down() override {
     ext_msg_cancellation_.cancel();
     ext_msg_queue_.close();
+    close_io_mux();
   }
 
   int verbosity{3 * 0};
@@ -257,52 +260,25 @@ class Collator final : public td::actor::Actor {
 
   // ===== io-mux: I/O multiplexing of account materialization during message intake =====
   //
-  // Account-path loads for UPCOMING messages run as awaitable walker coroutines over the raw
-  // (non-usage-tracked) previous-state cells, so celldb reads for the next several messages
-  // overlap with execution of the current one. Execution order and usage/proof recording are
-  // unchanged: the main loop merely awaits readiness before its usual synchronous lookups.
+  // Account-path loads for UPCOMING messages run as walker coroutines on the actor scheduler,
+  // operating over the raw (non-usage-tracked) previous-state cells, so celldb reads for the
+  // next several messages overlap with execution of the current one. Execution order and
+  // usage/proof recording are unchanged: the main loop merely awaits readiness before its usual
+  // synchronous lookups. All shared state lives in CollatorIoMuxState (thread-safe, owned via
+  // shared_ptr so that in-flight walks complete safely even if the collation aborts).
   // See the "io-mux" section in collator.cpp for the full design notes.
-  static constexpr size_t IO_MUX_WINDOW = 32;               // inbound-queue messages resolved ahead of execution
-  static constexpr size_t IO_MUX_MAX_CONCURRENT_WALKS = 8;  // bounded number of in-flight account path walks
-  static constexpr size_t IO_MUX_SHADOW_BATCH = 16;         // shadow queue walker: messages parsed per batch
-  static constexpr size_t IO_MUX_ACCOUNT_SUBTREE_CELLS = 64;  // account state cells materialized per account
-  static constexpr size_t IO_MUX_MSG_SUBTREE_CELLS = 8;       // message body cells materialized per inbound msg
-  struct AccountPathResolution {
-    bool done = false;
-    bool queued = false;
-    td::actor::StartedTask<td::Unit> task;
-    td::actor::StartedTask<td::Unit>::ExternalPromise waiter;
-  };
-  bool io_mux_enabled_ = false;
-  std::vector<Ref<vm::Cell>> io_mux_account_dict_roots_;  // raw accounts dict roots of the prev state(s)
-  std::map<ton::StdSmcAddress, AccountPathResolution> io_mux_resolutions_;
-  std::deque<ton::StdSmcAddress> io_mux_walk_queue_;
-  size_t io_mux_running_walks_{0};
-  td::uint32 io_mux_issued_{0};
-  td::uint32 io_mux_resolved_{0};
-  td::uint32 io_mux_awaits_{0};
-  double io_mux_wait_time_{0.0};
-  // Shadow walker over the raw inbound queues: discovers dest accounts of upcoming inbound
-  // internal messages and warms their queue/envelope cells, without touching usage trees.
+  std::shared_ptr<CollatorIoMuxState> io_mux_;
+  // raw (non-usage-tracked) queue roots of the neighbors, for the shadow inbound-queue walker
   std::map<BlockIdExt, Ref<vm::Cell>> io_mux_pure_queue_roots_;
-  std::shared_ptr<std::unique_ptr<block::OutputQueueMerger>> io_mux_shadow_merger_;
-  std::vector<block::OutputQueueMerger::Neighbor> io_mux_shadow_neighbors_;
-  td::actor::StartedTask<td::Unit> io_mux_shadow_task_;
-  bool io_mux_shadow_running_ = false;
-  bool io_mux_shadow_done_ = false;
-  size_t io_mux_shadow_extracted_{0};
-  size_t io_mux_inbound_processed_{0};
-  size_t io_mux_inbound_skip_offset_{0};  // queue entries deleted by cleanup; visible to the shadow only
 
   void init_io_mux(const Ref<vm::Cell>& pure_state_root);
   td::optional<ton::StdSmcAddress> get_msg_dest_in_shard(const Ref<vm::Cell>& msg) const;
   void issue_account_path_resolution(const ton::StdSmcAddress& addr);
-  void start_account_path_walk(const ton::StdSmcAddress& addr, AccountPathResolution& res);
-  td::actor::Task<td::Unit> account_path_walker(ton::StdSmcAddress addr);
-  void on_account_path_walk_done(const ton::StdSmcAddress& addr);
   td::actor::Task<> wait_account_path_resolved(ton::StdSmcAddress addr);
-  void pump_inbound_queue_shadow();
-  td::actor::Task<td::Unit> inbound_queue_shadow_batch(size_t batch);
+  void start_inbound_queue_shadow();
+  void note_inbound_msg_processed();
+  void close_io_mux();
+  void log_io_mux_stats();
 
   bool msg_metadata_enabled_ = false;
   bool deferring_messages_enabled_ = false;
