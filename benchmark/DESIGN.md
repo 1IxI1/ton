@@ -117,6 +117,30 @@ Recipient j = pseudorandom other wallet. Gas ≈ 20-25k total per transfer.
 - Expected mainnet-like ceiling ≈ 500-1000 jetton TPS (bytes soft limit 512KB);
   "unleashed" config (block_limit_mul≈40, gas_limit_mul≈10) probes the 1e4 goal.
 
+## bench-spam CLI contract (agreed between orchestrator and tool)
+
+```
+bench-spam --manifest <manifest.json> --contracts-dir <benchmark/contracts> \
+  --liteserver <ip>:<port> --liteserver-pubkey-b64 <base64 ed25519 pubkey> \
+  --rate <ext msgs/s> --duration <s> --warmup <s> --wallet-offset <first wallet idx> \
+  --track-sample 0.01 --out <results.json> --blocks-csv <blocks.csv>
+```
+
+Each run consumes wallets [offset, offset + rate*duration) — one external per wallet
+(seqno 0). Orchestrator advances offset between runs so seqnos stay valid without
+re-reading state. results.json schema (approximate, tool may extend):
+
+```json
+{"sent":N, "send_errors":N, "included":N, "duration_s":…, "rate_target":…,
+ "tps_included":…, "jetton_tps":…,
+ "inclusion_latency_ms":{"p50":…,"p90":…,"p99":…,"mean":…},
+ "chain_latency_ms":{"p50":…,"p90":…,"p99":…,"samples":N},
+ "blocks":[{"seqno":…,"utime":…,"observed_at_unix_ms":…,"n_txs":…}, …]}
+```
+
+The orchestrator (`test/integration/bench_jetton.py`) needs from tontester:
+`FullNode.liteserver_endpoint()` → (host, port, pubkey_b64).
+
 ## Build
 
 New top-level `benchmark/` dir, added via add_subdirectory in root CMakeLists (pattern:
