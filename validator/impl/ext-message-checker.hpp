@@ -74,6 +74,9 @@ class ExtMessageChecker : public td::actor::Actor {
   // is safe (same pattern as collator/liteserver sharing wait_block_state results).
   BlockIdExt config_mc_block_id_;
   std::unique_ptr<block::ConfigInfo> config_;
+  // Prepared transaction phase configs, keyed by (wc, state utime); cleared whenever config_
+  // refreshes. Saves re-fetching all config params for every message.
+  std::map<std::pair<WorkchainId, UnixTime>, std::unique_ptr<ExtMessageQ::ExecutionConfig>> exec_configs_;
 
   struct CachedState {
     BlockIdExt block_id;

@@ -62,10 +62,22 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
   }
   acc.block_lt = state.lt;
 
+  // NOTE: exec_config stays valid below because nothing in between actually suspends (the
+  // co_awaits unwrap ready td::Result values); only this worker's tasks mutate exec_configs_.
+  auto &exec_config = exec_configs_[{wc, state.utime}];
+  if (exec_config == nullptr) {
+    exec_config = co_await ExtMessageQ::ExecutionConfig::create(*config_, wc, state.utime);
+    if (exec_configs_.size() > 16) {
+      std::erase_if(exec_configs_,
+                    [&](const auto &kv) { return kv.second == nullptr || kv.first.second + 60 < state.utime; });
+    }
+  }
+
   const WalletMessageProcessor *wallet =
       acc.code.not_null() ? WalletMessageProcessor::get(acc.code->get_hash().bits()) : nullptr;
   if (wallet == nullptr) {
-    co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(), *config_);
+    co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(),
+                                                 *exec_config);
     result.timings.vm = timer.elapsed();
     co_return result;
   }
@@ -90,7 +102,8 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
   // performs it at finalization (after this VM run instead of before it — same admission verdict).
   acc.data = co_await wallet->set_wallet_seqno(acc.data, msg_seqno);
   acc.storage_dict_hash = acc.orig_storage_dict_hash = {};
-  co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(), *config_);
+  co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(),
+                                               *exec_config);
   result.timings.vm = timer.elapsed();
   result.is_wallet = true;
   result.msg_seqno = msg_seqno;
@@ -108,6 +121,7 @@ td::actor::Task<ExtMessageChecker::ResolvedState> ExtMessageChecker::resolve_sta
   if (config_ == nullptr || config_mc_block_id_ != mc_state->get_block_id()) {
     config_ = co_await block::ConfigInfo::extract_config(mc_state->root_cell(), mc_state->get_block_id(), 0xFFFF);
     config_mc_block_id_ = mc_state->get_block_id();
+    exec_configs_.clear();
   }
 
   BlockIdExt block_id;
