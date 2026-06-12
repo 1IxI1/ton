@@ -225,6 +225,6 @@ budget at parity config.
   mainnet 22/23 block limits as mul baselines; verified wc0 validation reads no celldb
   state (r300 run: 586 tps included, validation pure-CPU ~28ms mean).
 - W1/W2: blocked on P0
-- W3: pending
-- W4: pending
+- W3: done (merged) — simplex-aware ext pool: candidates hold externals, history collapse re-adds rejected blocks' externals; 8.7x goodput on the unleashed collapse scenario; unit tests in test/validator/test-ext-message-pool.cpp
+- W4: done (merged) — liteserver advertised tip never outruns the shard client; inverted "possibly out of sync" diagnostic fixed; 0 desync errors under load
 - W5: blocked on P0
