@@ -152,3 +152,75 @@ uv run python test/integration/bench_jetton.py \
   --rate 600 --duration 180 --warmup 20 \
   --net-dir /mnt/bench/net-bench --out-dir /mnt/bench/results/my-run
 ```
+
+---
+
+# Phase 2: single-shard optimization toward 10⁴ jetton TPS (2026-06-12)
+
+Goal: push the single-shard, disk-bound (state ≫ RAM) regime as far toward 10⁴ jetton
+TPS as possible without compromising correctness or (more than minimally) public ABI.
+All work on branch `bench-jetton-tps`; plan + per-workstream findings in PHASE2.md.
+
+## The ladder (208 GB-class state, mainnet-parity limits, 400 ms blocks, cold caches)
+
+| step | steady jetton TPS | what changed |
+|---|---|---|
+| phase-1 baseline | 84 | — |
+| + phase-1 prefetch | 132 | fire-and-forget account prefetch pool |
+| + C0 mainnet parity | 195 | full collated data (param-8 cap 0x3EE), real mainnet block limits (1 MB soft bytes); validation = pure CPU ~28 ms, zero celldb reads |
+| + W5 celldb bundling | 210–219 | 'bundle' records (tag −2): 5-level dict slabs + leaf/account/data bundles; 93→30 device reads per transfer; bundled state /mnt/bench/state-full-b5 (256 GB, root hash identical) |
+| + W1 io-mux (+W3/W4/W7) | 221–238 | awaited account-path walkers replace the prefetch pool; account/queue I/O wait → 0 |
+| + W6 window-cadence fix | (in next row) | speculative cross-window collation on self-parents; boundary stall 92–180 ms → ≤9 ms |
+| + W8 device split | **313–330** | fsync-heavy DBs (consensus, statedb, archive) moved off the read device; no durability relaxation |
+
+Raw TPS at the final config: ~940–990 tx/s sustained, cadence steady at 402 ms.
+Latency: saturated runs are backlog-dominated (p50 tens of seconds); sub-saturation
+inclusion p50 remains ≈ 2 block cycles.
+
+## What we learned (bottleneck chain, in discovery order)
+
+1. Serial celldb descents on the collator thread (phase 1) — fixed by W5 (fewer reads)
+   × W1 (overlapped reads, no lingering threads: bounded awaited walkers).
+2. Block limits were never the binder at mainnet values once validation went
+   collated-data-only (C0); ×10 limits change nothing on the disk-bound state.
+3. Candidate-loss collapse under overload — W3's simplex-aware mempool (hold per
+   candidate, re-add on history collapse) = 8.7× goodput in the collapse regime; plus
+   the phase-1 soft-timeout cascade deferral.
+4. Admission ceiling ~4 k ext/s — W7's worker-pool checker sustains ~8 k/s admitted
+   (the VM check ~1 ms/msg is the remaining floor).
+5. Leader-window boundary stall (P0: 92 ms, grown to 160–180 ms with fatter blocks) —
+   W6 speculation on self-produced parents only; foreign parents still require local
+   validation before collation (load-bearing safety property, per review).
+6. fsync/jbd2 interference: ~122 syncs/s (archive index 55/s, simplex DB 38/s) forcing
+   ~114 journal commits/s on the read device — W8 device split: +15–18%, no durability
+   loss. Default-off relaxed-sync engine flags exist for measurement only.
+7. Liteserver advertised-tip desync (W4) and an inverted "out of sync" diagnostic —
+   fixed; advertised tips are now always servable.
+
+## Where the next factor of ~30 lives (to reach 10⁴)
+
+Measured residuals at the final config:
+- ~120–130 ms/block of genuine cold-read latency inside intake that io-mux depth
+  doesn't yet hide (deeper windows + W5 bundle aging + admission/collation I/O
+  interference at high rates are the levers; archive temp-index write coalescing is a
+  cheap +).
+- Serialize/proof tail ~78–89 ms/block — W6 produced a safe overlap design
+  (block-id/file-hash ordering constraint), not yet implemented.
+- Per-transfer CPU ≈ 0.5 ms single-threaded — the hard wall. **W2 cross-account
+  parallel execution** (design note in W1's report: per-account lanes, commit-ordered
+  lt assignment, usage-tree replay at commit; blocks valid but not bit-identical —
+  acceptable since the collator defines the block) is the only path to 10⁴ on one
+  shard: ~12 k tx per 400 ms needs ~15–20 effective cores in execution plus
+  admission scaled to ~10 k VM checks/s (~12 cores) — i.e. 10⁴ single-shard is a
+  full-machine parallel-execution project, not a tuning exercise. Realistic stacked
+  estimate short of W2: intake-bound ~500–700 jTPS.
+
+## Reproducing the final number
+
+```sh
+uv run python test/integration/bench_jetton.py \
+  --manifest /mnt/bench/state-full-b5/manifest.json \
+  --net-dir <dir-on-other-ssd> --celldb-checkpoint-dir /mnt/bench/work/ckpt \
+  --rate 1200 --duration 180 --warmup 15 --spam-arg=--connections=8
+```
+Results: /mnt/bench/results/p2-FINAL-r1200 (330 jTPS steady).
