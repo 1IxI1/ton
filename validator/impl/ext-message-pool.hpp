@@ -252,7 +252,7 @@ class ExtMessagePool : public td::actor::Actor {
   static constexpr size_t SOFT_MEMPOOL_LIMIT = 1024;
   static constexpr size_t NUM_CHECKERS = 24;
   static constexpr size_t MAX_INFLIGHT_CHECKS = 8 * NUM_CHECKERS;
-  static constexpr size_t MAX_ADMISSION_WAITERS = 20000;
+  static constexpr size_t MAX_ADMISSION_WAITERS = 60000;
   static constexpr double ADMISSION_STATS_PERIOD = 5.0;
 };
 
