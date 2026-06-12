@@ -87,6 +87,7 @@ struct SpamOptions {
   td::uint64 presign = 0;  // presign buffer size; 0 = auto
   int signer_threads = 0;  // 0 = auto
   td::uint64 index = 0;    // for the addr subcommand
+  bool force_fallback = false;  // start in listBlockTransactions mode (testing)
 };
 
 struct Bits256Hash {
@@ -480,6 +481,7 @@ class SpamRunner : public td::actor::Actor {
   }
 
   void start_up() override {
+    fallback_mode_ = opts_.force_fallback;
     start_time_ = td::Time::now();
     unix_offset_ = td::Clocks::system() - start_time_;
     last_tick_ = start_time_;
@@ -1376,6 +1378,8 @@ int main(int argc, char *argv[]) {
     TRY_RESULT_ASSIGN(opts.signer_threads, td::to_integer_safe<int>(arg));
     return opts.signer_threads >= 0 ? td::Status::OK() : td::Status::Error("--signer-threads must be >= 0");
   });
+  p.add_option('\0', "force-fallback", "start in listBlockTransactions mode (for testing the fallback path)",
+               [&] { opts.force_fallback = true; });
   p.add_checked_option('\0', "index", "wallet index (addr subcommand)", [&](td::Slice arg) {
     TRY_RESULT_ASSIGN(opts.index, td::to_integer_safe<td::uint64>(arg));
     return td::Status::OK();
