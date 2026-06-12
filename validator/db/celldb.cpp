@@ -248,6 +248,12 @@ void CellDbIn::start_up() {
     LOG(WARNING) << "Set CellDb block cache size to " << td::format::as_size(o_celldb_cache_size.value());
   }
   db_options.use_direct_reads = opts_->get_celldb_direct_io();
+  // Relaxed sync (--celldb-relaxed-sync): per-block cell commits skip the WAL fsync
+  // (the WAL is still pushed to the OS page cache). Crash window: on kernel panic /
+  // power loss the celldb may lose its most recent commits and revert to an earlier
+  // consistent point while statedb/archive already reference the newer states; the
+  // node then needs a resync/re-apply of those blocks. Process crashes are safe.
+  db_options.relaxed_write_sync = opts_->get_celldb_relaxed_sync();
 
   // NB: from now on we MUST use this merge operator
   // Only V2 and InMemory BoC actually use them, but it still should be kept for V1,

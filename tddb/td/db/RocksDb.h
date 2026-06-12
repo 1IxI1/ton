@@ -75,6 +75,13 @@ struct RocksDbOptions {
   bool no_block_cache = false;
   bool enable_bloom_filter = false;
   bool two_level_index_and_filter = false;
+
+  // Commit write batches / transactions without fsyncing the WAL. The WAL is still
+  // flushed to the OS page cache, so committed data survives a process crash but the
+  // tail may be lost on kernel panic / power failure (the DB then recovers to an
+  // earlier consistent point). Only enable for databases whose recent writes may be
+  // safely re-derived or re-synced after such a loss.
+  bool relaxed_write_sync = false;
 };
 
 class RocksDb : public KeyValue {

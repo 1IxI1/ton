@@ -143,6 +143,12 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   bool get_celldb_disable_bloom_filter() const override {
     return celldb_disable_bloom_filter_;
   }
+  bool get_celldb_relaxed_sync() const override {
+    return celldb_relaxed_sync_;
+  }
+  bool get_consensus_db_relaxed_sync() const override {
+    return consensus_db_relaxed_sync_;
+  }
   bool get_unsynced_liteserver() const override {
     return unsynced_liteserver_;
   }
@@ -263,6 +269,12 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   void set_celldb_disable_bloom_filter(bool value) override {
     celldb_disable_bloom_filter_ = value;
   }
+  void set_celldb_relaxed_sync(bool value) override {
+    celldb_relaxed_sync_ = value;
+  }
+  void set_consensus_db_relaxed_sync(bool value) override {
+    consensus_db_relaxed_sync_ = value;
+  }
   void set_unsynced_liteserver(bool value) override {
     unsynced_liteserver_ = value;
   }
@@ -349,6 +361,8 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   bool celldb_in_memory_ = false;
   bool celldb_v2_ = false;
   bool celldb_disable_bloom_filter_ = false;
+  bool celldb_relaxed_sync_ = false;
+  bool consensus_db_relaxed_sync_ = false;
   bool unsynced_liteserver_ = false;
   bool state_serializer_enabled_ = true;
   td::Ref<CollatorOptions> collator_options_{true};

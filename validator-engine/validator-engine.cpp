@@ -1657,6 +1657,8 @@ td::Status ValidatorEngine::load_global_config() {
   validator_options_.write().set_celldb_in_memory(celldb_in_memory_);
   validator_options_.write().set_celldb_v2(!celldb_in_memory_ && !permanent_celldb_);
   validator_options_.write().set_celldb_disable_bloom_filter(celldb_disable_bloom_filter_);
+  validator_options_.write().set_celldb_relaxed_sync(celldb_relaxed_sync_);
+  validator_options_.write().set_consensus_db_relaxed_sync(consensus_db_relaxed_sync_);
   validator_options_.write().set_unsynced_liteserver(unsynced_liteserver_);
   validator_options_.write().set_max_open_archive_files(max_open_archive_files_);
   validator_options_.write().set_archive_preload_period(archive_preload_period_);
@@ -5966,6 +5968,22 @@ int main(int argc, char *argv[]) {
       "disable using bloom filter in CellDb. Enabled bloom filter reduces read latency, but increases memory usage",
       [&]() {
         acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::set_celldb_disable_bloom_filter, true); });
+      });
+  p.add_option(
+      '\0', "celldb-relaxed-sync",
+      "do not fsync the CellDb WAL on per-block commits (data still reaches the OS page cache). On kernel "
+      "panic / power loss the celldb may lose the latest blocks' states and need a resync; process crashes "
+      "are safe. Default: off",
+      [&]() {
+        acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::set_celldb_relaxed_sync, true); });
+      });
+  p.add_option(
+      '\0', "consensus-db-relaxed-sync",
+      "do not fsync consensus DB vote/certificate writes (data still reaches the OS page cache). DANGEROUS: "
+      "on kernel panic / power loss the validator may forget votes it already broadcast and equivocate after "
+      "restart, weakening consensus safety. Never enable on a production validator. Default: off",
+      [&]() {
+        acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::set_consensus_db_relaxed_sync, true); });
       });
   p.add_option('\0', "unsynced-liteserver", "allow liteserver queries before node is fully synced", [&]() {
     acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::set_unsynced_liteserver, true); });

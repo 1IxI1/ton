@@ -354,7 +354,8 @@ Status RocksDb::begin_transaction() {
   CHECK(!write_batch_);
   CHECK(transaction_db_);
   rocksdb::WriteOptions options;
-  options.sync = true;
+  // These write options are applied when the transaction commits.
+  options.sync = !options_.relaxed_write_sync;
   transaction_.reset(transaction_db_->BeginTransaction(options, {}));
   return Status::OK();
 }
@@ -363,14 +364,24 @@ Status RocksDb::commit_write_batch() {
   CHECK(write_batch_);
   auto write_batch = std::move(write_batch_);
   rocksdb::WriteOptions options;
-  options.sync = true;
-  return from_rocksdb(db_->Write(options, write_batch.get()));
+  options.sync = !options_.relaxed_write_sync;
+  TRY_STATUS(from_rocksdb(db_->Write(options, write_batch.get())));
+  if (options_.relaxed_write_sync) {
+    // With manual_wal_flush the WAL stays in process memory until flushed; push it
+    // to the OS page cache (without fsync) so commits survive a process crash.
+    TRY_STATUS(from_rocksdb(db_->FlushWAL(/* sync = */ false)));
+  }
+  return Status::OK();
 }
 
 Status RocksDb::commit_transaction() {
   CHECK(transaction_);
   auto transaction = std::move(transaction_);
-  return from_rocksdb(transaction->Commit());
+  TRY_STATUS(from_rocksdb(transaction->Commit()));
+  if (options_.relaxed_write_sync) {
+    TRY_STATUS(from_rocksdb(db_->FlushWAL(/* sync = */ false)));  // See commit_write_batch.
+  }
+  return Status::OK();
 }
 
 Status RocksDb::abort_write_batch() {

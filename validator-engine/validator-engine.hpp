@@ -257,6 +257,8 @@ class ValidatorEngine : public td::actor::Actor {
   bool celldb_preload_all_ = false;
   bool celldb_in_memory_ = false;
   bool celldb_disable_bloom_filter_ = false;
+  bool celldb_relaxed_sync_ = false;
+  bool consensus_db_relaxed_sync_ = false;
   bool unsynced_liteserver_ = false;
   bool read_config_ = false;
   bool started_keyring_ = false;
@@ -364,6 +366,12 @@ class ValidatorEngine : public td::actor::Actor {
   }
   void set_celldb_disable_bloom_filter(bool value) {
     celldb_disable_bloom_filter_ = value;
+  }
+  void set_celldb_relaxed_sync(bool value) {
+    celldb_relaxed_sync_ = value;
+  }
+  void set_consensus_db_relaxed_sync(bool value) {
+    consensus_db_relaxed_sync_ = value;
   }
   void set_unsynced_liteserver(bool value) {
     unsynced_liteserver_ = value;

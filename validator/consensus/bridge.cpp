@@ -116,9 +116,17 @@ class ManagerFacadeImpl : public ManagerFacade {
 
 class DbImpl : public Db {
  public:
-  explicit DbImpl(std::string path) {
+  explicit DbImpl(std::string path, bool relaxed_sync) {
     td::mkpath(path).ensure();
-    auto rocksdb = td::RocksDb::open(path).ensure().move_as_ok();
+    td::RocksDbOptions db_options;
+    // Relaxed sync (--consensus-db-relaxed-sync): vote/certificate persistence skips
+    // the per-commit WAL fsync (data still reaches the OS page cache). Crash window:
+    // on kernel panic / power loss the node may forget votes it already broadcast and
+    // re-vote differently after restart — this weakens the consensus SAFETY guarantee
+    // (equivocation protection across restarts). Process crashes are safe. Default off;
+    // never enable on a production validator.
+    db_options.relaxed_write_sync = relaxed_sync;
+    auto rocksdb = td::RocksDb::open(path, std::move(db_options)).ensure().move_as_ok();
     reader_ = rocksdb.snapshot();
     writer_ = td::KeyValueAsync<td::BufferSlice, td::BufferSlice>(std::make_shared<td::RocksDb>(std::move(rocksdb)));
   }
@@ -309,7 +317,7 @@ class BridgeImpl final : public IValidatorGroup {
 
     td::actor::Runtime runtime;
 
-    bus->db = std::make_unique<DbImpl>(db_path());
+    bus->db = std::make_unique<DbImpl>(db_path(), params_.validator_opts->get_consensus_db_relaxed_sync());
 
     BlockAccepter::register_in(runtime);
     BlockProducer::register_in(runtime);
