@@ -16,6 +16,7 @@
 */
 #pragma once
 
+#include <deque>
 #include <set>
 
 #include "interfaces/validator-manager.h"
@@ -221,6 +222,12 @@ class ExtMessagePool : public td::actor::Actor {
   std::vector<size_t> checker_inflight_;
   size_t next_checker_{0};
   void init_checkers();
+  // Admission backpressure: only MAX_INFLIGHT_CHECKS checks run concurrently; the rest wait in
+  // FIFO order (bounded — beyond that requests fail fast instead of queueing into a congestion
+  // collapse that would starve the whole node).
+  size_t inflight_checks_{0};
+  std::deque<td::actor::StartedTask<>::ExternalPromise> admission_waiters_;
+  void release_check_slot();
   // Atomic (non-suspending) pool-side completion of a checked wallet message: prune/dedup the
   // wallet seqno window and register the allow-broadcast promise.
   td::Result<td::actor::StartedTask<>> finalize_wallet_check(const td::Ref<ExtMessage> &message,
@@ -246,6 +253,8 @@ class ExtMessagePool : public td::actor::Actor {
   static constexpr size_t PER_ADDRESS_LIMIT = 256;
   static constexpr size_t SOFT_MEMPOOL_LIMIT = 1024;
   static constexpr size_t NUM_CHECKERS = 16;
+  static constexpr size_t MAX_INFLIGHT_CHECKS = 4 * NUM_CHECKERS;
+  static constexpr size_t MAX_ADMISSION_WAITERS = 20000;
   static constexpr double ADMISSION_STATS_PERIOD = 5.0;
 };
 

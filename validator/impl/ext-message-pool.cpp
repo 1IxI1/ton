@@ -42,6 +42,23 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   if (checkers_.empty()) {
     init_checkers();
   }
+  // Backpressure: bound the number of concurrent checks. Without it, an over-rate burst piles
+  // unbounded work onto the worker/pool mailboxes and the queueing delay alone times every
+  // request out (congestion collapse) while starving the rest of the node of CPU.
+  while (inflight_checks_ >= MAX_INFLIGHT_CHECKS) {
+    if (admission_waiters_.size() >= MAX_ADMISSION_WAITERS) {
+      ++admission_window_.rejected;
+      co_return td::Status::Error(ErrorCode::notready, "too many pending external message checks");
+    }
+    auto [task, promise] = td::actor::StartedTask<>::make_bridge();
+    admission_waiters_.push_back(std::move(promise));
+    co_await std::move(task);
+    // Loop: a new arrival may have grabbed the slot between our wakeup and resumption.
+  }
+  ++inflight_checks_;
+  SCOPE_EXIT {
+    release_check_slot();
+  };
   // The expensive stages (parse, account state fetch — cold celldb reads —, VM execution) run
   // on a worker; this pool actor stays free to dispatch/finalize other messages meanwhile.
   size_t worker = next_checker_++ % checkers_.size();
@@ -100,6 +117,17 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   co_return result.move_as_ok();
 }
 
+void ExtMessagePool::release_check_slot() {
+  --inflight_checks_;
+  // Wake one waiter per freed slot; it re-checks the limit when it resumes, so this stays
+  // correct (no slot leak) even if the woken request was cancelled while waiting.
+  if (!admission_waiters_.empty()) {
+    auto waiter = std::move(admission_waiters_.front());
+    admission_waiters_.pop_front();
+    waiter.set_value(td::Unit{});
+  }
+}
+
 td::Result<td::Unit> ExtMessagePool::admission_precheck(WorkchainId wc, StdSmcAddress addr) {
   if (checked_ext_msg_counter_.get_msg_count(wc, addr) >= MAX_EXT_MSG_PER_ADDR) {
     return td::Status::Error(PSTRING() << "too many external messages to address " << wc << ":" << addr.to_hex());
@@ -141,11 +169,12 @@ void ExtMessagePool::log_admission_stats() {
       busy += n > 0;
       inflight += n;
     }
-    char buf[256];
+    char buf[320];
     snprintf(buf, sizeof(buf),
-             "ext admission: in=%.0f/s admitted=%.0f/s rejected=%.0f/s busy_workers=%zu/%zu inflight=%zu "
+             "ext admission: in=%.0f/s admitted=%.0f/s rejected=%.0f/s busy_workers=%zu/%zu inflight=%zu wait_q=%zu "
              "avg_check_ms=%.2f (parse=%.2f precheck=%.2f state=%.2f lookup=%.2f vm=%.2f)",
              (double)w.in / dt, (double)w.admitted / dt, (double)w.rejected / dt, busy, checkers_.size(), inflight,
+             admission_waiters_.size(),
              w.checked ? w.check_time / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.parse / (double)w.checked * 1e3 : 0.0,
              w.checked ? w.timings.precheck / (double)w.checked * 1e3 : 0.0,
