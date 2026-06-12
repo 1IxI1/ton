@@ -50,6 +50,19 @@ def _write_model(file: Path, model: TLObject):
     _ = file.write_text(model.to_json())
 
 
+_TRANSIENT_LITESERVER_MARKERS = (
+    "LITE_SERVER_NETWORK",  # node is not listening / adnl query timed out
+    "LITE_SERVER_NOTREADY",  # node is not synced yet
+    "LITE_SERVER_UNKNOWN",  # block not yet available
+    "timeout for adnl query",  # tonlib-wrapped variants of the above
+)
+
+
+def _is_transient_liteserver_error(e: TonlibError) -> bool:
+    """Liteserver errors that just mean "retry later" during node startup / block waits."""
+    return any(marker in e.result.message for marker in _TRANSIENT_LITESERVER_MARKERS)
+
+
 type DebugType = None | Literal["rr"]
 
 
@@ -402,20 +415,9 @@ class Network:
                 mc_info = await client.get_masterchain_info()
             except TonlibError as e:
                 # FIXME: We should really let node notify us that it is ready.
-                try:
-                    if (
-                        e.result.code == 500
-                        and (
-                            e.result.message
-                            == "LITE_SERVER_NETWORKtimeout for adnl query query"  # node is not synced yet
-                            or e.result.message
-                            == "LITE_SERVER_NETWORK"  # node is not listening the socket
-                        )
-                    ):
-                        await asyncio.sleep(0.2)
-                        continue
-                except Exception:
-                    pass
+                if _is_transient_liteserver_error(e):
+                    await asyncio.sleep(0.2)
+                    continue
                 raise
 
             assert mc_info.last is not None
@@ -432,15 +434,9 @@ class Network:
             try:
                 return await client.lookup_block(workchain=workchain, shard=shard, seqno=seqno)
             except TonlibError as e:
-                try:
-                    if e.result.code == 500 and (
-                        "LITE_SERVER_UNKNOWN:" in e.result.message
-                        or "LITE_SERVER_NOTREADY:" in e.result.message
-                    ):
-                        await asyncio.sleep(0.2)
-                        continue
-                except Exception:
-                    pass
+                if _is_transient_liteserver_error(e):
+                    await asyncio.sleep(0.2)
+                    continue
                 raise
 
 
