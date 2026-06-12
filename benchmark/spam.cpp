@@ -664,6 +664,7 @@ class SpamRunner : public td::actor::Actor {
   void watcher_advance() {
     next_seqno_++;
     fetch_attempts_ = 0;
+    transient_attempts_ = 0;
     watcher_retry_in(0.0);
   }
 
@@ -782,8 +783,23 @@ class SpamRunner : public td::actor::Actor {
                             td::Timestamp::in(15.0), std::move(P));
   }
 
+  // The liteserver indexes blocks (ltdb/archive) slightly behind the shard
+  // client; with large fast blocks lookups/fetches transiently fail with
+  // "block not found ... possibly out of sync". Such errors must be retried
+  // on the same seqno, NOT counted toward the >16MB fallback heuristic.
+  static bool is_transient_block_error(const td::Status &s) {
+    auto msg = s.message();
+    return msg.str().find("not found") != std::string::npos ||
+           msg.str().find("out of sync") != std::string::npos ||
+           msg.str().find("notready") != std::string::npos;
+  }
+
   void got_block(ton::BlockIdExt blkid, td::Result<td::BufferSlice> R) {
     if (R.is_error()) {
+      if (is_transient_block_error(R.error()) && ++transient_attempts_ < 200) {
+        watcher_retry_in(0.1);  // re-lookup the same seqno until the liteserver catches up
+        return;
+      }
       fetch_attempts_++;
       LOG(WARNING) << "getBlock(" << blkid.id.seqno << ") failed (attempt " << fetch_attempts_
                    << "): " << R.error();
@@ -895,6 +911,10 @@ class SpamRunner : public td::actor::Actor {
       return td::Status::OK();
     }();
     if (status.is_error()) {
+      if (is_transient_block_error(status) && ++transient_attempts_ < 200) {
+        watcher_retry_in(0.1);
+        return;
+      }
       fetch_attempts_++;
       LOG(WARNING) << "listBlockTransactions(" << blkid.id.seqno << ") failed: " << status;
       if (fetch_attempts_ >= 5) {
@@ -1143,6 +1163,7 @@ class SpamRunner : public td::actor::Actor {
   td::Timestamp watcher_retry_{td::Timestamp::now()};
   bool fallback_mode_{false};
   int fetch_attempts_{0};
+  int transient_attempts_{0};
   double cur_observed_at_{0};
   td::uint32 cur_utime_{0};
   td::uint64 fb_n_txs_{0}, fb_matched_{0};
