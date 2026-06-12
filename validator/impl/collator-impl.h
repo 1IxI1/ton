@@ -255,15 +255,54 @@ class Collator final : public td::actor::Actor {
   std::set<td::Bits256> account_dict_estimator_added_accounts_;
   unsigned account_dict_ops_{0};
 
-  // Asynchronous prefetch of account paths in the accounts dictionary of the previous state
-  // (see AccountPrefetchPool in collator.cpp)
-  std::vector<Ref<vm::Cell>> prefetch_account_dict_roots_;
-  std::set<ton::StdSmcAddress> prefetched_accounts_;
-  td::uint32 prefetch_issued_{0};
-  td::uint32 prefetch_dropped_{0};
-  void init_account_prefetch(const Ref<vm::Cell>& pure_state_root);
-  void prefetch_account_path(const ton::StdSmcAddress& addr);
-  void prefetch_msg_dest_account(const Ref<vm::Cell>& msg);
+  // ===== io-mux: I/O multiplexing of account materialization during message intake =====
+  //
+  // Account-path loads for UPCOMING messages run as awaitable walker coroutines over the raw
+  // (non-usage-tracked) previous-state cells, so celldb reads for the next several messages
+  // overlap with execution of the current one. Execution order and usage/proof recording are
+  // unchanged: the main loop merely awaits readiness before its usual synchronous lookups.
+  // See the "io-mux" section in collator.cpp for the full design notes.
+  static constexpr size_t IO_MUX_WINDOW = 32;               // inbound-queue messages resolved ahead of execution
+  static constexpr size_t IO_MUX_MAX_CONCURRENT_WALKS = 8;  // bounded number of in-flight account path walks
+  static constexpr size_t IO_MUX_SHADOW_BATCH = 16;         // shadow queue walker: messages parsed per batch
+  static constexpr size_t IO_MUX_ACCOUNT_SUBTREE_CELLS = 64;  // account state cells materialized per account
+  static constexpr size_t IO_MUX_MSG_SUBTREE_CELLS = 8;       // message body cells materialized per inbound msg
+  struct AccountPathResolution {
+    bool done = false;
+    bool queued = false;
+    td::actor::StartedTask<td::Unit> task;
+    td::actor::StartedTask<td::Unit>::ExternalPromise waiter;
+  };
+  bool io_mux_enabled_ = false;
+  std::vector<Ref<vm::Cell>> io_mux_account_dict_roots_;  // raw accounts dict roots of the prev state(s)
+  std::map<ton::StdSmcAddress, AccountPathResolution> io_mux_resolutions_;
+  std::deque<ton::StdSmcAddress> io_mux_walk_queue_;
+  size_t io_mux_running_walks_{0};
+  td::uint32 io_mux_issued_{0};
+  td::uint32 io_mux_resolved_{0};
+  td::uint32 io_mux_awaits_{0};
+  double io_mux_wait_time_{0.0};
+  // Shadow walker over the raw inbound queues: discovers dest accounts of upcoming inbound
+  // internal messages and warms their queue/envelope cells, without touching usage trees.
+  std::map<BlockIdExt, Ref<vm::Cell>> io_mux_pure_queue_roots_;
+  std::shared_ptr<std::unique_ptr<block::OutputQueueMerger>> io_mux_shadow_merger_;
+  std::vector<block::OutputQueueMerger::Neighbor> io_mux_shadow_neighbors_;
+  td::actor::StartedTask<td::Unit> io_mux_shadow_task_;
+  bool io_mux_shadow_running_ = false;
+  bool io_mux_shadow_done_ = false;
+  size_t io_mux_shadow_extracted_{0};
+  size_t io_mux_inbound_processed_{0};
+  size_t io_mux_inbound_skip_offset_{0};  // queue entries deleted by cleanup; visible to the shadow only
+
+  void init_io_mux(const Ref<vm::Cell>& pure_state_root);
+  td::optional<ton::StdSmcAddress> get_msg_dest_in_shard(const Ref<vm::Cell>& msg) const;
+  void issue_account_path_resolution(const ton::StdSmcAddress& addr);
+  void start_account_path_walk(const ton::StdSmcAddress& addr, AccountPathResolution& res);
+  td::actor::Task<td::Unit> account_path_walker(ton::StdSmcAddress addr);
+  void on_account_path_walk_done(const ton::StdSmcAddress& addr);
+  td::actor::Task<> wait_account_path_resolved(ton::StdSmcAddress addr);
+  void pump_inbound_queue_shadow();
+  td::actor::Task<td::Unit> inbound_queue_shadow_batch(size_t batch);
 
   bool msg_metadata_enabled_ = false;
   bool deferring_messages_enabled_ = false;
@@ -365,9 +404,9 @@ class Collator final : public td::actor::Actor {
 
   void register_new_msg(block::NewOutMsg msg);
   void register_new_msgs(block::transaction::Transaction& trans, td::optional<block::MsgMetadata> msg_metadata);
-  bool process_new_messages(bool& enqueue_only);
+  td::actor::Task<bool> process_new_messages(bool& enqueue_only);
   int process_one_new_message(block::NewOutMsg msg, bool enqueue_only = false, Ref<vm::Cell>* is_special = nullptr);
-  bool process_inbound_internal_messages();
+  td::actor::Task<bool> process_inbound_internal_messages();
   bool precheck_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt);
   bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx);
   td::actor::Task<> process_external_and_new_messages();
