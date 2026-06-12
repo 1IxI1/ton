@@ -4952,6 +4952,16 @@ bool Collator::process_new_messages(bool& enqueue_only) {
       stats_.limits_log += PSTRING() << "NEW_MESSAGES: "
                                      << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
     }
+    // Time-bound the in-block message cascade the same way externals intake is
+    // bounded: executing new messages past the soft timeout pushes the candidate
+    // past the producer's slot deadline, after which an empty fallback block is
+    // finalized and the dead candidate's externals are lost from the mempool.
+    // Defer the remainder to the out queue instead.
+    if (!enqueue_only && params_.soft_timeout.is_in_past()) {
+      LOG(INFO) << "soft timeout reached, enqueue all remaining new messages";
+      enqueue_only = true;
+      stats_.limits_log += PSTRING() << "NEW_MESSAGES: timeout\n";
+    }
     if (!check_cancelled()) {
       return false;
     }
