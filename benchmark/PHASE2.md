@@ -84,9 +84,143 @@ validation cpu time ≈ real time (e.g. 60.2ms cpu / 60.4ms real at block 199) �
 is pure CPU over collated-data proofs. Timings: validation n=387 mean 28.5ms max 118ms;
 collation n=387 mean 175ms max 491ms (collation still I/O-bound; that is P0/W1 territory).
 
+## P0 findings (collation profiling, 208GB state, mainnet-parity config, 2026-06-12)
+
+Runs (rate 600, warmup 15, wallet offsets 3.0–3.2M, cold caches, single shard,
+400ms slots): `p0-r600` (120s, node-verbosity 3, dwarf perf), `p0-r600-v1` (120s,
+verbosity 1 — canonical), `p0-r600-lbr` (60s, verbosity 1, LBR perf). Raw artifacts in
+/mnt/bench/work/p0/ (session-logs{,2,3}, node1-log*.zst, perf{,2,3}.data, diskstats*.csv,
+analyze_p0.py + per-block CSVs, classify_perf.py + perf*-classified.txt) and
+/mnt/bench/results/p0-r600*/. Background contention: two agents compiled in bursts;
+perf windows were taken in a quiet window (load1 ≈ 6 during the canonical run,
+20 hw threads); the engine itself accounts for most of that load.
+
+**Headline**: verbosity-1 run included 14,823 transfers in 105s ⇒ **118.6 jetton TPS**
+(356 raw). Saturated blocks (n=186): 71.2 externals, 146 txs, 444KB block,
+**366KB collated data**, cycle p50 405ms. NOTE: node-verbosity 3 costs ~34% goodput
+(78.5 jTPS in the otherwise identical run — logging serializes on hot actor threads);
+and rate 600 yields *lower* goodput than rate 300 (118 vs 195 jTPS in c0-parity-r300):
+over-saturation overhead (admission + pool + internals backlog), relevant to W3.
+
+### 1. Slot timeline (saturated, per ~405ms cycle, session-log events + collator stats)
+
+| segment | mean | notes |
+|---|---|---|
+| prev candidate ready → collate request | 21ms | p50 0.3ms; **92ms at every 4th slot** (leader-window restart, single validator) |
+| request → Collator ctor | 0.0ms | parent state handed over in-memory: producer does MerkleUpdate::apply itself (chain-state.cpp) and passes `prev_block_state_roots` — **the phase-1 "parent-resolve eats half the slot" no longer exists** |
+| ctor → do_collate (preinit: mc state, neighbors, queues) | 1.9ms | |
+| **do_collate → externals cutoff (intake)** | **333ms** | ends at `wait_externals_until = slot_start`; split measured in the verbose run: **dispatch+inbound internals 153ms, externals 167ms**; ext-queue idle wait ≈ 0 (mempool always backlogged) |
+| post-externals (finalize+serialize, "post_ext") | 39ms | runs *past* slot_start; delays the next request |
+| candidate handoff to producer | 10ms | clone/copy of 444KB block + 366KB collated data |
+| total collation (ctor → stats) | 374ms | occupies the full slot; the c0 "mean 175ms" was an artifact of averaging over non-saturated warmup blocks |
+
+Post-collation pipeline (overlapped with the next collation, does not consume slot
+budget): candidate received +0.1ms → validation start +18ms → validation 44ms
+(pure CPU, no celldb reads — full collated data works) → notarize cert +12ms →
+finalize cert +14ms. Finalization lands ~90ms after the candidate; only gates
+empty-block fallbacks, never block production here (0 empty slots, all attempts==0).
+
+So the next block's intake window ≈ 400 − post_ext(39) − handoff(10) − gap(21) −
+preinit(2) ≈ 330ms ✓. The old "collation gets only ~190ms" is dead; its successor:
+**externals get only ~167ms** because the first ~153ms of every intake go to the
+previous blocks' deferred internal cascades (out-queue grew +32/block at rate 600 —
+the system was not even at internals equilibrium; longer runs would shift the split
+further toward internals).
+
+### 2. Collation internal breakdown (collator work_time stats, saturated means, run v1)
+
+| phase | real ms | cpu ms | iowait ms |
+|---|---|---|---|
+| trx_tvm (VM execution) | 33.9 | 25.2 | 8.7 |
+| trx_storage_stat + trx_other | 13.6 | 13.3 | 0.3 |
+| combine_account_transactions | 8.3 | 8.2 | 0.1 |
+| create_shard_state (new state + Merkle update) | 8.9 | 8.9 | 0.0 |
+| create_block | 2.2 | 2.2 | 0.0 |
+| **create_collated_data (proofs of accessed cells — NEW)** | **13.8** | 13.7 | 0.1 |
+| create_block_candidate (BoC serialization) | 5.9 | 5.8 | 0.0 |
+| queue_cleanup + preinit + final_storage_stat | 0.4 | 0.4 | 0.0 |
+| **unattributed (account loads, dict descents, msg routing)** | **283.8** | 100.8 | **183.0** |
+| **TOTAL work_time** | **370.7** | **178.5** | **192.2** |
+
+**52% of collation real time is I/O wait**, all of it inside the intake loop
+(the named phases are CPU-bound). The user's "trx_* ≈ 60ms" observation is the
+trx_tvm+trx_other+trx_storage_stat rows (~48ms here): the trx timers start *after*
+`make_account` — the per-message account-path descent and cell loads land in
+"unattributed". Full-collated-data cost: create_collated_data 13.8ms + bigger
+create_block_candidate (5.9ms vs ~2.7 pre-C0) ≈ **+17ms/block ≈ 4% of the slot**,
+plus 366KB/block of extra candidate bytes. Validation: 44ms pure CPU.
+Account-path prefetch is active (issued ≈ 330/block, dropped 0) and yet 183ms of
+serial read waits remain: prefetch covers the destination-account paths it can see,
+but storage-stat cells, dict-update paths and second-hop loads still miss.
+
+### 3. CPU profile (perf, LBR call graphs, whole process, saturated)
+
+Process CPU ≈ 3 cores of 20. Subsystems: collator-tagged 10.7%, network 13.5%,
+liteserver (serving bench-spam) 13.2%, account-prefetch pool 7.0%, validation 3.8%,
+mempool admission 2.2%, celldb commit 1.6%, archive 2.7%, rest deep-stack/other.
+By component across subsystems: **ed25519 ≈ 25%** (mempool admission VM checks +
+network channel crypto + signing), **rocksdb Get path ≈ 18%**, cell-slice ops ≈ 10%,
+BoC serialize ≈ 7.5%, allocator ≈ 6.5%, sha256 ≈ 5.5%, TVM dispatch ≈ 1%.
+The collation-critical thread runs at only ~44% CPU duty (178ms/405ms) — CPU is not
+the binding constraint; the I/O wait is.
+
+perf notes: `--call-graph dwarf` unwinds only ~14% of samples on this RelWithDebInfo
+clang build (fat/deep actor+TVM stacks exceed the dump; libdw gives up) — **use
+`--call-graph lbr`** (works perfectly, 32-frame depth) or add
+`-fno-omit-frame-pointer` (-1–2% perf) for profiling builds. sched_switch off-cpu
+stacks are kernel-only for the same reason (captured, not usable).
+
+### 4. Disk picture (/proc/diskstats, steady state, canonical run)
+
+16.5k read IOPS, 127MB/s, avg read 7.7KB, avg latency 0.10ms, device util 56%
+(NVMe nowhere near saturated — the serial chain is). Writes 377 IOPS / 55MB/s.
+Per transfer (~170/s): **~94 device reads total** (collator + prefetch pool +
+admission + liteserver), of which **~27 serial reads on the collator critical path**
+(192ms iowait ÷ 0.10ms ≈ 1,900 reads/block ÷ 71 transfers).
+
+### 5. Ranked verdict (per 405ms cycle) and implications
+
+1. **Serial celldb I/O wait in the intake loop: 183–192ms (47%)** — W1's target.
+   Multiplexing I/O within one collation thread (async account loads / stackful
+   coros) converts ~insert-latency×count into max(CPU, IO-depth-limited time):
+   intake could roughly double at util ≪ 100%. W1 is the single biggest lever.
+2. **Intake CPU: ~128ms** (TVM 25ms + tx scaffolding ~14ms + account
+   unpack/dict/routing ~89ms). W2 (parallel execution across accountchains) attacks
+   this *after* W1; alone it saves at most ~30% of the slot. Per-transfer collator
+   CPU ≈ 2.5ms (3 txs incl. next-block internals).
+3. **Post-externals serialization: 39ms (10%)** — pure CPU after the externals
+   cutoff; it directly shortens the *next* intake window. Proof building (14ms) +
+   candidate BoC (6ms) + state/block (11ms) + combine (8ms). Could overlap with the
+   next collation's intake (pipeline the serialize stage) for a free ~10% window gain.
+4. **Producer/window overhead: 21ms mean + 10ms handoff** — 92ms stall at every
+   leader-window boundary (4 slots) even with a single validator; cheap fix candidate
+   (pre-arm the next window's first collation).
+5. **Internals-vs-externals scheduling**: deferred cascades consume the first ~46%
+   of every intake window and the backlog still grows (+32 msgs/block) — at true
+   equilibrium externals/block would be *lower*. Any intake speedup helps both; W3's
+   pool work should also re-meter externals admission to internals capacity.
+6. **W5 (celldb layout)**: ~13-level dict descents at ~1 cell/IO today; 5-level
+   bundling would cut the critical path ~27 → ~6 reads/transfer and total IOPS ~4×,
+   multiplying W1's headroom (more in-flight reads per NVMe roundtrip budget).
+
+### Consensus-pipeline answer to the driving question
+
+Collation seemingly "occupies its full 400ms" because it *does*: the producer
+requests the next collation immediately after the previous candidate (no parent-state
+stall at parity config), and the collator spends the whole slot — but only ~48ms of
+it is transaction work (trx_*); ~190ms is serial cold-read wait, ~80ms is per-message
+CPU outside trx timers, ~39ms is end-of-block serialization+proofs, and ~153ms of the
+"transaction" budget is really the previous block's deferred internal cascade.
+Validation/notarization/finalization are fully pipelined and irrelevant to the slot
+budget at parity config.
+
 ## Status log (append-only; agents update their line on completion)
 
-- P0: pending
+- P0: done — slot timeline + collation phase decomposition + LBR CPU profile + disk
+  profile on 208GB/parity (runs p0-r600*); verdict: 52% of collation is serial celldb
+  I/O wait (W1), intake CPU ~32% (W2), collated-data proofs cost ~4% of slot, no
+  parent-resolve gap remains; externals get ~167ms of the slot, internals backlog the
+  first ~153ms. W1 → W5 → post-ext pipelining is the recommended order.
 - C0: done — full collated data on by default (param-8 cap 0x3EE, mainnet parity) +
   mainnet 22/23 block limits as mul baselines; verified wc0 validation reads no celldb
   state (r300 run: 586 tps included, validation pure-CPU ~28ms mean).
