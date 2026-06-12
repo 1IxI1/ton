@@ -32,7 +32,6 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "auto/tl/lite_api.h"
@@ -56,8 +55,8 @@
 #include "ton/ton-types.h"
 #include "vm/boc.h"
 #include "vm/cells/MerkleProof.h"
-#include "vm/cp0.h"
 #include "vm/dict.h"
+#include "vm/vm.h"
 
 #include "common.h"
 
@@ -134,7 +133,7 @@ std::string json_escape(td::Slice s) {
       r += c;
     } else if (static_cast<unsigned char>(c) < 0x20) {
       char buf[8];
-      snprintf(buf, sizeof(buf), "\\u%04x", c);
+      snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
       r += buf;
     } else {
       r += c;
@@ -581,7 +580,7 @@ class SpamRunner : public td::actor::Actor {
       LOG(WARNING) << "duration elapsed after " << sent_ << "/" << target_total_
                    << " messages (signer or sender could not sustain the rate); draining";
       begin_drain(now);
-    } else if (signer_->exhausted() && sent_ >= signer_sent_limit()) {
+    } else {
       auto err = signer_->error();
       if (err.is_error()) {
         LOG(ERROR) << "signer failed: " << err;
@@ -589,10 +588,6 @@ class SpamRunner : public td::actor::Actor {
         begin_drain(now);
       }
     }
-  }
-
-  td::uint64 signer_sent_limit() const {
-    return target_total_;
   }
 
   void send_message(PresignedMsg &&msg, double now) {
@@ -936,8 +931,8 @@ class SpamRunner : public td::actor::Actor {
     }
     next_progress_ = now + 5.0;
     LOG(INFO) << "progress: sent " << sent_ << "/" << target_total_ << " (ok " << send_ok_ << ", err " << send_err_
-              << "), included " << inclusion_ms_.size() << ", blocks " << blocks_.size()
-              << (blocks_.empty() ? 0u : blocks_.back().seqno) << (fallback_mode_ ? " [fallback mode]" : "");
+              << "), included " << inclusion_ms_.size() << ", blocks " << blocks_.size() << " (tip seqno "
+              << (blocks_.empty() ? 0u : blocks_.back().seqno) << ")" << (fallback_mode_ ? " [fallback mode]" : "");
   }
 
   void check_done(double now) {
@@ -965,7 +960,7 @@ class SpamRunner : public td::actor::Actor {
       LOG(ERROR) << "no sent externals were observed in any block";
       g_exit_code.store(1);
     }
-    td::actor::SchedulerContext::get()->stop();
+    td::actor::SchedulerContext::get().stop();
     stop();
   }
 
