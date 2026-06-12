@@ -226,6 +226,13 @@ class ExtMessagePool : public td::actor::Actor {
   size_t inflight_checks_{0};
   std::deque<td::actor::StartedTask<>::ExternalPromise> admission_waiters_;
   void release_check_slot();
+  // Adaptive wait-queue cap: bound the ESTIMATED queueing delay, not just the count, so that
+  // under degraded capacity (CPU contention, cold caches) requests fail fast instead of being
+  // answered after the client has already timed out.
+  double check_completion_rate_{2000.0};  // EWMA, completions/s; optimistic start for cold boot
+  td::uint64 completions_in_rate_window_{0};
+  double rate_window_start_{td::Time::now()};
+  size_t max_admission_waiters();
   // Atomic (non-suspending) pool-side completion of a checked wallet message: prune/dedup the
   // wallet seqno window and register the allow-broadcast promise.
   td::Result<td::actor::StartedTask<>> finalize_wallet_check(const td::Ref<ExtMessage> &message,
@@ -252,9 +259,12 @@ class ExtMessagePool : public td::actor::Actor {
   static constexpr size_t SOFT_MEMPOOL_LIMIT = 1024;
   static constexpr size_t NUM_CHECKERS = 24;
   static constexpr size_t MAX_INFLIGHT_CHECKS = 8 * NUM_CHECKERS;
-  // Sized so that worst-case queueing latency stays well under client/liteserver timeouts
-  // (~10s): beyond this the requests would time out anyway, so fail them fast instead.
-  static constexpr size_t MAX_ADMISSION_WAITERS = 30000;
+  // Absolute bound on queued admission requests; the effective bound is adaptive
+  // (max_admission_waiters() targets MAX_ADMISSION_QUEUE_DELAY of estimated wait).
+  static constexpr size_t MAX_ADMISSION_WAITERS = 50000;
+  // Keep the estimated queueing delay well under client/liteserver timeouts (~10s): beyond
+  // that the requests would be answered after the caller gave up anyway, so fail them fast.
+  static constexpr double MAX_ADMISSION_QUEUE_DELAY = 5.0;
   static constexpr double ADMISSION_STATS_PERIOD = 5.0;
 };
 

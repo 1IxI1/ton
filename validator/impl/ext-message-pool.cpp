@@ -45,7 +45,7 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   // unbounded work onto the worker/pool mailboxes and the queueing delay alone times every
   // request out (congestion collapse) while starving the rest of the node of CPU.
   while (inflight_checks_ >= MAX_INFLIGHT_CHECKS) {
-    if (admission_waiters_.size() >= MAX_ADMISSION_WAITERS) {
+    if (admission_waiters_.size() >= max_admission_waiters()) {
       ++admission_window_.rejected;
       co_return td::Status::Error(ErrorCode::notready, "too many pending external message checks");
     }
@@ -118,7 +118,23 @@ td::actor::Task<ExtMessagePool::CheckResult> ExtMessagePool::check_add_external_
   co_return result.move_as_ok();
 }
 
+size_t ExtMessagePool::max_admission_waiters() {
+  double now = td::Time::now();
+  double window = now - rate_window_start_;
+  if (window >= 1.0) {
+    if (window <= 10.0) {
+      check_completion_rate_ =
+          0.5 * check_completion_rate_ + 0.5 * (double)completions_in_rate_window_ / window;
+    }  // else: stale idle-period data, keep the previous estimate
+    completions_in_rate_window_ = 0;
+    rate_window_start_ = now;
+  }
+  double cap = check_completion_rate_ * MAX_ADMISSION_QUEUE_DELAY;
+  return (size_t)td::clamp(cap, 512.0, (double)MAX_ADMISSION_WAITERS);
+}
+
 void ExtMessagePool::release_check_slot() {
+  ++completions_in_rate_window_;
   --inflight_checks_;
   // Wake one waiter per freed slot; it re-checks the limit when it resumes, so this stays
   // correct (no slot leak) even if the woken request was cancelled while waiting.
