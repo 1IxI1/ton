@@ -4,10 +4,13 @@ Context: read benchmark/DESIGN.md + benchmark/RESULTS.md first. Phase-1 found si
 ceilings of 132–145 jTPS (208GB state) / 236–241 (RAM state, byte-limit) with the collator
 bottlenecked on serial celldb reads, an effective ~190ms collation budget, and ~0.54ms CPU
 per transfer. Phase-2 goal: 10⁴ jetton TPS single shard (= 30k tx/s = ~12k txs per 400ms
-block), per explicit direction. Constraints: (1) NO correctness compromises; (2) avoid
-public-ABI changes — block format & collated data are fair game if minimal, full-node-visible
-ABI is not; (3) prefer eliminating the phase-1 prefetcher (no lingering threads) once proper
-I/O multiplexing exists.
+block), per explicit direction. Constraints: (1) NO correctness compromises; (2) ABI: the
+BLOCK format is public ABI — minimal changes only if unavoidable; COLLATED DATA is exchanged
+between validators only — fine to modify arbitrarily; (3) prefer eliminating the phase-1
+prefetcher (no lingering threads) once proper I/O multiplexing exists; (4) the primary regime
+is the 208GB state that does NOT fit in RAM (disk-bound); RAM-resident numbers are secondary.
+Ordering note: C0 lands BEFORE P0 — config parity (full collated data) changes what profiling
+measures.
 
 ## Machine-sharing protocol (MANDATORY for every agent)
 
