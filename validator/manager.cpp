@@ -1817,14 +1817,15 @@ td::Ref<MasterchainState> ValidatorManagerImpl::do_get_last_liteserver_state() {
   if (last_liteserver_state_->get_seqno() == last_masterchain_state_->get_seqno()) {
     return last_liteserver_state_;
   }
-  // If liteserver seqno (i.e., shard client) lags then use last masterchain state for liteserver
-  // Allowed lag depends on the block rate
-  double time_per_block = double(last_masterchain_state_->get_unix_time() - last_liteserver_state_->get_unix_time()) /
-                          double(last_masterchain_state_->get_seqno() - last_liteserver_state_->get_seqno());
-  time_per_block = std::max(time_per_block, 2.0);
-  if (td::Clocks::system() - double(last_liteserver_state_->get_unix_time()) > std::min(time_per_block * 8, 180.0)) {
-    last_liteserver_state_ = last_masterchain_state_;
-  }
+  // The advertised liteserver tip advances only when the shard client confirms that every shard block
+  // referenced by the masterchain state is already applied and indexed (update_shard_client_block_handle),
+  // i.e. servable via lookupBlock/getBlock/listBlockTransactions. Jumping ahead to last_masterchain_state_
+  // here (as was done before when the shard client lagged) advertised shard blocks that liteserver
+  // lookups could not serve yet, producing spurious "block not found (possibly out of sync)" errors.
+  VLOG(validator, INFO) << "liteserver tip gate: holding advertised tip at seqno "
+                        << last_liteserver_state_->get_seqno() << " (last masterchain seqno "
+                        << last_masterchain_state_->get_seqno() << ", shard client seqno "
+                        << (shard_client_handle_ ? shard_client_handle_->id().seqno() : 0) << ")";
   return last_liteserver_state_;
 }
 
@@ -3087,6 +3088,11 @@ void ValidatorManagerImpl::process_block_handle_for_litequery_error(BlockIdExt b
     for (auto &shard : shard_client_shards_) {
       if (shard_intersects(shard->shard(), block_id.shard_full())) {
         if (block_id.seqno() > shard->top_block_id().seqno()) {
+          // The block is beyond the advertised tip: it is simply not available yet, not a desync.
+          err = err.move_as_error_suffix(
+              PSTRING() << " (beyond advertised tip: shard top_seqno=" << shard->top_block_id().seqno() << ")");
+        } else {
+          // The advertised tip references this block, but it is not servable: a genuine desync.
           err = err.move_as_error_suffix(
               PSTRING() << " (possibly out of sync: shard_client_seqno="
                         << (shard_client_handle_ ? shard_client_handle_->id().seqno() : 0) << " ls_seqno="
@@ -3128,9 +3134,15 @@ void ValidatorManagerImpl::process_lookup_block_for_litequery_error(AccountIdPre
   } else {
     for (auto &shard : shard_client_shards_) {
       if (shard_intersects(shard->shard(), account.as_leaf_shard())) {
-        if (value > (type == 0 ? shard->end_lt()
-                               : (type == 1 ? (shard_client_handle_ ? shard_client_handle_->unix_time() : 0)
-                                            : shard->top_block_id().seqno()))) {
+        td::uint64 top = (type == 0 ? shard->end_lt()
+                                    : (type == 1 ? (shard_client_handle_ ? shard_client_handle_->unix_time() : 0)
+                                                 : shard->top_block_id().seqno()));
+        if (value > top) {
+          // The requested block is beyond the advertised tip: it is simply not available yet, not a desync.
+          err = err.move_as_error_suffix(
+              PSTRING() << " (beyond advertised tip: shard top_seqno=" << shard->top_block_id().seqno() << ")");
+        } else {
+          // The advertised tip references this block, but it is not servable: a genuine desync.
           err = err.move_as_error_suffix(
               PSTRING() << " (possibly out of sync: shard_client_seqno="
                         << (shard_client_handle_ ? shard_client_handle_->id().seqno() : 0) << " ls_seqno="
