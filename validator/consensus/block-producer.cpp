@@ -47,6 +47,7 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     current_leader_window_ = std::nullopt;
     cancellation_source_.cancel();
+    speculative_.reset();  // cancels the speculative collation, if any
     stop();
   }
 
@@ -102,6 +103,21 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     std::chrono::milliseconds start_collate_before =
         bus.shard.is_masterchain() ? std::chrono::milliseconds(0) : target_rate_;
     td::Timestamp slot_start = event->start_time;
+
+    // If our previous leader window ended with a speculative collation on top of our own last
+    // candidate (see maybe_start_speculative_generation), adopt it when this window indeed builds
+    // on that candidate. Otherwise simply discard it: nothing was published, and the mempool only
+    // holds/drops externals for published candidates, so a discarded collation leaks nothing.
+    td::CancellationTokenSource adopted_cancellation;  // keeps the adopted collation cancellable
+    if (auto spec = std::exchange(speculative_, std::nullopt)) {
+      if (parent.has_value() && spec->parent == parent && spec->slot == event->start_slot &&
+          !should_generate_empty_block(state)) {
+        block_generation = std::move(spec->generation);
+        block_generation_active = true;
+        adopted_cancellation = std::move(spec->cancellation_source);
+        slot_start = std::max(slot_start, spec->slot_start);
+      }
+    }
 
     for (td::uint32 slot = event->start_slot; current_leader_window_ == window && slot < event->end_slot; ++slot) {
       co_await td::actor::coro_sleep(slot_start - start_collate_before);
@@ -216,10 +232,78 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
 
     if (current_leader_window_ == window) {
       current_leader_window_ = std::nullopt;
+      // The loop above advanced `slot_start` to the next window's first slot.
+      if (!block_generation_active) {
+        maybe_start_speculative_generation(parent, state, event->end_slot, slot_start);
+      }
     }
 
     co_return {};
   }
+
+  // Speculative cross-window pipelining: when our leader window ends and (by the local collator
+  // schedule) the next window is ours as well, start collating the next window's first block on
+  // top of our own last candidate immediately, instead of waiting for the last slot's
+  // notarization certificate to arrive and trigger OurLeaderWindowStarted (validation +
+  // certificate roundtrip, a sizable fraction of a slot). This mirrors what the producer already
+  // does between slots within one window. Nothing is signed or published here: the candidate is
+  // announced only after OurLeaderWindowStarted confirms that the new window builds on the
+  // candidate we speculated on; on mismatch (e.g. our last candidate got skipped) the result is
+  // discarded and collation restarts from the actual base, exactly as without speculation.
+  void maybe_start_speculative_generation(ParentId parent, const ChainStateRef& state, td::uint32 next_slot,
+                                          td::Timestamp slot_start) {
+    auto& bus = *owning_bus();
+    if (bus.shard.is_masterchain()) {
+      // The masterchain producer collates within its slot (start_collate_before == 0); there is
+      // no cross-slot collation pipeline to extend.
+      return;
+    }
+    if (!parent.has_value()) {
+      return;
+    }
+    if (!bus.collator_schedule->is_expected_collator(bus.local_id->idx, next_slot)) {
+      return;
+    }
+    if (should_generate_empty_block(state)) {
+      return;
+    }
+
+    std::chrono::milliseconds hard_timeout = std::max(target_rate_ * 3, std::chrono::milliseconds(60'000));
+    CollateParams params{
+        .shard = bus.shard,
+        .min_masterchain_block_id = state->min_mc_block_id(),
+        .prev = state->block_ids(),
+        .creator = Ed25519_PublicKey{bus.local_id->key.ed25519_value().raw()},
+        .utime = slot_start.at_unix(),
+        .hard_timeout = slot_start + hard_timeout,
+        .soft_timeout = slot_start,
+        .wait_externals_until = slot_start,
+        .prev_block_data = state->block_data(),
+        .prev_block_state_roots = state->state(),
+    };
+    td::CancellationTokenSource cancellation_source;
+    td::actor::SharedFuture<GeneratedCandidate> generation = td::actor::ask(
+        bus.manager, &ManagerFacade::collate_block, std::move(params), cancellation_source.get_cancellation_token());
+    owning_bus().publish<TraceEvent>(stats::CollateStarted::create(next_slot));
+    speculative_ = SpeculativeGeneration{
+        .parent = parent,
+        .slot = next_slot,
+        .slot_start = slot_start,
+        .generation = std::move(generation),
+        .cancellation_source = std::move(cancellation_source),
+    };
+  }
+
+  // A collation for the first slot of our (locally expected) next leader window, started before
+  // the window itself was observed; see maybe_start_speculative_generation.
+  struct SpeculativeGeneration {
+    ParentId parent;  // our last candidate of the finished window; the collation builds on it
+    td::uint32 slot;
+    td::Timestamp slot_start;
+    td::actor::SharedFuture<GeneratedCandidate> generation;
+    td::CancellationTokenSource cancellation_source;  // cancelled on destruction
+  };
+  std::optional<SpeculativeGeneration> speculative_;
 
   std::optional<td::uint32> current_leader_window_;
   td::CancellationTokenSource cancellation_source_;
