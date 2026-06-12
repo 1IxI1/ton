@@ -57,6 +57,7 @@ TIMING_MARKERS = ("collation took", "validation took", "collation failed in")
 class BenchParams:
     manifest: Path
     net_dir: Path
+    celldb_checkpoint_dir: Path | None
     rate: float
     duration: int
     warmup: int
@@ -82,6 +83,18 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         type=Path,
         default=Path("/mnt/bench/net"),
         help="network working directory (recreated unless --keep-net)",
+    )
+    _ = parser.add_argument(
+        "--celldb-checkpoint-dir",
+        type=Path,
+        default=None,
+        help=(
+            "physical location for the disposable celldb checkpoint (recreated every run); "
+            "must be on the same filesystem as the manifest's celldb for hardlinks to work. "
+            "When set, <node dir>/celldb becomes a symlink to it, which lets --net-dir live "
+            "on a different device than the state (fsync-heavy small writes — consensus DB, "
+            "statedb, archive, logs — split away from the big read workload)"
+        ),
     )
     _ = parser.add_argument("--rate", type=float, default=500.0, help="external msgs per second")
     _ = parser.add_argument("--duration", type=int, default=60, help="spam duration, seconds")
@@ -129,9 +142,13 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         help="extra bench-spam CLI arg (repeatable), e.g. --spam-arg=--connections=8",
     )
     args = parser.parse_args(argv)
+    celldb_checkpoint_dir = cast(Path | None, args.celldb_checkpoint_dir)
     return BenchParams(
         manifest=cast(Path, args.manifest).absolute(),
         net_dir=cast(Path, args.net_dir).absolute(),
+        celldb_checkpoint_dir=(
+            celldb_checkpoint_dir.absolute() if celldb_checkpoint_dir is not None else None
+        ),
         rate=cast(float, args.rate),
         duration=cast(int, args.duration),
         warmup=cast(int, args.warmup),
@@ -185,6 +202,9 @@ def _write_run_config(path: Path, params: BenchParams, repo_root: Path) -> None:
     config: dict[str, JSONSerializable] = {
         "manifest": str(params.manifest),
         "net_dir": str(params.net_dir),
+        "celldb_checkpoint_dir": (
+            str(params.celldb_checkpoint_dir) if params.celldb_checkpoint_dir is not None else None
+        ),
         "rate": params.rate,
         "duration": params.duration,
         "warmup": params.warmup,
@@ -195,6 +215,8 @@ def _write_run_config(path: Path, params: BenchParams, repo_root: Path) -> None:
         "keep_net": params.keep_net,
         "smoke": params.smoke,
         "probe_addr": params.probe_addr,
+        "engine_args": list(params.engine_args),
+        "spam_args": list(params.spam_args),
         "git_rev": _git_rev(repo_root),
         "finished_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
@@ -308,6 +330,17 @@ async def _amain(params: BenchParams) -> int:
         # first start (RocksDB checkpoint = hardlink copy, so each run gets a
         # disposable celldb). The engine runs with `--db .` and cwd=<node dir>,
         # so on startup this is indistinguishable from a restart.
+        celldb_dst = node.directory / "celldb"
+        if params.celldb_checkpoint_dir is not None:
+            # Device split: the checkpoint stays on the state's filesystem
+            # (hardlinks require it) while the node dir — and with it every
+            # other write target (consensus DB, statedb, archive, logs) — can
+            # live on another device. The engine follows the symlink.
+            if params.celldb_checkpoint_dir.exists():
+                l.info(f"removing previous celldb checkpoint {params.celldb_checkpoint_dir}")
+                shutil.rmtree(params.celldb_checkpoint_dir)
+            celldb_dst.symlink_to(params.celldb_checkpoint_dir)
+            celldb_dst = params.celldb_checkpoint_dir
         await _run_choomed(
             [
                 str(install.build_dir / "benchmark/bench-state-gen"),
@@ -315,7 +348,7 @@ async def _amain(params: BenchParams) -> int:
                 "--src",
                 str(celldb_src),
                 "--dst",
-                str(node.directory / "celldb"),
+                str(celldb_dst),
             ]
         )
 
