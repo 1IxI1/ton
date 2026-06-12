@@ -16,6 +16,8 @@
 */
 #pragma once
 
+#include <functional>
+
 #include "block/mc-config.h"
 #include "interfaces/validator-manager.h"
 #include "td/actor/coro_utils.h"
@@ -70,8 +72,19 @@ class ExtMessageChecker : public td::actor::Actor {
   BlockIdExt config_mc_block_id_;
   std::unique_ptr<block::ConfigInfo> config_;
   // Prepared transaction phase configs, keyed by (wc, state utime); cleared whenever config_
-  // refreshes. Saves re-fetching all config params for every message.
-  std::map<std::pair<WorkchainId, UnixTime>, std::unique_ptr<ExtMessageQ::ExecutionConfig>> exec_configs_;
+  // refreshes. Saves re-fetching all config params for every message. The no-log config is used
+  // for the first VM run; rejected messages are re-run with VM logging to produce the same
+  // detailed error as before (accepted messages skip the per-instruction log entirely).
+  struct ExecConfigPair {
+    std::unique_ptr<ExtMessageQ::ExecutionConfig> nolog, log;
+  };
+  std::map<std::pair<WorkchainId, UnixTime>, ExecConfigPair> exec_configs_;
+
+  // Runs the message without VM logging; on rejection, re-runs a freshly rebuilt account with
+  // logging to reconstruct the same detailed error message as before (the VM is deterministic).
+  td::Status run_message(WorkchainId wc, block::Account acc,
+                         const std::function<td::Result<block::Account>()> &rebuild_account, UnixTime utime,
+                         LogicalTime lt, const td::Ref<vm::Cell> &msg_root, ExecConfigPair &exec_config);
 
   struct CachedState {
     BlockIdExt block_id;

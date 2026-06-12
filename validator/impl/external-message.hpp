@@ -81,7 +81,7 @@ class ExtMessageQ : public ExtMessage {
     td::RefInt256 masterchain_create_fee, basechain_create_fee;
 
     static td::Result<std::unique_ptr<ExecutionConfig>> create(const block::ConfigInfo& config, ton::WorkchainId wc,
-                                                               UnixTime utime);
+                                                               UnixTime utime, bool with_vm_log);
   };
   static td::Status run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
                                            td::Ref<vm::Cell> msg_root, ExecutionConfig& exec_config);

@@ -52,28 +52,34 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
 
   timer = td::Timer();
   bool special = wc == masterchainId && config_->is_special_smartcontract(addr);
-  block::Account acc;
-  if (!acc.unpack(std::move(shard_acc), state.utime, special)) {
-    co_return td::Status::Error("Failed to unpack account state");
-  }
-  acc.block_lt = state.lt;
+  auto unpack_account = [shard_acc, special, utime = state.utime,
+                         lt = state.lt]() -> td::Result<block::Account> {
+    block::Account a;
+    if (!a.unpack(shard_acc, utime, special)) {
+      return td::Status::Error("Failed to unpack account state");
+    }
+    a.block_lt = lt;
+    return std::move(a);
+  };
+  auto acc = co_await unpack_account();
 
   // NOTE: exec_config stays valid below because nothing in between actually suspends (the
   // co_awaits unwrap ready td::Result values); only this worker's tasks mutate exec_configs_.
   auto &exec_config = exec_configs_[{wc, state.utime}];
-  if (exec_config == nullptr) {
-    exec_config = co_await ExtMessageQ::ExecutionConfig::create(*config_, wc, state.utime);
+  if (exec_config.nolog == nullptr) {
+    exec_config.nolog = co_await ExtMessageQ::ExecutionConfig::create(*config_, wc, state.utime, false);
+    exec_config.log = co_await ExtMessageQ::ExecutionConfig::create(*config_, wc, state.utime, true);
     if (exec_configs_.size() > 16) {
       std::erase_if(exec_configs_,
-                    [&](const auto &kv) { return kv.second == nullptr || kv.first.second + 60 < state.utime; });
+                    [&](const auto &kv) { return kv.second.nolog == nullptr || kv.first.second + 60 < state.utime; });
     }
   }
 
   const WalletMessageProcessor *wallet =
       acc.code.not_null() ? WalletMessageProcessor::get(acc.code->get_hash().bits()) : nullptr;
   if (wallet == nullptr) {
-    co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(),
-                                                 *exec_config);
+    co_await run_message(wc, std::move(acc), unpack_account, state.utime, state.lt + 1, message->root_cell(),
+                         exec_config);
     result.timings.vm = timer.elapsed();
     co_return result;
   }
@@ -98,8 +104,14 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
   // performs it at finalization (after this VM run instead of before it — same admission verdict).
   acc.data = co_await wallet->set_wallet_seqno(acc.data, msg_seqno);
   acc.storage_dict_hash = acc.orig_storage_dict_hash = {};
-  co_await ExtMessageQ::run_message_on_account(wc, &acc, state.utime, state.lt + 1, message->root_cell(),
-                                               *exec_config);
+  auto unpack_wallet_account = [&unpack_account, wallet, msg_seqno]() -> td::Result<block::Account> {
+    TRY_RESULT(a, unpack_account());
+    TRY_RESULT_ASSIGN(a.data, wallet->set_wallet_seqno(a.data, msg_seqno));
+    a.storage_dict_hash = a.orig_storage_dict_hash = {};
+    return std::move(a);
+  };
+  co_await run_message(wc, std::move(acc), unpack_wallet_account, state.utime, state.lt + 1, message->root_cell(),
+                       exec_config);
   result.timings.vm = timer.elapsed();
   result.is_wallet = true;
   result.msg_seqno = msg_seqno;
@@ -108,6 +120,29 @@ td::actor::Task<ExtMessageChecker::CheckedExtMsg> ExtMessageChecker::check(td::B
   result.state_utime = state.utime;
   LOG(DEBUG) << "Checked external message to " << wc << ":" << addr.to_hex() << ", " << wallet->name();
   co_return result;
+}
+
+td::Status ExtMessageChecker::run_message(WorkchainId wc, block::Account acc,
+                                          const std::function<td::Result<block::Account>()> &rebuild_account,
+                                          UnixTime utime, LogicalTime lt, const td::Ref<vm::Cell> &msg_root,
+                                          ExecConfigPair &exec_config) {
+  auto status = ExtMessageQ::run_message_on_account(wc, &acc, utime, lt, msg_root, *exec_config.nolog);
+  if (status.is_ok()) {
+    return status;
+  }
+  // Rejected: re-run a pristine account with VM logging so the error carries the same detail as
+  // before (the VM is deterministic; only the log differs). Costs a second run on the rejection
+  // path only, which is bounded by the admission in-flight cap.
+  auto r_acc = rebuild_account();
+  if (r_acc.is_error()) {
+    return status;
+  }
+  auto acc_retry = r_acc.move_as_ok();
+  auto status_with_log = ExtMessageQ::run_message_on_account(wc, &acc_retry, utime, lt, msg_root, *exec_config.log);
+  if (status_with_log.is_error()) {
+    return status_with_log;
+  }
+  return status;
 }
 
 td::actor::Task<ExtMessageChecker::ResolvedState> ExtMessageChecker::resolve_state(td::Ref<MasterchainState> mc_state,

@@ -153,7 +153,7 @@ td::Result<Ref<ExtMessageQ>> ExtMessageQ::create_ext_message(Ref<vm::Cell> root)
 }
 
 td::Result<std::unique_ptr<ExtMessageQ::ExecutionConfig>> ExtMessageQ::ExecutionConfig::create(
-    const block::ConfigInfo& config, ton::WorkchainId wc, UnixTime utime) {
+    const block::ConfigInfo& config, ton::WorkchainId wc, UnixTime utime, bool with_vm_log) {
   auto exec_config = std::make_unique<ExecutionConfig>();
   auto fetch_res = block::FetchConfigParams::fetch_config_params(
       config, &exec_config->old_mparams, &exec_config->storage_prices, &exec_config->storage_phase_cfg,
@@ -166,14 +166,14 @@ td::Result<std::unique_ptr<ExtMessageQ::ExecutionConfig>> ExtMessageQ::Execution
     return error.move_as_error_prefix("External message was not accepted: cannot fetch config params: ");
   }
   exec_config->compute_phase_cfg.libraries = std::make_unique<vm::Dictionary>(config.get_libraries_root(), 256);
-  exec_config->compute_phase_cfg.with_vm_log = true;
+  exec_config->compute_phase_cfg.with_vm_log = with_vm_log;
   exec_config->compute_phase_cfg.stop_on_accept_message = true;
   return std::move(exec_config);
 }
 
 td::Status ExtMessageQ::run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
                                                td::Ref<vm::Cell> msg_root, const block::ConfigInfo& config) {
-  TRY_RESULT(exec_config, ExecutionConfig::create(config, wc, utime));
+  TRY_RESULT(exec_config, ExecutionConfig::create(config, wc, utime, /* with_vm_log = */ true));
   return run_message_on_account(wc, acc, utime, lt, std::move(msg_root), *exec_config);
 }
 
