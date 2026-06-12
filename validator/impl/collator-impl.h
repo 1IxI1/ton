@@ -17,6 +17,7 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <deque>
 #include <map>
 #include <queue>
 
@@ -204,6 +205,7 @@ class Collator final : public td::actor::Actor {
   std::set<td::Bits256> registered_ext_msgs_;
   ExtMsgQueue ext_msg_queue_;
   std::optional<std::pair<td::Ref<ExtMessage>, int>> pending_ext_msg_;
+  std::deque<std::pair<td::Ref<ExtMessage>, int>> ext_msg_buffer_;
   td::CancellationTokenSource ext_msg_cancellation_;
 
   std::priority_queue<NewOutMsg, std::vector<NewOutMsg>, std::greater<NewOutMsg>> new_msgs;

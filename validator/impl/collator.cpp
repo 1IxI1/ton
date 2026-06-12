@@ -58,6 +58,8 @@ static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
 
 static constexpr int MAX_ATTEMPTS = 5;
+// Maximum number of externals drained from the queue at once for account path prefetch
+static constexpr size_t MAX_EXT_MSG_PREFETCH_BATCH = 256;
 
 namespace {
 
@@ -4348,7 +4350,11 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       co_return false;
     }
     std::pair<td::Ref<ExtMessage>, int> item;
-    if (pending_ext_msg_) {
+    if (!ext_msg_buffer_.empty()) {
+      // buffered messages were popped from the queue before pending_ext_msg_
+      item = std::move(ext_msg_buffer_.front());
+      ext_msg_buffer_.pop_front();
+    } else if (pending_ext_msg_) {
       item = std::move(*pending_ext_msg_);
       pending_ext_msg_.reset();
     } else {
@@ -4365,6 +4371,20 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
         break;  // queue empty or closed
       }
       item = maybe.move_as_ok();
+      // Opportunistically drain immediately available externals into a buffer and prefetch their
+      // destination account paths: background walkers warm the celldb cache for later messages
+      // while the messages are processed serially below
+      while (ext_msg_buffer_.size() < MAX_EXT_MSG_PREFETCH_BATCH) {
+        auto more = co_await ext_msg_queue_.try_pop().wrap();
+        if (more.is_error()) {
+          break;  // queue empty or closed
+        }
+        const auto& ext_msg_ref = more.ok().first;
+        if (ext_msg_ref->wc() == workchain() && is_our_address(ext_msg_ref->addr())) {
+          prefetch_account_path(ext_msg_ref->addr());
+        }
+        ext_msg_buffer_.push_back(more.move_as_ok());
+      }
     }
     td::ScopedRealCpuTimer timer_total{stats_.work_time.total};
     auto [ext_msg_ref, priority] = std::move(item);
@@ -5042,6 +5062,9 @@ void Collator::prefetch_msg_dest_account(const Ref<vm::Cell>& msg) {
  * @param new_msg The new output message to be registered.
  */
 void Collator::register_new_msg(block::NewOutMsg new_msg) {
+  // The message may be processed later in this block; warm up the destination account path
+  // in the background while the collator keeps executing transactions
+  prefetch_msg_dest_account(new_msg.msg);
   if (new_msg.lt < min_new_msg_lt) {
     min_new_msg_lt = new_msg.lt;
   }
@@ -6768,6 +6791,9 @@ td::uint32 Collator::get_skip_externals_queue_size() {
 void Collator::finalize_stats() {
   auto work_time = stats_.work_time.total;
   LOG(WARNING) << "Collate query work time = " << work_time.real << "s, cpu time = " << work_time.cpu << "s";
+  if (prefetch_issued_ || prefetch_dropped_) {
+    LOG(WARNING) << "Account path prefetch: issued=" << prefetch_issued_ << " dropped=" << prefetch_dropped_;
+  }
   if (block_candidate) {
     stats_.block_id = block_candidate->id;
     stats_.collated_data_hash = block_candidate->collated_file_hash;
