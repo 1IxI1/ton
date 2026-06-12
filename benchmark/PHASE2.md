@@ -227,4 +227,5 @@ budget at parity config.
 - W1/W2: blocked on P0
 - W3: done (merged) — simplex-aware ext pool: candidates hold externals, history collapse re-adds rejected blocks' externals; 8.7x goodput on the unleashed collapse scenario; unit tests in test/validator/test-ext-message-pool.cpp
 - W4: done (merged) — liteserver advertised tip never outruns the shard client; inverted "possibly out of sync" diagnostic fixed; 0 desync errors under load
-- W5: blocked on P0
+- W5: done (merged) — celldb 'bundle' records (tag -2): 5-level dict slabs + leaf+account+data bundles; 93->30 reads/transfer, 124->209.5 jTPS on bundled 256GB state (/mnt/bench/state-full-b5, root hash identical to state-full)
+- W7: done (merged) — ExtMessageChecker worker pool (24 workers) off the pool actor; admission ~8k/s with ~0 errors (was ~hundreds/s collapse), backpressure with fast rejects; found ~1ms VM floor per check + recurring ~30s engine-wide contention bursts (suspect state GC, future work)
