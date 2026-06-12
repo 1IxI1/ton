@@ -67,7 +67,7 @@ class ExtMessageQ : public ExtMessage {
                                                              block::SizeLimitsConfig::ExtMsgLimits limits);
   static td::Result<td::Ref<ExtMessageQ>> create_ext_message(td::Ref<vm::Cell> root);  // Skips message size checks.
   static td::Status run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
-                                           td::Ref<vm::Cell> msg_root, std::unique_ptr<block::ConfigInfo> config);
+                                           td::Ref<vm::Cell> msg_root, const block::ConfigInfo& config);
 };
 
 td::Result<td::Bits256> get_ext_in_msg_hash_norm(td::Ref<vm::Cell> ext_in_msg_cell);

@@ -5,6 +5,7 @@ set(TON_VALIDATOR_SOURCE
   collator.cpp
   config.cpp
   external-message.cpp
+  ext-message-checker.cpp
   ext-message-pool.cpp
   fabric.cpp
   ihr-message.cpp
@@ -22,6 +23,7 @@ set(TON_VALIDATOR_SOURCE
   collator-impl.h
   config.hpp
   external-message.hpp
+  ext-message-checker.hpp
   ext-message-pool.hpp
   ihr-message.hpp
   liteserver.hpp

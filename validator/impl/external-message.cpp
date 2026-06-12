@@ -153,7 +153,7 @@ td::Result<Ref<ExtMessageQ>> ExtMessageQ::create_ext_message(Ref<vm::Cell> root)
 }
 
 td::Status ExtMessageQ::run_message_on_account(ton::WorkchainId wc, block::Account* acc, UnixTime utime, LogicalTime lt,
-                                               td::Ref<vm::Cell> msg_root, std::unique_ptr<block::ConfigInfo> config) {
+                                               td::Ref<vm::Cell> msg_root, const block::ConfigInfo& config) {
   Ref<vm::Cell> old_mparams;
   std::vector<block::StoragePrices> storage_prices_;
   block::StoragePhaseConfig storage_phase_cfg_{&storage_prices_};
@@ -164,14 +164,14 @@ td::Status ExtMessageQ::run_message_on_account(ton::WorkchainId wc, block::Accou
   td::RefInt256 masterchain_create_fee, basechain_create_fee;
 
   auto fetch_res = block::FetchConfigParams::fetch_config_params(
-      *config, &old_mparams, &storage_prices_, &storage_phase_cfg_, &rand_seed_, &compute_phase_cfg_,
+      config, &old_mparams, &storage_prices_, &storage_phase_cfg_, &rand_seed_, &compute_phase_cfg_,
       &action_phase_cfg_, &serialize_config_, &masterchain_create_fee, &basechain_create_fee, wc, utime);
   if (fetch_res.is_error()) {
     auto error = fetch_res.move_as_error();
     LOG(DEBUG) << "Cannot fetch config params: " << error.message();
     return error.move_as_error_prefix("External message was not accepted: cannot fetch config params: ");
   }
-  compute_phase_cfg_.libraries = std::make_unique<vm::Dictionary>(config->get_libraries_root(), 256);
+  compute_phase_cfg_.libraries = std::make_unique<vm::Dictionary>(config.get_libraries_root(), 256);
   compute_phase_cfg_.with_vm_log = true;
   compute_phase_cfg_.stop_on_accept_message = true;
 

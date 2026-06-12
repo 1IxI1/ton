@@ -23,6 +23,7 @@
 #include "td/utils/PersistentTreap.h"
 
 #include "external-message.hpp"
+#include "ext-message-checker.hpp"
 
 namespace ton::validator {
 
@@ -37,6 +38,8 @@ class ExtMessagePool : public td::actor::Actor {
     td::actor::StartedTask<> wait_allow_broadcast;
   };
   td::actor::Task<CheckResult> check_add_external_message(td::BufferSlice data, int priority, bool add_to_mempool);
+  // Cheap pre-check called back by ExtMessageChecker workers before the expensive stages.
+  td::Result<td::Unit> admission_precheck(WorkchainId wc, StdSmcAddress addr);
   void install_collator_queue(ShardIdFull shard, std::unique_ptr<ExtMsgCallback> callback);
   void cleanup_external_messages(ShardIdFull shard);
   void complete_external_messages(std::vector<ExtMessage::Hash> to_delay, std::vector<ExtMessage::Hash> to_delete);
@@ -60,6 +63,9 @@ class ExtMessagePool : public td::actor::Actor {
   std::vector<std::pair<std::string, std::string>> prepare_stats();
 
   void alarm() override;
+  void start_up() override {
+    alarm_timestamp().relax(admission_stats_at_);
+  }
 
  private:
   struct MessageId {
@@ -208,11 +214,28 @@ class ExtMessagePool : public td::actor::Actor {
   };
   std::map<std::pair<WorkchainId, StdSmcAddress>, WalletInfo> wallets_;
 
-  td::actor::Task<CheckResult> check_message(td::Ref<ExtMessage> message, td::optional<td::uint32> &msg_seqno);
-  td::Result<td::uint32> check_message_to_wallet(td::Ref<ExtMessage> message, const WalletMessageProcessor *wallet,
-                                                 block::Account acc, UnixTime utime, LogicalTime lt,
-                                                 std::unique_ptr<block::ConfigInfo> config,
-                                                 td::Promise<td::Unit> allow_broadcast_promise);
+  // ===== Parallel admission =====
+  // The expensive per-message stages (parse, account state fetch, VM check) run on these worker
+  // actors; the pool only dispatches and finalizes. Created lazily on the first check.
+  std::vector<td::actor::ActorOwn<ExtMessageChecker>> checkers_;
+  std::vector<size_t> checker_inflight_;
+  size_t next_checker_{0};
+  void init_checkers();
+  // Atomic (non-suspending) pool-side completion of a checked wallet message: prune/dedup the
+  // wallet seqno window and register the allow-broadcast promise.
+  td::Result<td::actor::StartedTask<>> finalize_wallet_check(const td::Ref<ExtMessage> &message,
+                                                             const ExtMessageChecker::CheckedExtMsg &checked);
+
+  // Rolling window for the periodic "ext admission" INFO stat.
+  struct AdmissionWindowStats {
+    td::uint64 in{0}, admitted{0}, rejected{0}, checked{0};
+    double check_time{0};
+    ExtMessageChecker::StageTimings timings;
+    td::Timestamp window_start = td::Timestamp::now();
+  };
+  AdmissionWindowStats admission_window_;
+  td::Timestamp admission_stats_at_ = td::Timestamp::in(ADMISSION_STATS_PERIOD);
+  void log_admission_stats();
 
   std::vector<std::unique_ptr<ExtMsgCallback>> callbacks_;
 
@@ -222,7 +245,8 @@ class ExtMessagePool : public td::actor::Actor {
   static constexpr size_t MAX_EXT_MSG_PER_ADDR = 3 * 10;
   static constexpr size_t PER_ADDRESS_LIMIT = 256;
   static constexpr size_t SOFT_MEMPOOL_LIMIT = 1024;
-  static constexpr td::uint32 MAX_WALLET_SEQNO_DIFF = 16;
+  static constexpr size_t NUM_CHECKERS = 10;
+  static constexpr double ADMISSION_STATS_PERIOD = 5.0;
 };
 
 }  // namespace ton::validator
