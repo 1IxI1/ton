@@ -224,3 +224,14 @@ uv run python test/integration/bench_jetton.py \
   --rate 1200 --duration 180 --warmup 15 --spam-arg=--connections=8
 ```
 Results: /mnt/bench/results/p2-FINAL-r1200 (330 jTPS steady).
+
+### Final-binary RAM-resident measurements (addendum)
+
+| config | steady jetton TPS | notes |
+|---|---|---|
+| state-mid (RAM), mainnet limits, r2000 | **476** | 1427 tx/s; gas soft limit NOT reached (max 592 tx/blk ≈ 4.9M gas) — per-transfer collation time binds (~1ms effective, up from the 0.54ms pre-W1 estimate; collated-data proofs + io-mux overhead suspected) |
+| state-mid (RAM), ×10 limits, r3000 | **406** | mega-block (933 tx) + empty-block cycling — the unfixed inbound-internal/dispatch-queue time-bounding bug (RESULTS.md §4b, second instance); W3 prevents external loss so it recovers per cycle instead of collapsing |
+
+Implication: on RAM-resident state the next lever is per-transfer collation CPU (profile
+the proof-building and io-mux overhead at RAM speeds) and the §4b-second-instance fix;
+limits bind nowhere on the final binary.
