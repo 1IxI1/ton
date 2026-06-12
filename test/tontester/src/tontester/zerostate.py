@@ -1,8 +1,10 @@
 import hashlib
+import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Never, override
+from typing import Never, cast, override
 
 import nacl.signing
 from bitarray import bitarray
@@ -88,6 +90,8 @@ from tlb.object import (
 )
 from tonapi import ton_api
 
+from tl import JSONSerializable
+
 from .key import Key
 from .validator_set import compute_validator_set_hash
 
@@ -147,6 +151,7 @@ class NetworkConfig:
     global_version: int = 14
     shard_validators: int = 1
     block_limit_mul: int = 1
+    gas_limit_mul: int = 1
     mc_valgroup_lifetime: int = 250
     mc_consensus: SimplexConsensusConfig | None = field(
         default_factory=lambda: SimplexConsensusConfig()
@@ -159,9 +164,49 @@ class NetworkConfig:
 
 @dataclass
 class WorkchainState:
-    file: Path
+    file: Path | None
     file_hash: bytes
     root_hash: bytes
+
+
+@dataclass(frozen=True)
+class ExternalBasechainState:
+    """Workchain-0 zerostate generated outside of tontester (e.g. by bench-state-gen).
+
+    Only the hashes and aggregate values are known; the state's cells are expected
+    to be pre-placed into the node's celldb, so no static BoC file is produced.
+    """
+
+    root_hash: bytes
+    file_hash: bytes
+    total_balance: int
+    gen_utime: int
+
+    @classmethod
+    def from_manifest(cls, path: Path) -> "ExternalBasechainState":
+        """Parse a bench-state-gen manifest.json (see benchmark/DESIGN.md)."""
+        manifest = cast(JSONSerializable, json.loads(path.read_text()))
+        assert isinstance(manifest, Mapping), f"{path}: manifest must be a JSON object"
+
+        def get_str(key: str) -> str:
+            value = manifest[key]
+            assert isinstance(value, str), f"{path}: field {key!r} must be a string"
+            return value
+
+        def get_int(key: str) -> int:
+            value = manifest[key]
+            assert isinstance(value, int), f"{path}: field {key!r} must be an integer"
+            return value
+
+        root_hash = bytes.fromhex(get_str("root_hash_hex"))
+        file_hash = bytes.fromhex(get_str("file_hash_hex"))
+        assert len(root_hash) == 32 and len(file_hash) == 32
+        return cls(
+            root_hash=root_hash,
+            file_hash=file_hash,
+            total_balance=int(get_str("total_balance")),
+            gen_utime=get_int("gen_utime"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +484,7 @@ def _build_config_params(
     params.append(ConfigParam_18(field=sp_dict))
 
     # Param 20: mc gas prices
+    gas_mul = config.gas_limit_mul
     params.append(
         config_mc_gas_prices(
             field=gas_flat_pfx(
@@ -449,7 +495,7 @@ def _build_config_params(
                     gas_limit=1_000_000,
                     special_gas_limit=20_000_000,
                     gas_credit=10_000,
-                    block_gas_limit=1000 * 1_000_000,
+                    block_gas_limit=1000 * 1_000_000 * gas_mul,
                     freeze_due_limit=int(0.1 * GRAM),
                     delete_due_limit=1 * GRAM,
                 ),
@@ -468,7 +514,7 @@ def _build_config_params(
                     gas_limit=1_000_000,
                     special_gas_limit=1_000_000,
                     gas_credit=10_000,
-                    block_gas_limit=1000 * 1_000_000,
+                    block_gas_limit=1000 * 1_000_000 * gas_mul,
                     freeze_due_limit=int(0.1 * GRAM),
                     delete_due_limit=1 * GRAM,
                 ),
@@ -485,7 +531,9 @@ def _build_config_params(
                     underload=128 * 1024, soft_limit=512 * 1024 * mul, hard_limit=1024 * 1024 * mul
                 ),
                 gas=param_limits(
-                    underload=2_000_000, soft_limit=100_000_000, hard_limit=100_000_000
+                    underload=2_000_000,
+                    soft_limit=100_000_000 * gas_mul,
+                    hard_limit=100_000_000 * gas_mul,
                 ),
                 lt_delta=param_limits(underload=1000, soft_limit=500_000, hard_limit=1_000_000),
             )
@@ -500,7 +548,9 @@ def _build_config_params(
                     underload=128 * 1024, soft_limit=512 * 1024 * mul, hard_limit=1024 * 1024 * mul
                 ),
                 gas=param_limits(
-                    underload=2_000_000, soft_limit=100_000_000, hard_limit=100_000_000
+                    underload=2_000_000,
+                    soft_limit=100_000_000 * gas_mul,
+                    hard_limit=100_000_000 * gas_mul,
                 ),
                 lt_delta=param_limits(underload=1000, soft_limit=500_000, hard_limit=1_000_000),
             )
@@ -759,7 +809,7 @@ def create_zerostate(
     config: NetworkConfig,
     validator_keys: list[Key],
     *,
-    basechain_fhash_override: bytes | None = None,
+    external_basechain: ExternalBasechainState | None = None,
 ) -> Zerostate:
     now_time = int(time.time())
     zs = ZerostateBuilder()
@@ -784,46 +834,60 @@ def create_zerostate(
     wallet_addr_int = 0  # AllOnes * 0
     config_params = _build_config_params(config, validator_keys, now_time, wallet_addr_int)
 
-    # --- Build workchain 0 (base chain) empty shard state ---
-    base_state = shard_state(
-        global_id=-777,
-        shard_id=shard_ident(shard_pfx_bits=0, workchain_id=0, shard_prefix=1 << 63),
-        seq_no=0,
-        vert_seq_no=0,
-        gen_utime=now_time,
-        gen_lt=0,
-        min_ref_mc_seqno=0xFFFF_FFFF,
-        out_msg_queue_info=ref(
-            OutMsgQueueInfo(
-                out_queue=OutMsgQueue({}),
-                proc_info=ProcessedInfo({}),
-                extra=None,
-            )
-        ),
-        before_split=0,
-        accounts=ref(
-            ShardAccounts(
-                field=HashmapDict(256, account_descr, depth_balance, DepthBalanceAug()),
-            )
-        ),
-        field=ref(
-            Anon_4(
-                overload_history=0,
-                underload_history=0,
-                total_balance=_zero_cc(),
-                total_validator_fees=_zero_cc(),
-                libraries=HashmapDict(256, shared_lib_descr),
-                master_ref=None,
-            )
-        ),
-        custom=None,
-    )
+    # --- Build workchain 0 (base chain) empty shard state, or take an external one ---
+    external_balance = 0
+    if external_basechain is None:
+        base_state = shard_state(
+            global_id=-777,
+            shard_id=shard_ident(shard_pfx_bits=0, workchain_id=0, shard_prefix=1 << 63),
+            seq_no=0,
+            vert_seq_no=0,
+            gen_utime=now_time,
+            gen_lt=0,
+            min_ref_mc_seqno=0xFFFF_FFFF,
+            out_msg_queue_info=ref(
+                OutMsgQueueInfo(
+                    out_queue=OutMsgQueue({}),
+                    proc_info=ProcessedInfo({}),
+                    extra=None,
+                )
+            ),
+            before_split=0,
+            accounts=ref(
+                ShardAccounts(
+                    field=HashmapDict(256, account_descr, depth_balance, DepthBalanceAug()),
+                )
+            ),
+            field=ref(
+                Anon_4(
+                    overload_history=0,
+                    underload_history=0,
+                    total_balance=_zero_cc(),
+                    total_validator_fees=_zero_cc(),
+                    libraries=HashmapDict(256, shared_lib_descr),
+                    master_ref=None,
+                )
+            ),
+            custom=None,
+        )
 
-    base_state_cell = base_state.serialize()
-    base_boc = base_state_cell.to_boc()
-    base_fhash = basechain_fhash_override or hashlib.sha256(base_boc).digest()
-    base_rhash = base_state_cell.hash
-    _ = (state_dir / "basestate0.boc").write_bytes(base_boc)
+        base_state_cell = base_state.serialize()
+        base_boc = base_state_cell.to_boc()
+        base_fhash = hashlib.sha256(base_boc).digest()
+        base_rhash = base_state_cell.hash
+        base_file: Path | None = state_dir / "basestate0.boc"
+        _ = base_file.write_bytes(base_boc)
+    else:
+        # The basechain state was generated externally (its cells must be
+        # pre-placed into each validator's celldb); no static BoC is written.
+        assert external_basechain.gen_utime <= now_time, (
+            f"external basechain gen_utime {external_basechain.gen_utime} is in the future"
+            f" (now {now_time})"
+        )
+        base_rhash = external_basechain.root_hash
+        base_fhash = external_basechain.file_hash
+        base_file = None
+        external_balance = external_basechain.total_balance
 
     # --- Now add param 12 (workchains) with base state hashes ---
     from block.generated import ConfigParam_12
@@ -907,7 +971,7 @@ def create_zerostate(
                 block_create_stats=None,
             )
         ),
-        global_balance=_cc(total_balance),
+        global_balance=_cc(total_balance + external_balance),
     )
 
     mc_state = shard_state(
@@ -953,7 +1017,7 @@ def create_zerostate(
             root_hash=mc_rhash,
         ),
         shardchain=WorkchainState(
-            file=state_dir / "basestate0.boc",
+            file=base_file,
             file_hash=base_fhash,
             root_hash=base_rhash,
         ),
