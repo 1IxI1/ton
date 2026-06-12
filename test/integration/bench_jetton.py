@@ -68,6 +68,7 @@ class BenchParams:
     smoke: bool
     probe_addr: str | None
     node_verbosity: int
+    engine_args: tuple[str, ...]
 
 
 def _parse_args(argv: list[str] | None = None) -> BenchParams:
@@ -112,6 +113,13 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         default=1,
         help="validator-engine log verbosity (keep low for high-rate runs)",
     )
+    _ = parser.add_argument(
+        "--engine-arg",
+        action="append",
+        default=[],
+        dest="engine_args",
+        help="extra validator-engine CLI arg (repeatable), e.g. --engine-arg=--celldb-cache-size=34359738368",
+    )
     args = parser.parse_args(argv)
     return BenchParams(
         manifest=cast(Path, args.manifest).absolute(),
@@ -127,6 +135,7 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         smoke=cast(bool, args.smoke),
         probe_addr=cast(str | None, args.probe_addr),
         node_verbosity=cast(int, args.node_verbosity),
+        engine_args=tuple(cast(list[str], args.engine_args)),
     )
 
 
@@ -302,7 +311,10 @@ async def _amain(params: BenchParams) -> int:
 
         await dht.run()
         await node.run(
-            StartOptions(args=("--disable-state-serializer",), verbosity=params.node_verbosity)
+            StartOptions(
+                args=("--disable-state-serializer", *params.engine_args),
+                verbosity=params.node_verbosity,
+            )
         )
 
         l.info(f"waiting for wc0 seqno >= {MIN_WC0_SEQNO} (proves the external state loaded)")
