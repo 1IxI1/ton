@@ -224,7 +224,7 @@ budget at parity config.
 - C0: done — full collated data on by default (param-8 cap 0x3EE, mainnet parity) +
   mainnet 22/23 block limits as mul baselines; verified wc0 validation reads no celldb
   state (r300 run: 586 tps included, validation pure-CPU ~28ms mean).
-- W1/W2: blocked on P0
+- W1: done (merged) — io-mux: awaited account-path walkers (8 coroutine walkers, window 64) + shadow inbound-queue walker + out-queue insert warming; replaces AccountPrefetchPool (removed). Eliminates all account/queue celldb io-wait (cold-collator A/B +75%; vs prefetch baseline +7.7%). KEY FINDING: residual ~175ms/block real-vs-cpu gap is page-cache reclaim (folio_wait) + fsync/jbd2 pressure, NOT celldb reads -> W8. W2 (cross-account parallel execution): design note in W1 report, not implemented
 - W3: done (merged) — simplex-aware ext pool: candidates hold externals, history collapse re-adds rejected blocks' externals; 8.7x goodput on the unleashed collapse scenario; unit tests in test/validator/test-ext-message-pool.cpp
 - W4: done (merged) — liteserver advertised tip never outruns the shard client; inverted "possibly out of sync" diagnostic fixed; 0 desync errors under load
 - W5: done (merged) — celldb 'bundle' records (tag -2): 5-level dict slabs + leaf+account+data bundles; 93->30 reads/transfer, 124->209.5 jTPS on bundled 256GB state (/mnt/bench/state-full-b5, root hash identical to state-full)
