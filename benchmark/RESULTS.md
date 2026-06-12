@@ -229,7 +229,7 @@ Results: /mnt/bench/results/p2-FINAL-r1200 (330 jTPS steady).
 
 | config | steady jetton TPS | notes |
 |---|---|---|
-| state-mid (RAM), mainnet limits, r2000 | **476** | 1427 tx/s; gas soft limit NOT reached (max 592 tx/blk ≈ 4.9M gas) — per-transfer collation time binds (~1ms effective, up from the 0.54ms pre-W1 estimate; collated-data proofs + io-mux overhead suspected) |
+| state-mid (RAM), mainnet limits, r2000 | **476** | 1427 tx/s; BYTE-BOUND on the mainnet 1MB soft limit (saturated blocks ~576 txs = ~192 transfers ≈ 1MB size estimate, ~1.42MB fetched BoC; gas only 4.9M of 10M). Theoretical ceiling at these limits ≈ 500 jTPS — this run is at ~96% of it. (Earlier "per-transfer CPU ~1ms binds" attribution was wrong.) |
 | state-mid (RAM), ×10 limits, r3000 | **406** | mega-block (933 tx) + empty-block cycling — the unfixed inbound-internal/dispatch-queue time-bounding bug (RESULTS.md §4b, second instance); W3 prevents external loss so it recovers per cycle instead of collapsing |
 
 Implication: on RAM-resident state the next lever is per-transfer collation CPU (profile
