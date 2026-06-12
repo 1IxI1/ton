@@ -274,6 +274,7 @@ class Collator final : public td::actor::Actor {
   void init_io_mux(const Ref<vm::Cell>& pure_state_root);
   td::optional<ton::StdSmcAddress> get_msg_dest_in_shard(const Ref<vm::Cell>& msg) const;
   void issue_account_path_resolution(const ton::StdSmcAddress& addr);
+  void issue_out_queue_insert_path(const Ref<vm::Cell>& msg);
   td::actor::Task<> wait_account_path_resolved(ton::StdSmcAddress addr);
   void start_inbound_queue_shadow();
   void note_inbound_msg_processed();

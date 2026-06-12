@@ -146,6 +146,17 @@ struct CollationStats {
     td::RealCpuTimer::Time create_block;
     td::RealCpuTimer::Time create_collated_data;
     td::RealCpuTimer::Time create_block_candidate;
+    // intake decomposition (the phases below overlap the phases above and are not part of the
+    // total<->phases accounting; they exist to attribute the intake time)
+    td::RealCpuTimer::Time intake_dispatch;
+    td::RealCpuTimer::Time intake_inbound;
+    td::RealCpuTimer::Time intake_externals;
+    td::RealCpuTimer::Time intake_new_msgs;
+    td::RealCpuTimer::Time make_account;
+    td::RealCpuTimer::Time enqueue_msg;
+    td::RealCpuTimer::Time inbound_extract;
+    td::RealCpuTimer::Time inbound_parse;
+    td::RealCpuTimer::Time inbound_process;
 
     std::string to_str(bool is_cpu) const {
       return PSTRING() << "total=" << total.get(is_cpu) << " preinit=" << preinit.get(is_cpu)
@@ -159,7 +170,15 @@ struct CollationStats {
                        << " create_shard_state=" << create_shard_state.get(is_cpu)
                        << " create_block=" << create_block.get(is_cpu)
                        << " create_collated_data=" << create_collated_data.get(is_cpu)
-                       << " create_block_candidate=" << create_block_candidate.get(is_cpu);
+                       << " create_block_candidate=" << create_block_candidate.get(is_cpu)
+                       << " intake_dispatch=" << intake_dispatch.get(is_cpu)
+                       << " intake_inbound=" << intake_inbound.get(is_cpu)
+                       << " intake_externals=" << intake_externals.get(is_cpu)
+                       << " intake_new_msgs=" << intake_new_msgs.get(is_cpu)
+                       << " make_account=" << make_account.get(is_cpu) << " enqueue_msg=" << enqueue_msg.get(is_cpu)
+                       << " inbound_extract=" << inbound_extract.get(is_cpu)
+                       << " inbound_parse=" << inbound_parse.get(is_cpu)
+                       << " inbound_process=" << inbound_process.get(is_cpu);
     }
   };
   WorkTimeStats work_time;

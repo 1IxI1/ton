@@ -158,6 +158,25 @@ void walk_account_path_blocking(const std::vector<Ref<vm::Cell>>& dict_roots, co
   }
 }
 
+/**
+ * Blocking part of an out-queue insert-path walk: descends the raw out-queue dictionary towards
+ * `key`, materializing the path that a subsequent insert of this key into the (mutated) queue
+ * dictionary will traverse — the bottom levels of both trees are the same shared cell instances.
+ * A lookup of an absent key still descends to the divergence point, which is exactly where the
+ * insert will rebuild the tree.
+ */
+void walk_out_queue_path_blocking(const std::vector<Ref<vm::Cell>>& queue_roots, const td::BitArray<352>& key) {
+  for (const auto& root : queue_roots) {
+    try {
+      vm::AugmentedDictionary dict{root, 352, block::tlb::aug_OutMsgQueue};
+      dict.lookup(key.bits(), 352);
+    } catch (vm::VmError&) {
+      // best-effort
+    } catch (vm::VmVirtError&) {
+    }
+  }
+}
+
 }  // namespace
 
 /**
@@ -165,7 +184,7 @@ void walk_account_path_blocking(const std::vector<Ref<vm::Cell>>& dict_roots, co
  * above). Owned via shared_ptr by the Collator, the walker coroutines and the shadow walker.
  */
 struct CollatorIoMuxState : public std::enable_shared_from_this<CollatorIoMuxState> {
-  static constexpr size_t WINDOW = 32;                 // inbound-queue messages resolved ahead of execution
+  static constexpr size_t WINDOW = 64;                 // inbound-queue messages resolved ahead of execution
   static constexpr size_t MAX_CONCURRENT_WALKS = 8;    // bounded number of in-flight account path walks
   static constexpr size_t SHADOW_BATCH = 16;           // shadow queue walker: messages parsed per batch
   static constexpr size_t ACCOUNT_SUBTREE_CELLS = 64;  // account state cells materialized per account
@@ -178,13 +197,22 @@ struct CollatorIoMuxState : public std::enable_shared_from_this<CollatorIoMuxSta
     td::actor::StartedTask<td::Unit>::ExternalPromise waiter;
   };
 
+  // A unit of background walk work: either an (awaitable) account path resolution or a
+  // fire-and-complete out-queue insert-path warmup.
+  struct WalkItem {
+    bool is_queue_key = false;
+    ton::StdSmcAddress addr;
+    td::BitArray<352> queue_key;
+  };
+
   std::mutex mu;
   bool closed = false;
   std::map<ton::StdSmcAddress, Entry> entries;
-  std::deque<ton::StdSmcAddress> walk_queue;
+  std::deque<WalkItem> walk_queue;
   size_t running_walks = 0;
   // immutable after init
   std::vector<Ref<vm::Cell>> account_dict_roots;
+  std::vector<Ref<vm::Cell>> queue_dict_roots;  // raw out-queue roots of the prev state(s)
   ton::ShardIdFull shard{ton::workchainInvalid, 0};
   // shadow walker (fields below `mu` unless noted)
   std::vector<block::OutputQueueMerger::Neighbor> shadow_neighbors;  // immutable after start
@@ -196,6 +224,7 @@ struct CollatorIoMuxState : public std::enable_shared_from_this<CollatorIoMuxSta
   // stats
   td::uint32 issued = 0;
   td::uint32 resolved = 0;
+  td::uint32 queue_paths = 0;
   td::uint32 waited = 0;
   double wait_time = 0.0;
 
@@ -225,44 +254,78 @@ struct CollatorIoMuxState : public std::enable_shared_from_this<CollatorIoMuxSta
         start_walk = true;
       } else {
         it->second.queued = true;
-        walk_queue.push_back(addr);
+        walk_queue.push_back(WalkItem{.is_queue_key = false, .addr = addr, .queue_key = {}});
       }
     }
     if (start_walk) {
-      start_walker(addr);
+      start_walker(WalkItem{.is_queue_key = false, .addr = addr, .queue_key = {}});
     }
   }
 
   /**
-   * Starts the walker coroutine for `addr` on the actor scheduler.
+   * Issues an out-queue insert-path warmup for `key` (thread-safe). Not awaitable: the warmed
+   * cells simply make the later synchronous insert into the queue dictionary run at RAM speed.
    */
-  void start_walker(ton::StdSmcAddress addr) {
-    auto task = [](std::shared_ptr<CollatorIoMuxState> self, ton::StdSmcAddress walk_addr) -> td::actor::Task<td::Unit> {
+  void issue_queue_path(const td::BitArray<352>& key) {
+    bool start_walk = false;
+    WalkItem item{.is_queue_key = true, .addr = {}, .queue_key = key};
+    {
+      std::lock_guard<std::mutex> guard(mu);
+      if (closed || queue_dict_roots.empty()) {
+        return;
+      }
+      ++queue_paths;
+      if (running_walks < MAX_CONCURRENT_WALKS) {
+        ++running_walks;
+        start_walk = true;
+      } else {
+        walk_queue.push_back(item);
+      }
+    }
+    if (start_walk) {
+      start_walker(item);
+    }
+  }
+
+  /**
+   * Starts the walker coroutine for one work item on the actor scheduler.
+   */
+  void start_walker(WalkItem item) {
+    auto task = [](std::shared_ptr<CollatorIoMuxState> self, WalkItem cur) -> td::actor::Task<td::Unit> {
       while (true) {
         // runs on a scheduler worker thread; the blocking reads happen right here
-        walk_account_path_blocking(self->account_dict_roots, walk_addr, ACCOUNT_SUBTREE_CELLS);
+        if (cur.is_queue_key) {
+          walk_out_queue_path_blocking(self->queue_dict_roots, cur.queue_key);
+        } else {
+          walk_account_path_blocking(self->account_dict_roots, cur.addr, ACCOUNT_SUBTREE_CELLS);
+        }
         td::actor::StartedTask<td::Unit>::ExternalPromise waiter;
         bool have_next = false;
         {
           std::lock_guard<std::mutex> guard(self->mu);
-          auto it = self->entries.find(walk_addr);
-          if (it != self->entries.end()) {
-            it->second.done = true;
-            it->second.walking = false;
-            waiter = std::move(it->second.waiter);
+          if (!cur.is_queue_key) {
+            auto it = self->entries.find(cur.addr);
+            if (it != self->entries.end()) {
+              it->second.done = true;
+              it->second.walking = false;
+              waiter = std::move(it->second.waiter);
+            }
+            ++self->resolved;
           }
-          ++self->resolved;
           while (!self->closed && !self->walk_queue.empty()) {
             auto next = self->walk_queue.front();
             self->walk_queue.pop_front();
-            auto next_it = self->entries.find(next);
-            if (next_it != self->entries.end() && next_it->second.queued && !next_it->second.done) {
+            if (!next.is_queue_key) {
+              auto next_it = self->entries.find(next.addr);
+              if (next_it == self->entries.end() || !next_it->second.queued || next_it->second.done) {
+                continue;  // stale (e.g. promoted by the main loop)
+              }
               next_it->second.queued = false;
               next_it->second.walking = true;
-              walk_addr = next;
-              have_next = true;
-              break;
             }
+            cur = next;
+            have_next = true;
+            break;
           }
           if (!have_next) {
             --self->running_walks;
@@ -278,7 +341,7 @@ struct CollatorIoMuxState : public std::enable_shared_from_this<CollatorIoMuxSta
         co_await td::actor::yield_on(td::actor::Executor::on_scheduler());
       }
       co_return td::Unit{};
-    }(shared_from_this(), addr);
+    }(shared_from_this(), item);
     task.set_executor(td::actor::Executor::on_scheduler());
     // The task is bounded (at most one queued chain of walks) and owns everything it touches via
     // shared_ptr; it is intentionally not stored anywhere — storing it in `entries` would create
@@ -3218,6 +3281,7 @@ td::Result<block::Account*> Collator::make_account(td::ConstBitPtr addr, bool fo
   if (found) {
     return found;
   }
+  td::ScopedRealCpuTimer timer{stats_.work_time.make_account};
   auto dict_entry = account_dict->lookup_extra(addr, 256);
   if (dict_entry.first.is_null()) {
     if (!force_create) {
@@ -4514,11 +4578,13 @@ static std::string block_full_comment(const block::BlockLimitStatus& block_limit
  */
 td::actor::Task<bool> Collator::process_inbound_internal_messages() {
   td::ScopedRealCpuTimer timer_total{stats_.work_time.total};
+  td::ScopedRealCpuTimer timer_intake{stats_.work_time.intake_inbound};
   SCOPE_EXIT {
     stats_.load_fraction_internals = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
   };
   while (!nb_out_msgs_->is_eof()) {
     block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
+    td::ScopedRealCpuTimer timer_extract{stats_.work_time.inbound_extract};
     auto kv = nb_out_msgs_->extract_cur();
     CHECK(kv && kv->msg.not_null());
     auto& neighbor_stats = stats_.neighbors.at(kv->source);
@@ -4561,17 +4627,25 @@ td::actor::Task<bool> Collator::process_inbound_internal_messages() {
       // io-mux: this message is now committed for processing; await the resolution of its
       // destination account. The dest parse loads exactly the cells process_inbound_message()
       // loads right below, so usage recording is unchanged.
+      td::ScopedRealCpuTimer timer_parse{stats_.work_time.inbound_parse};
       note_inbound_msg_processed();
       auto msg_env = kv->msg->prefetch_ref();
       block::tlb::MsgEnvelope::Record_std env;
       if (msg_env.not_null() && block::tlb::unpack_cell(msg_env, env) && env.msg.not_null()) {
         if (auto dest = get_msg_dest_in_shard(env.msg)) {
           timer_total.pause();
+          timer_intake.pause();
+          timer_extract.pause();
+          timer_parse.pause();
           co_await wait_account_path_resolved(dest.value());
           timer_total.resume();
+          timer_intake.resume();
+          timer_extract.resume();
+          timer_parse.resume();
         }
       }
     }
+    timer_extract.pause();
     LOG(DEBUG) << "processing inbound message with (lt,hash)=(" << kv->lt << "," << kv->key.to_hex()
                << ") from neighbor #" << kv->source;
     ++neighbor_stats.processed_msgs;
@@ -4581,7 +4655,12 @@ td::actor::Task<bool> Collator::process_inbound_internal_messages() {
         block::gen::t_EnqueuedMsg.print(sb, kv->msg);
       };
     }
-    if (!process_inbound_message(kv->msg, kv->lt, kv->key.cbits(), kv->source)) {
+    bool process_ok;
+    {
+      td::ScopedRealCpuTimer timer_process{stats_.work_time.inbound_process};
+      process_ok = process_inbound_message(kv->msg, kv->lt, kv->key.cbits(), kv->source);
+    }
+    if (!process_ok) {
       if (verbosity > 1) {
         FLOG(INFO) {
           sb << "invalid inbound message: lt=" << kv->lt << " from=" << kv->source << " key=" << kv->key.to_hex()
@@ -4591,6 +4670,7 @@ td::actor::Task<bool> Collator::process_inbound_internal_messages() {
       }
       co_return fatal_error("error processing inbound internal message");
     }
+    timer_extract.resume();
     nb_out_msgs_->next();
   }
   inbound_queues_empty_ = nb_out_msgs_->is_eof();
@@ -4721,6 +4801,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       }
     }
     td::ScopedRealCpuTimer timer_total{stats_.work_time.total};
+    td::ScopedRealCpuTimer timer_intake{stats_.work_time.intake_externals};
     auto [ext_msg_ref, priority] = std::move(item);
     ++stats_.ext_msgs_total;
     if (register_external_message(ext_msg_ref, priority).is_error()) {
@@ -4734,8 +4815,10 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
     if (io_mux_ && ext_msg_ref->wc() == workchain() && is_our_address(ext_msg_ref->addr())) {
       // io-mux: await the resolution of the destination account (no-op if it was never issued)
       timer_total.pause();
+      timer_intake.pause();
       co_await wait_account_path_resolved(ext_msg_ref->addr());
       timer_total.resume();
+      timer_intake.resume();
     }
     auto ext_msg = ext_msg_ref->root_cell();
     ton::Bits256 hash{ext_msg->get_hash().bits()};
@@ -4818,6 +4901,7 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
  * @returns True if the processing was successful, false otherwise.
  */
 bool Collator::process_dispatch_queue() {
+  td::ScopedRealCpuTimer timer_intake{stats_.work_time.intake_dispatch};
   SCOPE_EXIT {
     stats_.load_fraction_dispatch = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
   };
@@ -5179,6 +5263,7 @@ bool Collator::insert_out_msg(Ref<vm::Cell> out_msg, td::ConstBitPtr msg_hash) {
  */
 bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
                                bool defer) {
+  td::ScopedRealCpuTimer timer{stats_.work_time.enqueue_msg};
   LogicalTime enqueued_lt = msg.lt;
   CHECK(msg.msg_env_from_dispatch_queue.is_null());
   // 0. unpack src_addr and dest_addr
@@ -5285,6 +5370,7 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
  */
 td::actor::Task<bool> Collator::process_new_messages(bool& enqueue_only) {
   td::ScopedRealCpuTimer timer_total{stats_.work_time.total};
+  td::ScopedRealCpuTimer timer_intake{stats_.work_time.intake_new_msgs};
   SCOPE_EXIT {
     stats_.load_fraction_new_msgs = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
   };
@@ -5315,8 +5401,10 @@ td::actor::Task<bool> Collator::process_new_messages(bool& enqueue_only) {
       // io-mux: about to (possibly) execute this message — await its destination account
       if (auto dest = get_msg_dest_in_shard(msg.msg)) {
         timer_total.pause();
+        timer_intake.pause();
         co_await wait_account_path_resolved(dest.value());
         timer_total.resume();
+        timer_intake.resume();
       }
     }
     LOG(DEBUG) << "have message with lt=" << msg.lt;
@@ -5359,6 +5447,14 @@ void Collator::init_io_mux(const Ref<vm::Cell>& pure_state_root) {
         io_mux_->shard = shard_;
       }
       io_mux_->account_dict_roots.push_back(std::move(accounts_root));
+      // also capture the raw out-queue root for insert-path warming (see issue_queue_path)
+      block::gen::OutMsgQueueInfo::Record qinfo;
+      if (tlb::unpack_cell(state.out_msg_queue_info, qinfo)) {
+        auto queue_root = qinfo.out_queue->prefetch_ref(0);
+        if (queue_root.not_null()) {
+          io_mux_->queue_dict_roots.push_back(std::move(queue_root));
+        }
+      }
     }
   } catch (vm::VmError&) {
   } catch (vm::VmVirtError&) {
@@ -5415,6 +5511,41 @@ void Collator::issue_account_path_resolution(const ton::StdSmcAddress& addr) {
 }
 
 /**
+ * io-mux: warms the out-queue dictionary path that inserting `msg` into the outbound queue will
+ * traverse (best-effort; issued when the message is registered, used if it ends up enqueued).
+ * The insert key is reconstructed exactly like in enqueue_message(): hypercube next hop + hash.
+ */
+void Collator::issue_out_queue_insert_path(const Ref<vm::Cell>& msg) {
+  if (!io_mux_) {
+    return;
+  }
+  try {
+    block::gen::CommonMsgInfo::Record_int_msg_info info;
+    if (!tlb::unpack_cell_inexact(msg, info)) {
+      return;
+    }
+    auto src_prefix = block::tlb::t_MsgAddressInt.get_prefix(std::move(info.src));
+    auto dest_prefix = block::tlb::t_MsgAddressInt.get_prefix(std::move(info.dest));
+    if (!src_prefix.is_valid() || !dest_prefix.is_valid()) {
+      return;
+    }
+    auto route_info = block::perform_hypercube_routing(src_prefix, dest_prefix, shard_);
+    if ((unsigned)route_info.first > 96 || (unsigned)route_info.second > 96) {
+      return;
+    }
+    auto next_hop = block::interpolate_addr(src_prefix, dest_prefix, route_info.second);
+    td::BitArray<32 + 64 + 256> key;
+    key.bits().store_int(next_hop.workchain, 32);
+    (key.bits() + 32).store_int(next_hop.account_id_prefix, 64);
+    (key.bits() + 96).copy_from(msg->get_hash().bits(), 256);
+    io_mux_->issue_queue_path(key);
+  } catch (vm::VmError&) {
+    // best-effort
+  } catch (vm::VmVirtError&) {
+  }
+}
+
+/**
  * io-mux: awaits readiness of a previously issued account path resolution. Returns immediately
  * if the account was never issued (the caller then falls back to synchronous loads) or is
  * already resolved.
@@ -5440,7 +5571,7 @@ td::actor::Task<> Collator::wait_account_path_resolved(ton::StdSmcAddress addr) 
     ++io_mux_->waited;
   }
   if (promote) {
-    io_mux_->start_walker(addr);
+    io_mux_->start_walker(CollatorIoMuxState::WalkItem{.is_queue_key = false, .addr = addr, .queue_key = {}});
   }
   td::Timer wait_timer;
   auto S = co_await std::move(wait_task).wrap();
@@ -5512,8 +5643,8 @@ void Collator::log_io_mux_stats() {
   if (io_mux_->issued) {
     LOG(WARNING) << "io-mux: window=" << CollatorIoMuxState::WINDOW
                  << " walks=" << CollatorIoMuxState::MAX_CONCURRENT_WALKS << " issued=" << io_mux_->issued
-                 << " resolved=" << io_mux_->resolved << " waited=" << io_mux_->waited
-                 << " waited_ms=" << io_mux_->wait_time * 1000;
+                 << " resolved=" << io_mux_->resolved << " qpaths=" << io_mux_->queue_paths
+                 << " waited=" << io_mux_->waited << " waited_ms=" << io_mux_->wait_time * 1000;
   }
 }
 
@@ -5529,6 +5660,8 @@ void Collator::register_new_msg(block::NewOutMsg new_msg) {
     if (auto dest = get_msg_dest_in_shard(new_msg.msg)) {
       issue_account_path_resolution(dest.value());
     }
+    // also warm the out-queue path this message will be inserted at if it ends up enqueued
+    issue_out_queue_insert_path(new_msg.msg);
   }
   if (new_msg.lt < min_new_msg_lt) {
     min_new_msg_lt = new_msg.lt;
