@@ -56,7 +56,7 @@ from block.generated import (
     shard_ident,
     shard_state,
     shared_lib_descr,
-    simplex_config,
+    simplex_config_v2,
     storage_extra_none,
     storage_info,
     storage_used,
@@ -133,23 +133,28 @@ _ALL_ONES = ((1 << 256) - 1) // 15
 
 @dataclass
 class SimplexConsensusConfig:
-    target_block_rate_ms: int = 1000
+    target_block_rate_ms: int = 400
     slots_per_leader_window: int = 4
-    first_block_timeout_ms: int = 1000
-    max_leader_window_desync: int = 2
+    first_block_timeout_ms: int = 700
+    use_quic: bool = True
+    protocol_version: int = 2
 
 
 @dataclass
 class NetworkConfig:
     monitor_min_split: int = 0
     split: int = 0
-    global_version: int = 13
+    global_version: int = 14
     shard_validators: int = 1
     block_limit_mul: int = 1
     mc_valgroup_lifetime: int = 250
-    mc_consensus: SimplexConsensusConfig | None = None
+    mc_consensus: SimplexConsensusConfig | None = field(
+        default_factory=lambda: SimplexConsensusConfig()
+    )
     shard_valgroup_lifetime: int = 250
-    shard_consensus: SimplexConsensusConfig | None = None
+    shard_consensus: SimplexConsensusConfig | None = field(
+        default_factory=lambda: SimplexConsensusConfig()
+    )
 
 
 @dataclass
@@ -557,10 +562,10 @@ def _build_config_params(
                 fast_attempts=3,
                 attempt_duration=8,
                 catchain_max_deps=4,
-                max_block_bytes=4 * (1 << 20),
-                max_collated_bytes=4 * (1 << 20),
+                max_block_bytes=2097152,
+                max_collated_bytes=10485760,
                 proto_version=5,
-                catchain_max_blocks_coeff=0,
+                catchain_max_blocks_coeff=10000,
             )
         )
     )
@@ -568,24 +573,23 @@ def _build_config_params(
     # Param 30: new consensus params
     mc_ncp: NewConsensusConfig | None = None
     shard_ncp: NewConsensusConfig | None = None
+
+    def convert_simplex_config(config: SimplexConsensusConfig) -> simplex_config_v2:
+        return simplex_config_v2(
+            flags=0,
+            protocol_version=config.protocol_version,
+            use_quic=config.use_quic,
+            slots_per_leader_window=config.slots_per_leader_window,
+            noncritical_params={
+                0: config.target_block_rate_ms,
+                1: config.first_block_timeout_ms,
+            },
+        )
+
     if isinstance(config.mc_consensus, SimplexConsensusConfig):
-        mc_ncp = simplex_config(
-            flags=0,
-            use_quic=True,
-            target_rate_ms=config.mc_consensus.target_block_rate_ms,
-            slots_per_leader_window=config.mc_consensus.slots_per_leader_window,
-            first_block_timeout_ms=config.mc_consensus.first_block_timeout_ms,
-            max_leader_window_desync=config.mc_consensus.max_leader_window_desync,
-        )
+        mc_ncp = convert_simplex_config(config.mc_consensus)
     if isinstance(config.shard_consensus, SimplexConsensusConfig):
-        shard_ncp = simplex_config(
-            flags=0,
-            use_quic=True,
-            target_rate_ms=config.shard_consensus.target_block_rate_ms,
-            slots_per_leader_window=config.shard_consensus.slots_per_leader_window,
-            first_block_timeout_ms=config.shard_consensus.first_block_timeout_ms,
-            max_leader_window_desync=config.shard_consensus.max_leader_window_desync,
-        )
+        shard_ncp = convert_simplex_config(config.shard_consensus)
     params.append(
         ConfigParam_30(
             field=new_consensus_config_all(
