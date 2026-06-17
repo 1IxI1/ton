@@ -952,9 +952,30 @@ class SpamRunner : public td::actor::Actor {
       return;
     }
     next_progress_ = now + 5.0;
+    // Instantaneous throughput over a trailing window of observed blocks. The
+    // span runs from the first out-of-window block (the true interval start) to
+    // now, so the rate isn't deflated at the window edge.
+    constexpr double kInstWindow = 5.0;
+    double cutoff = now - kInstWindow;
+    td::uint64 w_txs = 0, w_matched = 0;
+    double lower = now;
+    for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it) {
+      lower = it->observed_at;
+      if (it->observed_at < cutoff) {
+        break;  // first block before the window: its timestamp bounds the span
+      }
+      w_txs += it->n_txs;
+      w_matched += it->n_matched;
+    }
+    double span = now - lower;
+    double inst_tps = span > 0.1 ? static_cast<double>(w_txs) / span : 0.0;
+    double inst_jtps = span > 0.1 ? static_cast<double>(w_matched) / span : 0.0;
     LOG(INFO) << "progress: sent " << sent_ << "/" << target_total_ << " (ok " << send_ok_ << ", err " << send_err_
               << "), included " << inclusion_ms_.size() << ", blocks " << blocks_.size() << " (tip seqno "
-              << (blocks_.empty() ? 0u : blocks_.back().seqno) << ")" << (fallback_mode_ ? " [fallback mode]" : "");
+              << (blocks_.empty() ? 0u : blocks_.back().seqno) << ")"
+              << " | inst " << td::StringBuilder::FixedDouble(inst_jtps, 1) << " jTPS ("
+              << td::StringBuilder::FixedDouble(inst_tps, 1) << " tx/s, last " << td::StringBuilder::FixedDouble(span, 1)
+              << "s)" << (fallback_mode_ ? " [fallback mode]" : "");
   }
 
   void check_done(double now) {
