@@ -10,6 +10,7 @@
 #include "ton/ton-io.hpp"
 #include "validator/consensus/simplex/bus.h"
 #include "validator/fabric.h"
+#include "validator/full-node.h"
 #include "validator/validator-group.hpp"
 
 namespace ton::validator {
@@ -178,6 +179,32 @@ class BlockSyncObserver : public td::actor::SpawnsWith<Bus>, public td::actor::C
   }
 };
 
+class CandidateBroadcastRelay : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<Bus> {
+ public:
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  static bool should_be_spawned(const Bus& bus) {
+    return bus.config.observers_in_private_overlay();
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const CandidateReceived> event) {
+    if (event->candidate->is_empty()) {
+      return;
+    }
+
+    int mode = fullnode::FullNode::broadcast_mode_fast_sync;
+    const auto& block = std::get<BlockCandidate>(event->candidate->block);
+    td::actor::send_closure(bus->manager, &ManagerFacade::send_block_candidate_broadcast, block.id, block.data.clone(),
+                            mode);
+  }
+};
+
 class BridgeImpl final : public IValidatorGroup {
  public:
   BridgeImpl(std::string name, GroupParams&& params) : name_(name), params_(std::move(params)) {
@@ -288,6 +315,8 @@ class BridgeImpl final : public IValidatorGroup {
     simplex::StateResolver::register_in(runtime);
 
     simplex::DefaultCollatorSchedule::provide_for(runtime);
+
+    runtime.register_actor<CandidateBroadcastRelay>("CandidateBroadcastRelay");
 
     bus_ = runtime.start(bus, name_);
   }

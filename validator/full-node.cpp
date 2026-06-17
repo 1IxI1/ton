@@ -285,8 +285,9 @@ void FullNodeImpl::on_new_masterchain_block(td::Ref<MasterchainState> state, std
 void FullNodeImpl::update_shard_actor(ShardIdFull shard, bool active) {
   ShardInfo &info = shards_[shard];
   if (info.actor.empty()) {
-    info.actor = FullNodeShard::create(shard, local_id_, adnl_id_, zero_state_file_hash_, opts_, limiter_, keyring_,
-                                       adnl_, rldp2_, overlays_, validator_manager_, client_, actor_id(this), active);
+    info.actor =
+        FullNodeShard::create(shard, local_id_, adnl_id_, zero_state_file_hash_, opts_, limiter_, keyring_, adnl_,
+                              rldp2_, quic_, overlays_, validator_manager_, client_, actor_id(this), active);
     if (!all_validators_.empty()) {
       td::actor::send_closure(info.actor, &FullNodeShard::update_validators, all_validators_, sign_cert_by_);
     }
@@ -363,13 +364,15 @@ void FullNodeImpl::send_block_candidate(BlockIdExt block_id, CatchainSeqno cc_se
     }
   }
   if (mode & broadcast_mode_public) {
-    auto shard = get_shard(ShardIdFull{masterchainId, shardIdAll});
-    if (shard.empty()) {
-      VLOG(full_node, WARNING) << "dropping OUT shard block info message to unknown shard";
-      return;
+    if (opts_.public_broadcast_mode_ & FullNodeOptions::PublicBroadcastMode::Plumtree) {
+      auto shard = get_shard(block_id.shard_full());
+      if (shard.empty()) {
+        VLOG(full_node, WARNING) << "dropping OUT Plumtree block candidate message to unknown shard";
+      } else {
+        td::actor::send_closure(shard, &FullNodeShard::send_block_candidate, block_id, cc_seqno, validator_set_hash,
+                                std::move(data));
+      }
     }
-    td::actor::send_closure(shard, &FullNodeShard::send_block_candidate, block_id, cc_seqno, validator_set_hash,
-                            std::move(data));
   }
 }
 
@@ -392,12 +395,25 @@ void FullNodeImpl::send_broadcast(BlockBroadcast broadcast, int mode) {
     }
   }
   if (mode & broadcast_mode_public) {
+    if (!(opts_.public_broadcast_mode_ & FullNodeOptions::PublicBroadcastMode::Fec)) {
+      return;
+    }
     auto shard = get_shard(broadcast.block_id.shard_full());
     if (shard.empty()) {
       VLOG(full_node, WARNING) << "dropping OUT broadcast to unknown shard";
       return;
     }
     td::actor::send_closure(shard, &FullNodeShard::send_broadcast, std::move(broadcast));
+  }
+}
+
+void FullNodeImpl::send_block_finality_broadcast(BlockFinalityBroadcast finality, int mode) {
+  if (mode & broadcast_mode_fast_sync) {
+    auto fast_sync_overlay = fast_sync_overlays_.choose_overlay(finality.block_id.shard_full()).first;
+    if (!fast_sync_overlay.empty()) {
+      td::actor::send_closure(fast_sync_overlay, &FullNodeFastSyncOverlay::send_block_finality_broadcast,
+                              finality.clone());
+    }
   }
 }
 
@@ -621,6 +637,11 @@ void FullNodeImpl::process_block_broadcast(BlockBroadcast broadcast, bool signat
                           });
 }
 
+void FullNodeImpl::process_block_finality_broadcast(BlockFinalityBroadcast finality) {
+  td::actor::ask(validator_manager_, &ValidatorManagerInterface::new_block_finality_broadcast, std::move(finality))
+      .detach();
+}
+
 void FullNodeImpl::process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                      td::uint32 validator_set_hash, td::BufferSlice data,
                                                      BroadcastSource source) {
@@ -703,6 +724,9 @@ void FullNodeImpl::start_up() {
     }
     void send_broadcast(BlockBroadcast broadcast, int mode) override {
       td::actor::send_closure(id_, &FullNodeImpl::send_broadcast, std::move(broadcast), mode);
+    }
+    void send_block_finality_broadcast(BlockFinalityBroadcast finality, int mode) override {
+      td::actor::send_closure(id_, &FullNodeImpl::send_block_finality_broadcast, std::move(finality), mode);
     }
     void download_block(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
                         td::Promise<ReceivedBlock> promise) override {
