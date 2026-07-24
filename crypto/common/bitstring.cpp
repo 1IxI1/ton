@@ -16,13 +16,14 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "common/bitstring.h"
 #include <cstring>
 #include <limits>
+
+#include "common/bitstring.h"
+#include "crypto/openssl/digest.hpp"
 #include "td/utils/as.h"
 #include "td/utils/bits.h"
 #include "td/utils/misc.h"
-#include "crypto/openssl/digest.hpp"
 
 namespace td {
 
@@ -508,11 +509,11 @@ unsigned long long bits_load_long_top(ConstBitPtr from, unsigned top_bits) {
 }
 
 unsigned long long bits_load_ulong(ConstBitPtr from, unsigned bits) {
-  return bits == 0 ? 0 : bits_load_long_top(from, bits) >> (64 - bits);
+  return bits == 0 ? 0ULL : bits_load_long_top(from, bits) >> (64 - bits);
 }
 
 long long bits_load_long(ConstBitPtr from, unsigned bits) {
-  return (long long)bits_load_long_top(from, bits) >> (64 - bits);
+  return bits == 0 ? 0LL : (long long)bits_load_long_top(from, bits) >> (64 - bits);
 }
 
 std::string bits_to_binary(const unsigned char* ptr, int offs, std::size_t len) {

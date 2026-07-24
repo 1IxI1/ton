@@ -16,7 +16,7 @@
 */
 #include "smart-casts-cfg.h"
 #include "ast.h"
-#include "tolk.h"
+#include "compilation-errors.h"
 
 /*
  *   This file represents internals of AST-level control flow and data flow analysis.
@@ -98,12 +98,46 @@ namespace tolk {
 std::string SinkExpression::to_string() const {
   std::string result = var_ref->name;
   uint64_t cur_path = index_path;
+  TypePtr cur_type = var_ref->declared_type;
   while (cur_path != 0) {
     result += ".";
-    result += std::to_string((cur_path & 0xFF) - 1);
+    bool formatted = false;
+    try {
+      if (const TypeDataStruct* t_struct = cur_type->try_as<TypeDataStruct>()) {
+        StructFieldPtr field_ref = t_struct->struct_ref->get_field((cur_path & 0xFF) - 1);
+        result += field_ref->name;
+        cur_type = field_ref->declared_type;
+        formatted = true;
+      }
+    } catch (...) {}
+    if (!formatted) {
+      result += std::to_string((cur_path & 0xFF) - 1);
+    }
     cur_path >>= 8;
   }
   return result;
+}
+
+bool SinkExpression::is_child_of(SinkExpression rhs) const {
+  // `c.1.2` (index_path = 3<<8 + 2) is a child of `c.1` (index_path = 2) and `c` (index_path = 0)
+  uint64_t mask = 0;
+  uint64_t rhs_path = rhs.index_path;
+  while (rhs_path != 0) {
+    mask = (mask << 8) + 0xFF;
+    rhs_path >>= 8;
+  }  
+  return var_ref == rhs.var_ref && index_path != rhs.index_path && (index_path & mask) == rhs.index_path; 
+}
+
+SinkExpression SinkExpression::get_child_s_expr(int field_idx) const {
+  uint64_t new_index_path = index_path;    // if we have c.1 (index_path = 2) and construct c.1.N, calc (N<<8 + 2)
+  for (int empty_byte = 0; empty_byte < 8; ++empty_byte) {
+    if ((index_path & (static_cast<uint64_t>(0xFF) << (empty_byte*8))) == 0) {
+      new_index_path += (static_cast<uint64_t>(field_idx) + 1) << (empty_byte*8);
+      break;
+    }
+  }
+  return SinkExpression(var_ref, new_index_path);
 }
 
 static std::string to_string(SignState s) {
@@ -138,6 +172,10 @@ static TypePtr calculate_type_lca(TypePtr a, TypePtr b, bool* became_union = nul
     return a;
   }
 
+  if (a == TypeDataNotInferred::create() || b == TypeDataNotInferred::create()) {
+    return TypeDataNotInferred::create();
+  }
+
   if (a == TypeDataUnknown::create() || b == TypeDataUnknown::create()) {
     return TypeDataUnknown::create();
   }
@@ -161,36 +199,17 @@ static TypePtr calculate_type_lca(TypePtr a, TypePtr b, bool* became_union = nul
   if (tensor1 && tensor2 && tensor1->size() == tensor2->size()) {
     std::vector<TypePtr> types_lca;
     types_lca.reserve(tensor1->size());
+    bool ith_became_union = false;
     for (int i = 0; i < tensor1->size(); ++i) {
-      TypePtr next = calculate_type_lca(tensor1->items[i], tensor2->items[i], became_union);
+      TypePtr next = calculate_type_lca(tensor1->items[i], tensor2->items[i], &ith_became_union);
       if (next == nullptr) {
         return nullptr;
       }
       types_lca.push_back(next);
     }
-    return TypeDataTensor::create(std::move(types_lca));
-  }
-
-  const auto* tuple1 = a->try_as<TypeDataTypedTuple>();
-  const auto* tuple2 = b->try_as<TypeDataTypedTuple>();
-  if (tuple1 && tuple2 && tuple1->size() == tuple2->size()) {
-    std::vector<TypePtr> types_lca;
-    types_lca.reserve(tuple1->size());
-    for (int i = 0; i < tuple1->size(); ++i) {
-      TypePtr next = calculate_type_lca(tuple1->items[i], tuple2->items[i], became_union);
-      if (next == nullptr) {
-        return nullptr;
-      }
-      types_lca.push_back(next);
+    if (!ith_became_union) {
+      return TypeDataTensor::create(std::move(types_lca));
     }
-    return TypeDataTypedTuple::create(std::move(types_lca));
-  }
-
-  if (const auto* a_alias = a->try_as<TypeDataAlias>()) {
-    return calculate_type_lca(a_alias->underlying_type, b, became_union);
-  }
-  if (const auto* b_alias = b->try_as<TypeDataAlias>()) {
-    return calculate_type_lca(a, b_alias->underlying_type, became_union);
   }
 
   TypePtr resulting_union = TypeDataUnion::create(std::vector{a, b});
@@ -240,13 +259,27 @@ BoolState calculate_bool_lca(BoolState a, BoolState b) {
   return transformations[static_cast<int>(a)][static_cast<int>(b)];
 }
 
+// example for a ternary operator: `var v = cond ? someSlice : someCell` (no hint) will give a compilation error,
+// but `var v: HINT = <same>` is okay, if hint is valid;
+// for instance, `var v: int = cond ? someInt32 : someInt64` is ok: no unification
+TypeInferringUnifyStrategy::TypeInferringUnifyStrategy(TypePtr hint) {
+  bool is_valid_hint = hint != nullptr && hint != TypeDataUnknown::create() && !hint->has_not_inferred_inside() && !hint->has_genericT_inside();
+  if (is_valid_hint) {
+    dest_hint = hint;
+  }
+}
+
 // see comments above TypeInferringUnifyStrategy
 // this function calculates lca or currently stored result and next
-void TypeInferringUnifyStrategy::unify_with(TypePtr next, TypePtr dest_hint) {
+void TypeInferringUnifyStrategy::unify_with(TypePtr next) {
   // example: `var r = ... ? int8 : int16`, will be inferred as `int8 | int16` (via unification)
   // but `var r: int = ... ? int8 : int16`, will be inferred as `int` (it's dest_hint)
-  if (dest_hint && dest_hint != TypeDataUnknown::create() && !dest_hint->unwrap_alias()->try_as<TypeDataUnion>()) {
-    if (dest_hint->can_rhs_be_assigned(next)) {
+  if (dest_hint) {
+    if (const TypeDataUnion* dest_union = dest_hint->unwrap_alias()->try_as<TypeDataUnion>()) {
+      if (TypePtr dest_variant = dest_union->calculate_exact_variant_to_fit_rhs(next)) {
+        next = dest_variant;
+      }
+    } else if (dest_hint->can_rhs_be_assigned(next)) {
       next = dest_hint;
     }
   }
@@ -280,6 +313,22 @@ void FlowContext::invalidate_all_subfields(LocalVarPtr var_ref, uint64_t parent_
   }
 }
 
+// get the resulting type of variable or struct field
+TypePtr FlowContext::smart_cast_or_original(SinkExpression s_expr, TypePtr originally_declared_type) const {
+  auto it = known_facts.find(s_expr);
+  if (it == known_facts.end()) {
+    return originally_declared_type;
+  }
+
+  TypePtr smart_casted = it->second.expr_type;
+  if (smart_casted->equal_to(originally_declared_type)) {
+    // given `var a: dict`, after merging control flow branches, restore `a: dict` instead of `a: cell?`
+    // (same for struct fields and other sink expressions)
+    return originally_declared_type;
+  }
+  return smart_casted;
+}
+
 // update current type of `local_var` / `tensorVar.0` / `obj.field`
 // example: `local_var = rhs`
 // example: `f(mutate obj.field)`
@@ -309,6 +358,25 @@ void FlowContext::mark_unreachable(UnreachableKind reason) {
   static_cast<void>(reason);
 }
 
+// compare FlowContext with another; used to infer loops until facts reach a fixed point
+bool FlowContext::equivalent_to(const FlowContext& another) const {
+  if (unreachable != another.unreachable || known_facts.size() != another.known_facts.size()) {
+    return false;
+  }
+
+  for (auto it_lhs = known_facts.begin(), it_rhs = another.known_facts.begin(); it_lhs != known_facts.end(); ++it_lhs, ++it_rhs) {
+    const FactsAboutExpr& lhs = it_lhs->second;
+    const FactsAboutExpr& rhs = it_rhs->second;
+    bool equal = lhs.expr_type->equal_to(rhs.expr_type)
+              && lhs.sign_state == rhs.sign_state
+              && lhs.bool_state == rhs.bool_state
+              && it_lhs->first == it_rhs->first;
+    if (!equal) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // "merge" two data-flow contexts occurs on control flow rejoins (if/else branches merging, for example)
 // it's generating a new context that describes "knowledge that definitely outcomes from these two"
@@ -352,26 +420,30 @@ FlowContext FlowContext::merge_flow(FlowContext&& c1, FlowContext&& c2) {
 // example: `int | slice | builder | bool` - `bool | slice` = `int | builder`
 // what for: `if (x != null)` / `if (x is T)`, to smart cast x inside if
 TypePtr calculate_type_subtract_rhs_type(TypePtr type, TypePtr subtract_type) {
-  const TypeDataUnion* lhs_union = type->try_as<TypeDataUnion>();
+  const TypeDataUnion* lhs_union = type->unwrap_alias()->try_as<TypeDataUnion>();
   if (!lhs_union) {
+    // `unknown` - `null` = `unknown`
+    if (type == TypeDataUnknown::create() && subtract_type == TypeDataNullLiteral::create()) {
+      return TypeDataUnknown::create();
+    }
     return TypeDataNever::create();
   }
 
   std::vector<TypePtr> rest_variants;
 
-  if (const TypeDataUnion* sub_union = subtract_type->try_as<TypeDataUnion>()) {
+  if (const TypeDataUnion* sub_union = subtract_type->unwrap_alias()->try_as<TypeDataUnion>()) {
     if (lhs_union->has_all_variants_of(sub_union)) {
-      rest_variants.reserve(lhs_union->variants.size() - sub_union->variants.size());
+      rest_variants.reserve(lhs_union->size() - sub_union->size());
       for (TypePtr lhs_variant : lhs_union->variants) {
-        if (!sub_union->has_variant_with_type_id(lhs_variant)) {
+        if (!sub_union->has_variant_equal_to(lhs_variant)) {
           rest_variants.push_back(lhs_variant);
         }
       }
     }
-  } else if (lhs_union->has_variant_with_type_id(subtract_type)) {
-    rest_variants.reserve(lhs_union->variants.size() - 1);
+  } else if (lhs_union->has_variant_equal_to(subtract_type)) {
+    rest_variants.reserve(lhs_union->size() - 1);
     for (TypePtr lhs_variant : lhs_union->variants) {
-      if (lhs_variant->get_type_id() != subtract_type->get_type_id()) {
+      if (!lhs_variant->equal_to(subtract_type)) {
         rest_variants.push_back(lhs_variant);
       }
     }
@@ -391,36 +463,42 @@ TypePtr calculate_type_subtract_rhs_type(TypePtr type, TypePtr subtract_type) {
 // example: `x.1` is { var_ref: x, index_path: 2 }
 // example: `x!.1` is the same
 // example: `x.1.2` is { var_ref: x, index_path: 2<<8 + 3 }
-// example: `x!.1!.2` is the same
+// example: `x!.1!.2!` is the same
 // not SinkExpressions: `globalVar` / `f()` / `obj.method().1`
 SinkExpression extract_sink_expression_from_vertex(AnyExprV v) {
+  v = unwrap_not_null_operator(v);
+
   if (auto as_ref = v->try_as<ast_reference>()) {
     if (LocalVarPtr var_ref = as_ref->sym->try_as<LocalVarPtr>()) {
       return SinkExpression(var_ref);
     }
   }
 
-  if (auto as_dot = v->try_as<ast_dot_access>(); as_dot && as_dot->is_target_indexed_access()) {
+  if (auto as_dot = v->try_as<ast_dot_access>()) {
     V<ast_dot_access> cur_dot = as_dot;
     uint64_t index_path = 0;
-    while (cur_dot->is_target_indexed_access()) {
-      int index_at = std::get<int>(cur_dot->target);
+    int depth = 0;
+    while (cur_dot->is_target_indexed_access() || cur_dot->is_target_struct_field()) {
+      int index_at = cur_dot->is_target_indexed_access()
+          ? std::get<int>(cur_dot->target)
+          : std::get<StructFieldPtr>(cur_dot->target)->field_idx;
       index_path = (index_path << 8) + index_at + 1;
+      depth++;
       if (auto parent_dot = unwrap_not_null_operator(cur_dot->get_obj())->try_as<ast_dot_access>()) {
         cur_dot = parent_dot;
       } else {
         break;
       }
     }
-    if (auto as_ref = unwrap_not_null_operator(cur_dot->get_obj())->try_as<ast_reference>()) {
-      if (LocalVarPtr var_ref = as_ref->sym->try_as<LocalVarPtr>()) {
-        return SinkExpression(var_ref, index_path);
+    if (index_path && depth < 8) {     // `(x = rhs).field` is the same sink as `x.field`
+      if (SinkExpression inner = extract_sink_expression_from_vertex(cur_dot->get_obj())) {
+        int inner_n_bits = 0;
+        for (uint64_t tmp = inner.index_path; tmp; tmp >>= 8) {
+          inner_n_bits += 8;
+        }
+        return SinkExpression(inner.var_ref, (index_path << inner_n_bits) | inner.index_path);
       }
     }
-  }
-
-  if (auto as_par = v->try_as<ast_parenthesized_expression>()) {
-    return extract_sink_expression_from_vertex(as_par->get_expr());
   }
 
   if (auto as_assign = v->try_as<ast_assign>()) {
@@ -437,6 +515,88 @@ SinkExpression extract_sink_expression_from_vertex(AnyExprV v) {
   return {};
 }
 
+// is_valid_mutation_path checks whether an expression is a valid target for mutation.
+// Its main property: "safe to be re-evaluated" while transforming AST to IR.
+// Valid: `v` / `v.field` / `v.0!.nested`
+//        (all can be used as `f(mutate lvalue)` / `lvalue.mutatingMethod()`)
+// Invalid: `v.id().field` / `(v = rhs).field` / `Point{x,y}.x` / `(a, b)` / `[a, b]`
+//        (all are denied: `f(mutate Point{x,y}.x)` / `f(mutate (a,b))` / `v.id().increment()`)
+//
+// It's conceptually similar to extract_sink_expression_from_vertex, but NOT the same:
+// - "sink" is ONE local variable or field, used for smart casts and cfg
+// - "lvalue path" is an atomically re-evaluable path to one target
+// When `out_sinks` is provided, stores SinkExpression if this lvalue path has one.
+bool is_valid_mutation_path(AnyExprV v, std::vector<SinkExpression>* out_sinks, bool inside_dot_obj) {
+  if (auto as_ref = v->try_as<ast_reference>()) {
+    if (out_sinks) {
+      if (LocalVarPtr var_ref = as_ref->sym->try_as<LocalVarPtr>()) {
+        out_sinks->emplace_back(var_ref);
+      } else if (GlobalVarPtr glob_ref = as_ref->sym->try_as<GlobalVarPtr>()) {
+        out_sinks->emplace_back(reinterpret_cast<LocalVarPtr>(glob_ref));
+      }
+    }
+    return true;
+  }
+  if (auto as_nn = v->try_as<ast_not_null_operator>()) {
+    return inside_dot_obj && is_valid_mutation_path(as_nn->get_expr(), out_sinks, inside_dot_obj);
+  }
+  if (auto as_dot = v->try_as<ast_dot_access>();
+           as_dot && (as_dot->is_target_indexed_access() || as_dot->is_target_struct_field())) {
+    int index_at = as_dot->is_target_indexed_access()
+        ? std::get<int>(as_dot->target)
+        : std::get<StructFieldPtr>(as_dot->target)->field_idx;
+    // deny `(a, b).0` as lvalue, but allow `tensorVar.0`
+    if (unwrap_not_null_operator(as_dot->get_obj())->try_as<ast_tensor>()) {
+      return false;
+    }
+    std::vector<SinkExpression> inner_sinks;
+    bool inner_valid = is_valid_mutation_path(as_dot->get_obj(), &inner_sinks, true);
+    if (out_sinks) {
+      for (SinkExpression s : inner_sinks) {
+        out_sinks->push_back(s.get_child_s_expr(index_at));
+      }
+    }
+    return inner_valid;
+  }
+  return false;
+}
+
+// is_valid_assignment_lhs checks destructuring assignments patterns.
+// When `out_sinks` is provided, stores SinkExpression for every lhs target.
+bool is_valid_assignment_lhs(AnyExprV v, std::vector<SinkExpression>* out_sinks) {
+  if (auto as_decl = v->try_as<ast_local_vars_declaration>()) {
+    return is_valid_assignment_lhs(as_decl->get_expr(), out_sinks);
+  }
+  if (auto decl_var = v->try_as<ast_local_var_lhs>()) {
+    if (out_sinks) {
+      out_sinks->emplace_back(decl_var->var_ref);
+    }
+    return true;
+  }
+  if (v->try_as<ast_underscore>()) {
+    return true;
+  }
+  // allow destructuring `(a, b) = someTensor`, store both `a` and `b`
+  if (auto as_tensor = v->try_as<ast_tensor>()) {
+    bool all_valid = true;
+    for (int i = 0; i < as_tensor->size(); ++i) {
+      all_valid &= is_valid_assignment_lhs(as_tensor->get_item(i), out_sinks);
+    }
+    return all_valid;
+  }
+  // allow destructuring `[a, b] = someTuple` and nesting like `(a, [b,c]) = rhs`
+  if (auto as_square = v->try_as<ast_square_brackets>()) {
+    bool all_valid = true;
+    for (int i = 0; i < as_square->size(); ++i) {
+      all_valid &= is_valid_assignment_lhs(as_square->get_item(i), out_sinks);
+    }
+    return all_valid;
+  }
+  // allow `lhs = rhs` if `f(mutate lhs)` is allowed:
+  // examples: `variable = rhs`, `(_, _, obj.field) = rhs` (we are in recursion inside a tensor)
+  return is_valid_mutation_path(v, out_sinks);
+}
+
 // given `lhs = rhs`, calculate "original" type of `lhs`
 // example: `var x: int? = ...; if (x != null) { x (here) = null; }`
 // "(here)" x is `int` (smart cast), but originally declared as `int?`
@@ -448,14 +608,26 @@ TypePtr calc_declared_type_before_smart_cast(AnyExprV v) {
     }
   }
 
-  if (auto as_dot = v->try_as<ast_dot_access>(); as_dot && as_dot->is_target_indexed_access()) {
-    TypePtr obj_type = as_dot->get_obj()->inferred_type->unwrap_alias();    // v already inferred; hence, index_at is correct
-    int index_at = std::get<int>(as_dot->target);
-    if (const auto* t_tensor = obj_type->try_as<TypeDataTensor>()) {
-      return t_tensor->items[index_at];
+  if (auto as_call = v->try_as<ast_function_call>()) {
+    if (as_call->fun_maybe && as_call->fun_maybe->does_return_self() && as_call->get_self_obj()) {
+      return calc_declared_type_before_smart_cast(as_call->get_self_obj());
     }
-    if (const auto* t_tuple = obj_type->try_as<TypeDataTypedTuple>()) {
-      return t_tuple->items[index_at];
+  }
+
+  if (auto as_dot = v->try_as<ast_dot_access>()) {
+    if (as_dot->is_target_struct_field()) {
+      StructFieldPtr field_ref = std::get<StructFieldPtr>(as_dot->target);
+      return field_ref->declared_type;
+    }
+    if (as_dot->is_target_indexed_access()) {
+      int index_at = std::get<int>(as_dot->target);
+      TypePtr obj_type = as_dot->get_obj()->inferred_type->unwrap_alias();    // v already inferred; hence, index_at is correct
+      if (const auto* t_tensor = obj_type->try_as<TypeDataTensor>()) {
+        return t_tensor->items[index_at];
+      }
+      if (const auto* t_shaped = obj_type->try_as<TypeDataShapedTuple>()) {
+        return t_shaped->items[index_at];
+      }
     }
   }
 
@@ -477,14 +649,10 @@ TypePtr calc_smart_cast_type_on_assignment(TypePtr lhs_declared_type, TypePtr rh
     // example: `var x: int | slice | cell = 4`, result is int
     // example: `var x: T1 | T2 | T3 = y as T3 | T1`, result is `T1 | T3`
     if (const TypeDataUnion* rhs_union = rhs_inferred_type->try_as<TypeDataUnion>()) {
-      bool lhs_has_all_variants_of_rhs = true;
-      for (TypePtr rhs_variant : rhs_union->variants) {
-        lhs_has_all_variants_of_rhs &= lhs_union->has_variant_with_type_id(rhs_variant);
-      }
-      if (lhs_has_all_variants_of_rhs && rhs_union->variants.size() < lhs_union->variants.size()) {
+      if (lhs_union->has_all_variants_of(rhs_union) && rhs_union->size() < lhs_union->size()) {
         std::vector<TypePtr> subtypes_of_lhs;
         for (TypePtr lhs_variant : lhs_union->variants) {
-          if (rhs_union->has_variant_with_type_id(lhs_variant)) {
+          if (rhs_union->has_variant_equal_to(lhs_variant)) {
             subtypes_of_lhs.push_back(lhs_variant);
           }
         }
@@ -511,7 +679,7 @@ std::ostream& operator<<(std::ostream& os, const FlowContext& flow) {
 }
 
 std::ostream& operator<<(std::ostream& os, const FactsAboutExpr& facts) {
-  os << facts.expr_type;
+  os << (facts.expr_type == nullptr ? "(nullptr-type)" : facts.expr_type->as_human_readable());
   if (facts.sign_state != SignState::Unknown) {
     os << " " << to_string(facts.sign_state);
   }

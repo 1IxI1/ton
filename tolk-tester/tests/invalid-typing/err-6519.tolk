@@ -1,13 +1,12 @@
-fun incNotChained(mutate self: int) {
-    self = self + 1;
+fun g(): int? {
+    return null
 }
 
-fun failWhenReturnANotChainedValue(x: int): int {
-    return x.incNotChained();
+fun main() {
+    return g() ?? true
 }
 
 /**
 @compilation_should_fail
-@stderr x.incNotChained()
-@stderr can not convert type `void` to return type `int`
+@stderr type of operator `??` is `int | bool`; probably, it's not what you expected
  */

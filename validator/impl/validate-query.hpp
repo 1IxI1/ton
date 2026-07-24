@@ -18,17 +18,23 @@
 */
 #pragma once
 
+#include <atomic>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "block/mc-config.h"
+#include "block/signature-set.h"
+#include "block/transaction.h"
+#include "common/global-version.h"
 #include "interfaces/validator-manager.h"
 #include "vm/cells.h"
 #include "vm/dict.h"
-#include "block/mc-config.h"
-#include "block/transaction.h"
+
+#include "block-parse.h"
+#include "fabric.h"
 #include "shard.hpp"
-#include "signature-set.hpp"
-#include <vector>
-#include <string>
-#include <map>
-#include "common/global-version.h"
 
 namespace ton {
 
@@ -99,9 +105,9 @@ inline ErrorCtxSet ErrorCtx::set_guard(std::vector<std::string> str_list) {
 /*
  *
  * must write candidate to disk, if accepted
- * can reject block only if it is invalid (i.e. in case of 
+ * can reject block only if it is invalid (i.e. in case of
  * internal errors must retry or crash)
- * only exception: block can be rejected, if it is known from 
+ * only exception: block can be rejected, if it is known from
  * masterchain, that it will not be part of shardchain finalized
  * state
  *
@@ -112,15 +118,13 @@ class ValidateQuery : public td::actor::Actor {
     return SUPPORTED_VERSION;
   }
   static constexpr long long supported_capabilities() {
-    return ton::capCreateStatsEnabled | ton::capBounceMsgBody | ton::capReportVersion | ton::capShortDequeue |
-           ton::capStoreOutMsgQueueSize | ton::capMsgMetadata | ton::capDeferMessages;
+    return capCreateStatsEnabled | capBounceMsgBody | capReportVersion | capShortDequeue | capStoreOutMsgQueueSize |
+           capMsgMetadata | capDeferMessages | capFullCollatedData;
   }
 
  public:
-  ValidateQuery(ShardIdFull shard, BlockIdExt min_masterchain_block_id, std::vector<BlockIdExt> prev,
-                BlockCandidate candidate, td::Ref<ValidatorSet> validator_set,
-                td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
-                td::Promise<ValidateCandidateResult> promise, bool is_fake = false);
+  ValidateQuery(BlockCandidate candidate, ValidateParams params, td::actor::ActorId<ValidatorManager> manager,
+                td::Timestamp timeout, td::Promise<ValidateCandidateResult> promise);
 
  private:
   int verbosity{3 * 1};
@@ -131,7 +135,8 @@ class ValidateQuery : public td::actor::Actor {
   std::vector<BlockIdExt> prev_blocks;
   std::vector<Ref<ShardState>> prev_states;
   BlockCandidate block_candidate;
-  td::Ref<ValidatorSet> validator_set_;
+  td::Ref<block::ValidatorSet> validator_set_;
+  PublicKeyHash local_validator_id_ = PublicKeyHash::zero();
   td::actor::ActorId<ValidatorManager> manager;
   td::Timestamp timeout;
   td::Promise<ValidateCandidateResult> main_promise;
@@ -143,14 +148,23 @@ class ValidateQuery : public td::actor::Actor {
   bool is_key_block_{false};
   bool update_shard_cc_{false};
   bool is_fake_{false};
+  bool full_collated_data_{false};
   bool prev_key_block_exists_{false};
   bool debug_checks_{false};
-  bool outq_cleanup_partial_{false};
+  bool parallel_accounts_validation_{false};
+  bool parallel_accounts_validation_pending_{false};
+  bool check_account_failed_{false};
+  td::Timer parallel_work_timer_{/*is_paused=*/true};
+  double parallel_total_real_time_ = 0.0;
+  std::optional<td::Status> check_account_fatal_error_ = std::nullopt;
+  std::optional<std::string> check_account_reject_error_ = std::nullopt;
+  std::optional<td::BufferSlice> check_account_reject_reason_ = std::nullopt;
   BlockSeqno prev_key_seqno_{~0u};
   int stage_{0};
   td::BitArray<64> shard_pfx_;
   int shard_pfx_len_;
   td::Bits256 created_by_;
+  std::vector<Ref<vm::Cell>> preloaded_prev_block_state_roots_;
 
   Ref<vm::Cell> prev_state_root_;
   Ref<vm::Cell> state_root_;
@@ -168,10 +182,10 @@ class ValidateQuery : public td::actor::Actor {
   std::vector<Ref<vm::Cell>> collated_roots_;
   std::map<RootHash, Ref<vm::Cell>> virt_roots_;
   std::unique_ptr<vm::Dictionary> top_shard_descr_dict_;
+  std::map<td::Bits256, Ref<vm::Cell>> virt_account_storage_dicts_;
 
   Ref<vm::CellSlice> shard_hashes_;              // from McBlockExtra
   Ref<vm::CellSlice> blk_config_params_;         // from McBlockExtra
-  Ref<BlockSignatureSet> prev_signatures_;       // from McBlockExtra (UNCHECKED)
   Ref<vm::Cell> recover_create_msg_, mint_msg_;  // from McBlockExtra (UNCHECKED)
 
   std::unique_ptr<block::ConfigInfo> config_, new_config_;
@@ -182,11 +196,14 @@ class ValidateQuery : public td::actor::Actor {
   Ref<vm::Cell> old_mparams_;
   bool accept_msgs_{true};
 
+  ton::BlockSeqno min_ref_mc_seqno_{~0U};
   ton::BlockSeqno min_shard_ref_mc_seqno_{~0U};
   ton::UnixTime max_shard_utime_{0};
   ton::LogicalTime max_shard_lt_{0};
 
   int global_id_{0};
+  int global_version_{0};
+  bool allow_same_timestamp_{false};
   ton::BlockSeqno vert_seqno_{~0U};
   bool ihr_enabled_{false};
   bool create_stats_enabled_{false};
@@ -194,13 +211,13 @@ class ValidateQuery : public td::actor::Actor {
   ton::BlockIdExt prev_key_block_;
   ton::LogicalTime prev_key_block_lt_;
   std::unique_ptr<block::BlockLimits> block_limits_;
-  std::unique_ptr<block::BlockLimitStatus> block_limit_status_;
-  td::uint64 total_gas_used_{0}, total_special_gas_used_{0};
+  mutable std::atomic_uint64_t total_gas_used_{0}, total_special_gas_used_{0};
 
   LogicalTime start_lt_, end_lt_;
   UnixTime prev_now_{~0u}, now_{~0u};
+  td::optional<td::uint64> now_ms_;
 
-  ton::Bits256 rand_seed_;
+  td::Bits256 rand_seed_ = td::Bits256::zero();
   std::vector<block::StoragePrices> storage_prices_;
   block::StoragePhaseConfig storage_phase_cfg_{&storage_prices_};
   block::ComputePhaseConfig compute_phase_cfg_;
@@ -212,12 +229,15 @@ class ValidateQuery : public td::actor::Actor {
   std::map<BlockSeqno, Ref<MasterchainStateQ>> aux_mc_states_;
 
   block::ShardState ps_, ns_;
+  bool processed_upto_updated_{false};
   std::unique_ptr<vm::AugmentedDictionary> sibling_out_msg_queue_;
   std::shared_ptr<block::MsgProcessedUptoCollection> sibling_processed_upto_;
 
-  std::map<td::Bits256, int> block_create_count_;
-  unsigned block_create_total_{0};
+  std::map<td::Bits256, int> shard_block_create_count_;
+  unsigned shard_block_create_total_{0};
 
+  block::tlb::InMsgDescr t_InMsgDescr{0};
+  block::tlb::OutMsgDescr t_OutMsgDescr{0};
   std::unique_ptr<vm::AugmentedDictionary> in_msg_dict_, out_msg_dict_, account_blocks_dict_;
   block::ValueFlow value_flow_;
   block::CurrencyCollection import_created_, transaction_fees_, total_burned_{0}, fees_burned_{0};
@@ -229,13 +249,20 @@ class ValidateQuery : public td::actor::Actor {
   std::vector<std::tuple<Bits256, LogicalTime, LogicalTime>> msg_proc_lt_;
   std::vector<std::tuple<Bits256, LogicalTime, LogicalTime>> msg_emitted_lt_;
 
-  std::vector<std::tuple<Bits256, Bits256, bool>> lib_publishers_, lib_publishers2_;
+  std::set<std::tuple<Bits256, Bits256, bool>> lib_publishers_, lib_publishers2_;
 
   std::map<std::pair<StdSmcAddress, td::uint64>, Ref<vm::Cell>> removed_dispatch_queue_messages_;
   std::map<std::pair<StdSmcAddress, td::uint64>, Ref<vm::Cell>> new_dispatch_queue_messages_;
+  std::set<StdSmcAddress> accounts_with_dispatch_queue_diff_;
   std::set<StdSmcAddress> account_expected_defer_all_messages_;
   td::uint64 old_out_msg_queue_size_ = 0, new_out_msg_queue_size_ = 0;
+  bool out_msg_queue_size_known_ = false;
+  bool have_out_msg_queue_size_in_state_ = false;
 
+  std::function<td::Ref<vm::Cell>(const td::Bits256&)> storage_stat_cache_;
+  std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> storage_stat_cache_update_;
+
+  bool short_dequeue_records_ = false;
   bool msg_metadata_enabled_ = false;
   bool deferring_messages_enabled_ = false;
   bool store_out_msg_queue_size_ = false;
@@ -244,6 +271,7 @@ class ValidateQuery : public td::actor::Actor {
   bool have_unprocessed_account_dispatch_queue_ = false;
 
   td::PerfWarningTimer perf_timer_;
+  td::PerfLog perf_log_;
 
   static constexpr td::uint32 priority() {
     return 2;
@@ -260,8 +288,7 @@ class ValidateQuery : public td::actor::Actor {
   void alarm() override;
   void start_up() override;
 
-  bool save_candidate();
-  void written_candidate();
+  void load_prev_states();
 
   bool fatal_error(td::Status error);
   bool fatal_error(int err_code, std::string err_msg);
@@ -281,15 +308,25 @@ class ValidateQuery : public td::actor::Actor {
   bool is_masterchain() const {
     return shard_.is_masterchain();
   }
+  int prev_block_idx(const BlockIdExt& id) const {
+    for (size_t i = 0; i < prev_blocks.size(); ++i) {
+      if (prev_blocks[i] == id) {
+        return (int)i;
+      }
+    }
+    return -1;
+  }
   td::actor::ActorId<ValidateQuery> get_self() {
     return actor_id(this);
   }
 
   void request_latest_mc_state();
-  void after_get_latest_mc_state(td::Result<std::pair<Ref<MasterchainState>, BlockIdExt>> res);
-  void after_get_mc_state(td::Result<Ref<ShardState>> res);
-  void got_mc_handle(td::Result<BlockHandle> res);
-  void after_get_shard_state(int idx, td::Result<Ref<ShardState>> res);
+  void after_get_latest_mc_state(td::Result<std::pair<Ref<MasterchainState>, BlockIdExt>> res, td::PerfLogAction token);
+  void after_get_mc_state(td::Result<Ref<ShardState>> res, td::PerfLogAction token);
+  void got_mc_handle(td::Result<BlockHandle> res, td::PerfLogAction token);
+  void after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res,
+                                    td::PerfLogAction token);
+  void after_get_shard_state(int idx, td::Result<Ref<ShardState>> res, td::PerfLogAction token);
   bool process_mc_state(Ref<MasterchainState> mc_state);
   bool try_unpack_mc_state();
   bool fetch_config_params();
@@ -300,6 +337,7 @@ class ValidateQuery : public td::actor::Actor {
   bool unpack_block_candidate();
   bool extract_collated_data_from(Ref<vm::Cell> croot, int idx);
   bool extract_collated_data();
+  bool check_account_failures();
   bool try_validate();
   bool compute_prev_state();
   bool compute_next_state();
@@ -309,22 +347,23 @@ class ValidateQuery : public td::actor::Actor {
   bool unpack_one_prev_state(block::ShardState& ss, BlockIdExt blkid, Ref<vm::Cell> prev_state_root);
   bool split_prev_state(block::ShardState& ss);
   bool request_neighbor_queues();
-  void got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res);
+  void got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res, td::PerfLogAction token);
 
   bool register_mc_state(Ref<MasterchainStateQ> other_mc_state);
   bool request_aux_mc_state(BlockSeqno seqno, Ref<MasterchainStateQ>& state);
   Ref<MasterchainStateQ> get_aux_mc_state(BlockSeqno seqno) const;
-  void after_get_aux_shard_state(ton::BlockIdExt blkid, td::Result<Ref<ShardState>> res);
+  void after_get_aux_shard_state(ton::BlockIdExt blkid, td::Result<Ref<ShardState>> res, td::PerfLogAction token);
 
   bool check_one_shard(const block::McShardHash& info, const block::McShardHash* sibling,
-                       const block::WorkchainInfo* wc_info, const block::CatchainValidatorsConfig& ccvc);
+                       const block::WorkchainInfo* wc_info, const block::CatchainValidatorsConfig& ccvc, bool& is_new);
   bool check_shard_layout();
   bool register_shard_block_creators(std::vector<td::Bits256> creator_list);
   bool check_cur_validator_set();
   bool check_mc_validator_info(bool update_mc_cc);
   bool check_utime_lt();
   bool prepare_out_msg_queue_size();
-  void got_out_queue_size(size_t i, td::Result<td::uint64> res);
+  void got_out_queue_size(size_t i, td::Result<td::uint64> res, td::PerfLogAction token);
+  void verified_shard_blocks(td::Status S, td::PerfLogAction token);
 
   bool fix_one_processed_upto(block::MsgProcessedUpto& proc, ton::ShardIdFull owner, bool allow_cur = false);
   bool fix_processed_upto(block::MsgProcessedUptoCollection& upto, bool allow_cur = false);
@@ -360,16 +399,60 @@ class ValidateQuery : public td::actor::Actor {
   bool check_dispatch_queue_update();
   bool check_processed_upto();
   bool check_neighbor_outbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalTime lt, td::ConstBitPtr key,
-                                       const block::McShardDescr& src_nb, bool& unprocessed);
+                                       const block::McShardDescr& src_nb, bool& unprocessed, bool& processed_here,
+                                       td::Bits256& msg_hash);
   bool check_in_queue();
   bool check_delivered_dequeued();
-  std::unique_ptr<block::Account> make_account_from(td::ConstBitPtr addr, Ref<vm::CellSlice> account);
-  std::unique_ptr<block::Account> unpack_account(td::ConstBitPtr addr);
-  bool check_one_transaction(block::Account& account, LogicalTime lt, Ref<vm::Cell> trans_root, bool is_first,
-                             bool is_last);
-  bool check_account_transactions(const StdSmcAddress& acc_addr, Ref<vm::CellSlice> acc_tr);
+
+  class CheckAccountTxs : public Actor {
+   public:
+    struct Context {
+      std::vector<std::tuple<Bits256, LogicalTime, LogicalTime>> msg_proc_lt{};
+      block::CurrencyCollection total_burned{0};
+      std::vector<std::tuple<Bits256, Bits256, bool>> lib_publishers{};
+      bool defer_all_messages = false;
+      std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> storage_stat_cache_update{};
+      ValidationStats::WorkTimeStats work_time{};
+
+      std::optional<td::Status> fatal_error;
+      std::optional<std::string> reject_error;
+      std::optional<td::BufferSlice> reject_reason;
+    };
+
+    CheckAccountTxs(const ValidateQuery& vq, td::actor::ActorId<ValidateQuery> vq_id, StdSmcAddress address,
+                    Ref<vm::CellSlice> acc_tr, Context ctx);
+
+    bool try_check();
+    Context extract_context();
+
+   private:
+    void start_up() override;
+
+    void abort_query(td::Status error);
+    bool reject_query(std::string error, td::BufferSlice reason = {});
+    bool reject_query(std::string err_msg, td::Status error, td::BufferSlice reason = {});
+    bool fatal_error(td::Status error);
+    bool fatal_error(std::string err_msg, int err_code = -666);
+
+    std::unique_ptr<block::Account> make_account_from(td::ConstBitPtr addr, Ref<vm::CellSlice> account);
+    std::unique_ptr<block::Account> unpack_account(td::ConstBitPtr addr);
+    bool check_one_transaction(block::Account& account, LogicalTime lt, Ref<vm::Cell> trans_root, bool is_first,
+                               bool is_last);
+    bool scan_account_libraries(Ref<vm::Cell> orig_libs, Ref<vm::Cell> final_libs, const td::Bits256& addr);
+
+    const ValidateQuery& vq_;
+    td::actor::ActorId<ValidateQuery> vq_id_;
+    StdSmcAddress address_;
+    Ref<vm::CellSlice> acc_tr_;
+    Context ctx_;
+  };
+  friend CheckAccountTxs;
+
+  CheckAccountTxs::Context load_check_account_transactions_context(const StdSmcAddress& address);
+  void save_account_transactions_context(const StdSmcAddress& address, CheckAccountTxs::Context ctx);
+
+  void after_check_account_finished(StdSmcAddress address, CheckAccountTxs::Context context);
   bool check_transactions();
-  bool scan_account_libraries(Ref<vm::Cell> orig_libs, Ref<vm::Cell> final_libs, const td::Bits256& addr);
   bool check_all_ticktock_processed();
   bool check_message_processing_order();
   bool check_special_message(Ref<vm::Cell> in_msg_root, const block::CurrencyCollection& amount,
@@ -378,7 +461,7 @@ class ValidateQuery : public td::actor::Actor {
   bool check_one_library_update(td::ConstBitPtr key, Ref<vm::CellSlice> old_value, Ref<vm::CellSlice> new_value);
   bool check_shard_libraries();
   bool check_new_state();
-  bool check_config_update(Ref<vm::CellSlice> old_conf_params, Ref<vm::CellSlice> new_conf_params);
+  bool check_config_update();
   bool check_one_prev_dict_update(ton::BlockSeqno seqno, Ref<vm::CellSlice> old_val_extra,
                                   Ref<vm::CellSlice> new_val_extra);
   bool check_mc_state_extra();
@@ -391,6 +474,8 @@ class ValidateQuery : public td::actor::Actor {
                            const block::CurrencyCollection& create);
   bool check_mc_block_extra();
 
+  Ref<vm::Cell> get_virt_state_root(const BlockIdExt& block_id);
+
   bool check_timeout() {
     if (timeout && timeout.is_in_past()) {
       abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
@@ -399,9 +484,8 @@ class ValidateQuery : public td::actor::Actor {
     return true;
   }
 
-  td::Timer work_timer_{true};
-  td::ThreadCpuTimer cpu_work_timer_{true};
-  void record_stats(bool success);
+  ValidationStats stats_;
+  void record_stats_and_stop(bool valid, std::string error_message = "");
 };
 
 }  // namespace validator

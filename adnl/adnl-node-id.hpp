@@ -18,8 +18,8 @@
 */
 #pragma once
 
-#include "keys/keys.hpp"
 #include "common/io.hpp"
+#include "keys/keys.hpp"
 
 namespace ton {
 
@@ -37,7 +37,9 @@ class AdnlNodeIdShort {
   }
   explicit AdnlNodeIdShort(td::Bits256 value) : hash_(value) {
   }
-  explicit AdnlNodeIdShort(tl_object_ptr<ton_api::adnl_id_short> obj) : hash_(obj->id_) {
+  explicit AdnlNodeIdShort(tl_object_ptr<ton_api::adnl_id_short> &&obj) : hash_(obj->id_) {
+  }
+  explicit AdnlNodeIdShort(const tl_object_ptr<ton_api::adnl_id_short> &obj) : hash_(obj->id_) {
   }
 
   const auto &pubkey_hash() const {
@@ -94,11 +96,15 @@ class AdnlNodeIdFull {
   explicit AdnlNodeIdFull(PublicKey &&pub) : pub_(std::move(pub)) {
   }
   static td::Result<AdnlNodeIdFull> create(const tl_object_ptr<ton_api::PublicKey> &pub) {
-    return AdnlNodeIdFull{pub};
+    auto id = AdnlNodeIdFull{pub};
+    if (!id.pubkey().is_ed25519()) {
+      return td::Status::Error("bad public key");
+    }
+    return id;
   }
   AdnlNodeIdFull() {
   }
-  const auto &pubkey() const {
+  const PublicKey &pubkey() const {
     return pub_;
   }
   bool empty() const {

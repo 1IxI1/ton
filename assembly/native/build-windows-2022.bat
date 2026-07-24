@@ -1,0 +1,114 @@
+REM execute this script inside elevated (Run as Administrator) console "x64 Native Tools Command Prompt for VS 2022"
+
+echo off
+
+set "SCRIPT_DIR=%~dp0"
+for %%I in ("%SCRIPT_DIR%.") do set "SCRIPT_DIR=%%~fI"
+set "ROOT_DIR=%SCRIPT_DIR%"
+if not exist "%ROOT_DIR%\third-party" (
+  for %%I in ("%SCRIPT_DIR%\..\..") do set "ROOT_DIR=%%~fI"
+)
+
+echo Using repo root: %ROOT_DIR%
+cd /d "%ROOT_DIR%"
+
+echo Installing chocolatey windows package manager...
+@"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -InputFormat None -ExecutionPolicy Bypass -Command "iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))" && SET "PATH=%PATH%;%ALLUSERSPROFILE%\chocolatey\bin"
+choco -?
+IF %errorlevel% NEQ 0 (
+  echo Can't install chocolatey
+  exit /b %errorlevel%
+)
+
+choco feature enable -n allowEmptyChecksums
+
+echo Installing tools...
+choco install -y pkgconfiglite ninja nasm
+IF %errorlevel% NEQ 0 (
+  echo Can't install tools
+  exit /b %errorlevel%
+)
+SET PATH=%PATH%;C:\Program Files\NASM
+
+where clang-cl
+IF %errorlevel% NEQ 0 (
+  echo clang-cl not found. Install LLVM toolset for Visual Studio 2022.
+  exit /b %errorlevel%
+)
+
+echo Current dir %cd%
+
+mkdir build
+cd build
+cmake -GNinja -DCMAKE_BUILD_TYPE=Release ^
+-DCMAKE_C_COMPILER=clang-cl ^
+-DCMAKE_CXX_COMPILER=clang-cl ^
+-DCMAKE_LINKER=lld-link ^
+-DCMAKE_CXX_COMPILER_LAUNCHER= ^
+-DPORTABLE=1 ^
+-DCMAKE_CXX_FLAGS="/DTD_WINDOWS=1 /EHsc /bigobj" ..
+
+IF %errorlevel% NEQ 0 (
+  echo Can't configure TON
+  exit /b %errorlevel%
+)
+
+IF "%1"=="-t" (
+ninja storage-daemon storage-daemon-cli blockchain-explorer fift func tolk tonlib tonlibjson  ^
+tonlib-cli validator-engine lite-client validator-engine-console generate-random-id ^
+json2tlo dht-server http-proxy rldp-http-proxy create-state create-hardfork emulator ^
+proxy-liteserver all-tests
+IF %errorlevel% NEQ 0 (
+  echo Can't compile TON
+  exit /b %errorlevel%
+)
+) else (
+ninja storage-daemon storage-daemon-cli blockchain-explorer fift func tolk tonlib tonlibjson  ^
+tonlib-cli validator-engine lite-client validator-engine-console generate-random-id ^
+json2tlo dht-server http-proxy rldp-http-proxy create-state create-hardfork emulator proxy-liteserver
+IF %errorlevel% NEQ 0 (
+  echo Can't compile TON
+  exit /b %errorlevel%
+)
+)
+
+copy validator-engine\validator-engine.exe test
+IF %errorlevel% NEQ 0 (
+  echo validator-engine.exe does not exist
+  exit /b %errorlevel%
+)
+
+echo Strip and copy artifacts
+cd ..
+echo where strip
+where strip
+mkdir artifacts
+mkdir artifacts\smartcont
+mkdir artifacts\lib
+
+for %%I in (build\storage\storage-daemon\storage-daemon.exe ^
+  build\storage\storage-daemon\storage-daemon-cli.exe ^
+  build\blockchain-explorer\blockchain-explorer.exe ^
+  build\crypto\fift.exe ^
+  build\crypto\tlbc.exe ^
+  build\crypto\func.exe ^
+  build\tolk\tolk.exe ^
+  build\crypto\create-state.exe ^
+  build\validator-engine-console\validator-engine-console.exe ^
+  build\tonlib\tonlib-cli.exe ^
+  build\tonlib\tonlibjson.dll ^
+  build\http\http-proxy.exe ^
+  build\rldp-http-proxy\rldp-http-proxy.exe ^
+  build\dht-server\dht-server.exe ^
+  build\lite-client\lite-client.exe ^
+  build\validator-engine\validator-engine.exe ^
+  build\utils\generate-random-id.exe ^
+  build\utils\json2tlo.exe ^
+  build\utils\proxy-liteserver.exe ^
+  build\emulator\emulator.dll) do (
+    echo strip -s %%I & copy %%I artifacts\
+    strip -s %%I & copy %%I artifacts\
+)
+
+xcopy /e /k /h /i crypto\smartcont artifacts\smartcont
+xcopy /e /k /h /i crypto\fift\lib artifacts\lib

@@ -3,6 +3,14 @@ type MIntN = int?;
 type MBuilder = builder;
 type CallbackIntToInt = int -> int;
 
+@pure
+fun beginParse(c: cell): slice
+    asm "CTOS";
+
+@pure
+fun endCell(b: builder): cell
+    asm "ENDC";
+
 fun getBeginCell() {
     return beginCell
 }
@@ -71,29 +79,29 @@ fun demo_handler(op: int, query_id: int, a: int, b: int): int {
 fun testVarApplyInTernary() {
     var t: tuple = createEmptyTuple();
     try {
-        t.tuplePush(demo_handler(0xF2, 122, 100, 200));
+        t.push(demo_handler(0xF2, 122, 100, 200));
     } catch(code) {
-        t.tuplePush(code);
+        t.push(code);
     }
     try {
-        t.tuplePush(demo_handler(0xF4, 122, 100, 200))
+        t.push(demo_handler(0xF4, 122, 100, 200))
     } catch(code) {
-        t.tuplePush(code)
+        t.push(code)
     }
     try {
-        t.tuplePush(demo_handler(0xF2, 122, 10, 10))
+        t.push(demo_handler(0xF2, 122, 10, 10))
     } catch(code) {
-        t.tuplePush(code)
+        t.push(code)
     }
     try {
-        t.tuplePush(demo_handler(0xF2, 123, 10, 10))
+        t.push(demo_handler(0xF2, 123, 10, 10))
     } catch(code) {
-        t.tuplePush(code)
+        t.push(code)
     }
     return t;
 }
 
-fun always_throw2(x: int) {
+fun always_throw2(x: int): void {
     throw 239 + x
 }
 
@@ -114,30 +122,30 @@ fun testGlobalVarApply() {
 fun testVarApply2() {
     var creator = createEmptyTuple;
     var t = creator();
-    t.tuplePush(1);
-    var sizer = t.tupleSize;
+    t.push(1);
+    var sizer = t.size;
     return sizer(t);
 }
 
-fun getTupleLastGetter<X>(): (tuple) -> X {
-    return tupleLast<X>;
+fun array<X>.getTupleLastGetter(): (tuple) -> X {
+    return array<X>.last;
 }
 
 @method_id(106)
 fun testVarApply3() {
     var t = createEmptyTuple();
-    t.tuplePush(1);
-    t.tuplePush([2]);
-    var getIntAt = t.tupleAt<int>;
-    var getTupleFirstInt = createEmptyTuple().tupleFirst<MInt>;
-    var getTupleLastTuple = getTupleLastGetter<tuple>();
-    return (getIntAt(t, 0), getTupleFirstInt(t), getTupleLastTuple(t), getTupleLastGetter<tuple>()(t));
+    t.push(1);
+    t.push([2]);
+    var getElemAt = t.get;
+    var getTupleFirstInt = createEmptyTuple().first;
+    var getTupleLastTuple = tuple.getTupleLastGetter();
+    return (getElemAt(t, 0), getTupleFirstInt(t), getTupleLastTuple(t), tuple.getTupleLastGetter()(t));
 }
 
 @method_id(107)
 fun testIndexedAccessApply() {
     var functions1 = (beginCell, endCell);
-    var functions2 = [beginParse];
+    var functions2 = [beginParse] as [cell -> slice];
     var b = functions1.0().storeInt(1, 16);
     b.storeInt(1, 16);
     return functions2.0(functions1.1(b)).loadInt(32);
@@ -151,7 +159,8 @@ fun testCallingNotNull() {
     var n4: () -> MIntN = getNullable4;
     var creator: (() -> builder?)? = myBeginCell;
     var end2: [int, (MBuilder -> cell)?] = [0, endCell];
-    var c: cell = end2.1!((creator!()!)!.storeInt(getNullable4()!, 32));
+    var builderN = (creator!()!);
+    var c: cell = end2.1!(builderN.storeInt(getNullable4()!, 32));
     return c.beginParse().loadInt(32);
 }
 
@@ -163,7 +172,7 @@ fun sumOfTensorIfNotNull(t: (int, int)?) {
 @method_id(109)
 fun testTypeTransitionOfVarCall() {
     var summer = sumOfTensorIfNotNull;
-    var hh1 = [1, null];
+    var hh1 = [1, null] as [int, null];
     var tt1 = (3, 4);
     return (summer(null), summer((1,2)), summer(hh1.1), summer(tt1));
 }
@@ -198,7 +207,7 @@ fun check_assoc_2(a: int, b: MInt, c: MIntN): bool {
 @method_id(112)
 fun testApplyGlobalVar(x: int, y: int, z: int): bool? {
   op = `_+_`;
-  if (0) { return null; }
+  if (false) { return null; }
   return check_assoc_2(x, y, z);
 }
 
@@ -222,6 +231,178 @@ fun testCallbackUnion(call1st: bool): (int, int) | int {
     return cb(10) as int
 }
 
+struct WithCallbacks {
+    f1: (int -> int)?,
+    beginCell: builder -> cell,
+}
+
+fun WithCallbacks.doEndCellActually(self, b: builder) { return self.beginCell(b); }
+
+@method_id(115)
+fun testCallableFields() {
+    var w: WithCallbacks = { f1: null, beginCell: endCell };
+    if (10 > 3) {
+        w.f1 = justAdd2;
+    }
+    return (
+        w.f1!(5),
+        w.doEndCellActually(beginCell().storeInt(6, 32)).beginParse().loadInt(32),
+        beginParse(w.beginCell(beginCell().storeInt(7, 32))).loadInt(32)
+    );
+}
+
+struct Wrapper<T> {
+    value: T;
+}
+
+fun wrap<T>(value: T): Wrapper<T> {
+    return{value};
+}
+
+@method_id(116)
+fun testCallableGenericField() {
+    var w1: Wrapper<(int) -> int> = { value: justAdd2 };
+    var w2: Wrapper<CallbackIntToInt?> = { value: justAdd2 };
+    var w_f = wrap<int->MInt>;
+    return (w1.value(5), w2.value!(9), wrap(w_f(justAdd2)).value.value(78));
+}
+
+struct Point {
+    x: int;
+    y: int;
+}
+
+fun Point.createXY(x: int, y: int): Point { return {x,y}; }
+fun Point.createFrom<U,V>(x: U, y: V): Point { return {x,y}; }
+
+fun Point.maxCoord(self) { return self.x > self.y ? self.x : self.y; }
+
+@method_id(117)
+fun testStaticAndInstanceMethods() {
+    var fPointCreateXY = Point.createXY;
+    var p1 = fPointCreateXY(5,6);
+    var fPointCreateFrom = Point.createFrom<int8,uint16>;
+    var p2 = fPointCreateFrom(7,8);
+    __expect_type(p1, "Point");
+    __expect_type(p2, "Point");
+    var getM1 = Point.maxCoord;
+    var getM2 = p1.maxCoord;
+    return (getM1(p1), (getM2 = p2.maxCoord)(p2));
+}
+
+fun Wrapper<T?>.createFromNull(): Wrapper<T?> {
+    return {value: null};
+}
+fun Wrapper<T>.createFrom<U>(value: U): Wrapper<T> {
+    return {value: value as T};
+}
+fun Wrapper<T>.equalsNotNull<U>(self, anotherW: Wrapper<U>) {
+    return self.value != null && anotherW.value != null && self.value == anotherW.value;
+}
+
+@method_id(118)
+fun testMethodsOfGenericStruct() {
+    var creator1 = Wrapper<int8>.createFrom<int>;
+    var w1 = creator1(10);
+    __expect_type(w1, "Wrapper<int8>");
+    var creator2 = Wrapper<coins?>.createFrom<int>;
+    var w2 = creator2((null as int16?)!);
+    __expect_type(w2, "Wrapper<coins?>");
+    var eq = Wrapper<int8>.equalsNotNull<coins?>;
+    __expect_type(eq, "(Wrapper<int8>, Wrapper<coins?>) -> bool");
+    var creator3 = Wrapper<int8?>.createFromNull;
+    __expect_type(creator3, "() -> Wrapper<int8?>");
+    return (eq(w1, w2), w2.value = w1.value as int, eq(w1, w2), creator3());
+}
+
+fun add3WithDefaults(a: int, b: int = 0, c: int = 0) {
+    return a + b + c;
+}
+
+@method_id(119)
+fun testSavingFunWithDefaults() {
+    var cc = add3WithDefaults;
+    __expect_type(cc, "(int, int, int) -> int");
+    return cc(1, 2, 3);
+}
+
+@noinline
+fun tupleCreator() { return createEmptyTuple() }
+@noinline
+fun getTupleCreator() { return tupleCreator }
+
+@method_id(120)
+fun testNoInlineSaving() {
+    var creator = getTupleCreator();
+    __expect_type(creator, "() -> array<unknown>");
+    return creator();
+}
+
+global gT: tuple
+
+fun getLambda() {
+    gT.push(10);
+    return fun(a: int, b: int) {
+        gT.push(20);
+        return a + b
+    }
+}
+
+fun getArg() {
+    gT.push(30);
+    return 50;
+}
+
+@method_id(121)
+fun testCalleeEvaluatedFirst() {
+    gT = [];
+    return (
+        getLambda()(getArg(), (gT.push(40), 50).1),
+        gT
+    )
+}
+
+fun addOne122(x: int): int {
+    return x + 1;
+}
+
+fun addTen122(x: int): int {
+    return x + 10;
+}
+
+fun replaceWithAddTen122(mutate f: (int) -> int): int {
+    f = addTen122;
+    return 5;
+}
+
+@method_id(122)
+fun testIndirectCalleeSnapshotBeforeArgs() {
+    var f: (int) -> int = addOne122;
+    return (f(5), f(replaceWithAddTen122(mutate f)), f(5));
+}
+
+fun realFail123() {
+    throw 123;
+}
+
+@inline
+fun failViaCallable123() {
+    var f = realFail123;
+    return f();
+}
+
+@method_id(123)
+fun testIndirectNeverInTryCatch(): int {
+    var x: int;
+    try {
+        failViaCallable123();
+    } catch {
+        x = 2;
+    }
+    return x;
+}
+
+
 fun main() {}
 
 /**
@@ -234,7 +415,7 @@ fun main() {}
 @testcase | 107 |    | 65537
 @testcase | 108 |    | 4
 @testcase | 109 |    | 0 3 0 7
-@testcase | 110 | 5  | 5 10 100 100 100 134
+@testcase | 110 | 5  | 5 10 100 100 100 typeid-2
 @testcase | 110 | 0  | (null) (null) (null) (null) (null) 0
 @testcase | 111 | 2 3 9      | -1
 @testcase | 111 | 11 22 44   | -1
@@ -244,6 +425,15 @@ fun main() {}
 @testcase | 112 | -1 -10 -20 | -1
 @testcase | 113 | 0          | 12 12
 @testcase | 113 | -1         | 12 -1
-@testcase | 114 | -1         | 2 3 130
+@testcase | 114 | -1         | 2 3 typeid-1
 @testcase | 114 | 0          | (null) 12 1
+@testcase | 115 |            | 7 6 7
+@testcase | 116 |            | 7 11 80
+@testcase | 117 |            | 6 8
+@testcase | 118 |            | 0 10 -1 (null)
+@testcase | 119 |            | 6
+@testcase | 120 |            | []
+@testcase | 121 |            | 100 [ 10 30 40 20 ]
+@testcase | 122 |            | 6 6 15
+@testcase | 123 |            | 2
  */

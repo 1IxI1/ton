@@ -1,18 +1,29 @@
-fun incChained(mutate self: int): self {
+struct Point { x: int; y: int }
+
+fun increment(mutate i: int) {
+    i += 1;
+    return i;
+}
+
+@noinline
+fun int.incChained(mutate self): self {
     self = self + 1;
     return self;
 }
 
-fun incChained2(mutate self: int): self {
+@noinline
+fun int.incChained2(mutate self): self {
     return self.incChained();
 }
 
-fun incChained3(mutate self: int): self {
-    incChained(mutate self);
+@noinline
+fun int.incChained3(mutate self): self {
+    self.incChained();
     return self;
 }
 
-fun incChained4(mutate self: int): self {
+@noinline
+fun int.incChained4(mutate self): self {
     self.incChained();
     return self;
 }
@@ -25,7 +36,7 @@ fun testIncChainedCodegen(x: int) {
 @method_id(102)
 fun testIncChained() {
     var x: int = 10;
-    incChained(mutate x);
+    x.incChained();
     x.incChained();
     x.incChained2();
     x.incChained2().incChained();
@@ -34,7 +45,7 @@ fun testIncChained() {
     return x.incChained();
 }
 
-fun incChainedWithMiddleReturn(mutate self: int, maxValue: int): self {
+fun int.incChainedWithMiddleReturn(mutate self, maxValue: int): self {
     if (self >= maxValue) {
         return self;
     }
@@ -49,7 +60,7 @@ fun testIncChainedWithMiddleReturn(x: int) {
     return x.incChainedWithMiddleReturn(10).incChainedWithMiddleReturn(999);
 }
 
-fun incChainedMutatingBoth(mutate self: int, mutate y: int): self {
+fun int.incChainedMutatingBoth(mutate self, mutate y: int): self {
     self += 1;
     y += 1;
     return self;
@@ -62,12 +73,12 @@ fun testIncChainedMutatingBoth() {
     var (x, y) = (0, 0);
     c104 = 0;
     x.incChainedMutatingBoth(mutate y).incChainedMutatingBoth(mutate y);
-    incChainedMutatingBoth(mutate x, mutate y);
+    x.incChainedMutatingBoth(mutate y);
     x = x.incChainedMutatingBoth(mutate c104).incChainedMutatingBoth(mutate c104).incChainedMutatingBoth(mutate y);
     return (x, y, c104);
 }
 
-fun incTensorChained(mutate self: (int, int)): self {
+fun (int, int).incTensorChained(mutate self): self {
     val (f, s) = self;
     self = (f + 1, s + 1);
     return self;
@@ -80,7 +91,7 @@ fun testIncTensorChained(f: int, s: int) {
     return tens.incTensorChained().incTensorChained();
 }
 
-fun incConditionalChainable(mutate self: int, mutate another: int, ifLessThan: int): self {
+fun int.incConditionalChainable(mutate self, mutate another: int, ifLessThan: int): self {
     another += 1;
     return self.incChained() < ifLessThan ? self.incChained().incChained() : self;
 }
@@ -93,7 +104,7 @@ fun testIncConditionalChainable(x: int) {
     return (x.incConditionalChainable(mutate y, 5), y);
 }
 
-fun checkNotEq(self: int, throwIfEq: int): void {
+fun int.checkNotEq(self, throwIfEq: int): void {
     if (self == throwIfEq) {
         throw 100 + throwIfEq;
     }
@@ -113,7 +124,7 @@ fun testNotMutatingSelf(arg: int) {
 
 global c108: int;
 
-fun checkNotEqChainable(self: int, throwIfEq: int): self {
+fun int.checkNotEqChainable(self, throwIfEq: int): self {
     c108 += 1;
     if (self != throwIfEq) {
         return self;
@@ -136,8 +147,8 @@ fun testNotMutatingChainableSelf(arg: int) {
 
 global onceFailed109: int;
 
-fun checkNotEqChainableMutateAnother(self: int, throwIfEq: int, mutate toInc: int): self {
-    if (onceFailed109) { return self; }
+fun int.checkNotEqChainableMutateAnother(self, throwIfEq: int, mutate toInc: int): self {
+    if (onceFailed109 != 0) { return self; }
     toInc += 1;
     try { return self.checkNotEqChainable(throwIfEq); }
     catch { onceFailed109 = 1; return self; }
@@ -158,9 +169,9 @@ fun testNotMutatingChainableSelfMutateAnother(initial: int) {
     return (arg, c108, c109, x);
 }
 
-fun pickG110(mutate self: int, mutate pushTo: tuple): self {
+fun int.pickG110(mutate self, mutate pushTo: tuple): self {
     self += 10;
-    pushTo.tuplePush(c110);
+    pushTo.push(c110);
     return self;
 }
 
@@ -175,13 +186,13 @@ fun testMutateGlobalsLValue(init: int) {
     return (c110, tup110);
 }
 
-fun myTuplePush<T>(mutate self: tuple, value: T): self {
-    self.tuplePush(value);
+fun tuple.myTuplePush<T>(mutate self, value: T): self {
+    self.push(value);
     return self;
 }
 
-fun myTupleAt<T>(self: tuple, idx: int): T {
-    return self.tupleAt(idx);
+fun tuple.myTupleAt<T>(self, idx: int): T {
+    return self.get(idx) as T;
 }
 
 global tup111: tuple;
@@ -192,10 +203,44 @@ fun testForallFunctionsWithSelf(): (int, int, tuple) {
     tup111 = createEmptyTuple();
     t.myTuplePush(10);
     tup111.myTuplePush(1).myTuplePush(2).myTuplePush(3);
-    return (t.myTupleAt(0), tup111.myTupleAt(tup111.tupleSize() - 1), tup111);
+    return (t.myTupleAt(0), tup111.myTupleAt(tup111.size() - 1), tup111);
 }
 
+global idCalled: tuple;
 
+fun T.id(self): self {
+    idCalled.push(true);
+    return self;
+}
+
+fun int.asmSelfId(self): self
+    asm "NOP"
+
+@method_id(112)
+fun test112() {
+    return (1.asmSelfId(), 2.asmSelfId().asmSelfId());
+}
+
+type PairShape = [int, int];
+
+fun PairShape.incFirst(mutate self): self {
+    self.0 += 1;
+    return self;
+}
+
+@method_id(113)
+fun test113() {
+    var viaDot: [PairShape] = [[1, 2]];
+    viaDot.0.incFirst().incFirst();
+
+    var viaQualified: [PairShape] = [[1, 2]];
+    val returned = PairShape.incFirst(mutate viaQualified.0).incFirst();
+
+    var singleQualified: [PairShape] = [[5, 6]];
+    PairShape.incFirst(mutate singleQualified.0);
+
+    return (viaDot.0.0, viaQualified.0.0, returned.0, singleQualified.0.0);
+}
 
 fun main() { }
 
@@ -219,35 +264,42 @@ fun main() { }
 @testcase | 109 | 102 | 102 2 1 2
 @testcase | 110 | 0   | 24 [ 2 13 ]
 @testcase | 111 |     | 10 3 [ 1 2 3 ]
+@testcase | 112 |     | 1 2
+@testcase | 113 |     | 3 3 3 6
 
 @fif_codegen
 """
-  incChained PROC:<{
-    //  self
-    INC	//  self
+  int.incChained() PROC:<{      //  self
+    INC	                        //  self
   }>
-  incChained2 PROC:<{
-    //  self
-    incChained CALLDICT	//  self
+  int.incChained2() PROC:<{     //  self
+    int.incChained() CALLDICT	//  self
   }>
-  incChained3 PROC:<{
-    //  self
-    incChained CALLDICT	//  self
+  int.incChained3() PROC:<{     //  self
+    int.incChained() CALLDICT	//  self
   }>
-  incChained4 PROC:<{
-    //  self
-    incChained CALLDICT	//  self
+  int.incChained4() PROC:<{     //  self
+    int.incChained() CALLDICT	//  self
   }>
 """
 
 @fif_codegen
 """
-  testIncChainedCodegen PROC:<{
-    // x
-    incChained CALLDICT	//  x
-    incChained2 CALLDICT	//  x
-    incChained3 CALLDICT	//  x
-    incChained4 CALLDICT	//  x
+  testIncChainedCodegen() PROC:<{   // x
+    int.incChained() CALLDICT	    //  x
+    int.incChained2() CALLDICT	    //  x
+    int.incChained3() CALLDICT	    //  x
+    int.incChained4() CALLDICT	    //  x
   }>
 """
+
+@fif_codegen
+"""
+  test112() PROC:<{             //
+    1 PUSHINT                   //  '1
+    2 PUSHINT                   //  '1 '4
+  }>
+"""
+
+@fif_codegen int.checkNotEqChainableMutateAnother() PREPAREDICT
  */

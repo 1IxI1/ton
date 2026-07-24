@@ -11,6 +11,7 @@
 
 import os
 import os.path
+import json
 import re
 import shutil
 import subprocess
@@ -116,6 +117,8 @@ class TolkTestCaseInputOutput:
                 continue
             elif in_arg.startswith("x{") or TolkTestCaseInputOutput.reJustNumber.fullmatch(in_arg):
                 processed_inputs.append(in_arg)
+            elif in_arg.startswith("cell{"):
+                processed_inputs.append("<b " + in_arg.replace("cell{", "x{") + " s, b>")
             elif TolkTestCaseInputOutput.reMathExpr.fullmatch(in_arg):
                 processed_inputs.append(str(eval(in_arg)))
             elif in_arg == "null":
@@ -127,9 +130,12 @@ class TolkTestCaseInputOutput:
         self.input = " ".join(processed_inputs)
         self.expected_output = output_str
 
-    def check(self, stdout_lines: List[str], line_idx: int):
-        if stdout_lines[line_idx] != self.expected_output:
-            raise CompareOutputError("error on case #%d (%d | %s):\n    expect: %s\n    actual: %s" % (line_idx + 1, self.method_id, self.input, self.expected_output, stdout_lines[line_idx]), "\n".join(stdout_lines))
+    def check(self, stdout_lines: List[str], line_idx: int, pivot_typeid: int):
+        expected_str = self.expected_output
+        if expected_str.find("typeid") != -1:
+           expected_str = re.sub(r'typeid-(\d+)', lambda m: str(pivot_typeid + int(m.group(1))), expected_str)
+        if stdout_lines[line_idx] != expected_str:
+            raise CompareOutputError("error on case #%d (%d | %s):\n    expect: %s\n    actual: %s" % (line_idx + 1, self.method_id, self.input, expected_str, stdout_lines[line_idx]), "\n".join(stdout_lines))
 
 
 class TolkTestCaseStderr:
@@ -258,8 +264,11 @@ class TolkTestFile:
         self.stderr_includes: List[TolkTestCaseStderr] = []
         self.input_output: List[TolkTestCaseInputOutput] = []
         self.fif_codegen: List[TolkTestCaseFifCodegen] = []
+        self.abi_json: List[TolkTestCaseFifCodegen] = []
         self.expected_hash: TolkTestCaseExpectedHash | None = None
-        self.experimental_options: str | None = None
+        self.more_cmd_line_options: List[str] = []
+        self.enable_tolk_lines_comments = False
+        self.pivot_typeid = 128
 
     def parse_input_from_tolk_file(self):
         with open(self.tolk_filename, "r") as fd:
@@ -268,6 +277,11 @@ class TolkTestFile:
 
         while self.line_idx < len(lines):
             line = lines[self.line_idx]
+            # support both "@tag" and "// @tag" syntax
+            if line.startswith("// @") and not line.startswith("// @testcase"):
+                line = line[3:]
+                lines[self.line_idx] = line
+
             if line.startswith("@testcase"):
                 s = [x.strip() for x in line.split("|")]
                 if len(s) != 4:
@@ -275,16 +289,24 @@ class TolkTestFile:
                 self.input_output.append(TolkTestCaseInputOutput(s[1], s[2], s[3]))
             elif line.startswith("@compilation_should_fail"):
                 self.compilation_should_fail = True
+            elif line.startswith("@stderr_avoid"):
+                self.stderr_includes.append(TolkTestCaseStderr(self.parse_string_value(lines), True))
             elif line.startswith("@stderr"):
                 self.stderr_includes.append(TolkTestCaseStderr(self.parse_string_value(lines), False))
             elif line.startswith("@fif_codegen_avoid"):
                 self.fif_codegen.append(TolkTestCaseFifCodegen(self.parse_string_value(lines), True))
+            elif line.startswith("@fif_codegen_enable_comments"):
+                self.enable_tolk_lines_comments = True
             elif line.startswith("@fif_codegen"):
                 self.fif_codegen.append(TolkTestCaseFifCodegen(self.parse_string_value(lines), False))
+            elif line.startswith("@abi_json_avoid"):
+                self.abi_json.append(TolkTestCaseFifCodegen(self.parse_string_value(lines), True))
+            elif line.startswith("@abi_json"):
+                self.abi_json.append(TolkTestCaseFifCodegen(self.parse_string_value(lines), False))
             elif line.startswith("@code_hash"):
                 self.expected_hash = TolkTestCaseExpectedHash(self.parse_string_value(lines, False)[0])
-            elif line.startswith("@experimental_options"):
-                self.experimental_options = line[22:]
+            elif line.startswith("@path_mapping"):
+                self.more_cmd_line_options += ["--path-mapping", line[14:].replace('{DIR}', os.path.dirname(self.tolk_filename))]
             self.line_idx = self.line_idx + 1
 
         if len(self.input_output) == 0 and not self.compilation_should_fail:
@@ -319,13 +341,20 @@ class TolkTestFile:
     def get_compiled_fif_filename(self):
         return self.artifacts_folder + "/compiled.fif"
 
+    def get_compiled_abi_filename(self):
+        return self.artifacts_folder + "/compiled.abi.json"
+
     def get_runner_fif_filename(self):
         return self.artifacts_folder + "/runner.fif"
 
     def run_and_check(self):
-        cmd_args = [TOLK_EXECUTABLE, "-o", self.get_compiled_fif_filename()]
-        if self.experimental_options:
-            cmd_args = cmd_args + ["-x", self.experimental_options]
+        cmd_args = ([TOLK_EXECUTABLE, "-o", self.get_compiled_fif_filename(),
+                     "--no-symbol-types", "--no-compiled-boc"]
+                    + self.more_cmd_line_options)
+        if not self.abi_json:
+            cmd_args += ["--no-contract-abi"]
+        if not self.enable_tolk_lines_comments:
+            cmd_args = cmd_args + ["--no-line-comments"]
         res = subprocess.run(cmd_args + [self.tolk_filename], capture_output=True, timeout=10)
         exit_code = res.returncode
         stderr = str(res.stderr, "utf-8")
@@ -369,13 +398,19 @@ class TolkTestFile:
             raise CompareOutputError("unexpected number of fift output: %d lines, but %d testcases" % (len(stdout_lines), len(self.input_output)), stdout)
 
         for i in range(len(stdout_lines)):
-            self.input_output[i].check(stdout_lines, i)
+            self.input_output[i].check(stdout_lines, i, self.pivot_typeid)
 
         if len(self.fif_codegen):
             with open(self.get_compiled_fif_filename()) as fd:
                 fif_output = fd.readlines()
             for fif_codegen in self.fif_codegen:
                 fif_codegen.check(fif_output)
+
+        if len(self.abi_json):
+            with open(self.get_compiled_abi_filename()) as fd:
+                abi_output = fd.readlines()
+            for abi_json in self.abi_json:
+                abi_json.check(abi_output)
 
         if self.expected_hash is not None:
             self.expected_hash.check(fif_code_hash)

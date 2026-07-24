@@ -1,4 +1,4 @@
-/* 
+/*
     This file is part of TON Blockchain source code.
 
     TON Blockchain is free software; you can redistribute it and/or
@@ -14,30 +14,34 @@
     You should have received a copy of the GNU General Public License
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
-    In addition, as a special exception, the copyright holders give permission 
-    to link the code of portions of this program with the OpenSSL library. 
-    You must obey the GNU General Public License in all respects for all 
-    of the code used other than OpenSSL. If you modify file(s) with this 
-    exception, you may extend this exception to your version of the file(s), 
-    but you are not obligated to do so. If you do not wish to do so, delete this 
-    exception statement from your version. If you delete this exception statement 
+    In addition, as a special exception, the copyright holders give permission
+    to link the code of portions of this program with the OpenSSL library.
+    You must obey the GNU General Public License in all respects for all
+    of the code used other than OpenSSL. If you modify file(s) with this
+    exception, you may extend this exception to your version of the file(s),
+    but you are not obligated to do so. If you do not wish to do so, delete this
+    exception statement from your version. If you delete this exception statement
     from all source files in the program, then also delete it here.
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "td/tl/tl_config.h"
+#include "td/tl/tl_core.h"
+#include "td/tl/tl_file_outputer.h"
+#include "td/tl/tl_generate.h"
 #include "td/tl/tl_writer.h"
+
+#include "tl_json_converter.h"
 #include "tl_writer_cpp.h"
 #include "tl_writer_h.h"
 #include "tl_writer_hpp.h"
-#include "tl_writer_jni_h.h"
 #include "tl_writer_jni_cpp.h"
-#include "tl_json_converter.h"
-
-#include "td/tl/tl_config.h"
-#include "td/tl/tl_generate.h"
-
-#include <string>
-#include <vector>
+#include "tl_writer_jni_h.h"
 
 template <class WriterCpp = td::TD_TL_writer_cpp, class WriterH = td::TD_TL_writer_h,
           class WriterHpp = td::TD_TL_writer_hpp>
@@ -59,22 +63,22 @@ static void generate_cpp(const std::string &directory, const std::string &tl_nam
 
 int main() {
   generate_cpp("auto/tl", "ton_api", "std::string", "td::BufferSlice", "std::string", "td::BufferSlice",
-               {"\"tl/tl_object_parse.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\"",
+               {"<optional>", "\"tl/tl_object_parse.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\"",
                 "\"crypto/common/bitstring.h\""},
-               {"<string>", "\"td/utils/buffer.h\"", "\"crypto/common/bitstring.h\""});
+               {"<string>", "<optional>", "\"td/utils/buffer.h\"", "\"crypto/common/bitstring.h\""});
 
   generate_cpp("auto/tl", "lite_api", "std::string", "td::BufferSlice", "std::string", "td::BufferSlice",
-               {"\"tl/tl_object_parse.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\"",
+               {"<optional>", "\"tl/tl_object_parse.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\"",
                 "\"crypto/common/bitstring.h\""},
-               {"<string>", "\"td/utils/buffer.h\"", "\"crypto/common/bitstring.h\""});
+               {"<string>", "<optional>", "\"td/utils/buffer.h\"", "\"crypto/common/bitstring.h\""});
   td::gen_json_converter(td::tl::read_tl_config_from_file("scheme/ton_api.tlo"), "auto/tl/ton_api_json", "ton_api",
                          td::tl::TL_writer::Mode::All);
 
 #ifdef TONLIB_ENABLE_JNI
   generate_cpp<td::TD_TL_writer_jni_cpp, td::TD_TL_writer_jni_h>(
       "auto/tl", "tonlib_api", "std::string", "std::string", "td::SecureString", "td::SecureString",
-      {"\"tl/tl_jni_object.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\""},
-      {"<string>", "\"td/utils/SharedSlice.h\"", "\"crypto/common/bitstring.h\""});
+      {"<optional>", "\"tl/tl_jni_object.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\""},
+      {"<string>", "<optional>", "\"td/utils/SharedSlice.h\"", "\"crypto/common/bitstring.h\""});
 #else
   generate_cpp<>("auto/tl", "tonlib_api", "std::string", "std::string", "td::SecureString", "td::SecureString",
                  {"\"tl/tl_object_parse.h\"", "\"tl/tl_object_store.h\"", "\"td/utils/int_types.h\""},

@@ -14,9 +14,9 @@
     You should have received a copy of the GNU General Public License
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "tolk.h"
 #include "ast.h"
 #include "ast-visitor.h"
+#include "compilation-errors.h"
 
 /*
  *   This pipe assigns lvalue/rvalue flags for AST expressions.
@@ -73,17 +73,17 @@ class CalculateRvalueLvalueVisitor final : public ASTVisitorFunctionBody {
   void visit(V<ast_empty_expression> v) override {
     mark_vertex(v);
   }
-  
-  void visit(V<ast_parenthesized_expression> v) override {
-    mark_vertex(v);
-    MarkingState saved = enter_rvalue_if_none();
-    parent::visit(v);
-    restore_state(saved);
-  }
 
   void visit(V<ast_braced_expression> v) override {
     mark_vertex(v);
     MarkingState saved = enter_state(MarkingState::None);
+    parent::visit(v);
+    restore_state(saved);
+  }
+
+  void visit(V<ast_braced_yield_result> v) override {
+    mark_vertex(v);
+    MarkingState saved = enter_rvalue_if_none();
     parent::visit(v);
     restore_state(saved);
   }
@@ -95,7 +95,7 @@ class CalculateRvalueLvalueVisitor final : public ASTVisitorFunctionBody {
     restore_state(saved);
   }
   
-  void visit(V<ast_typed_tuple> v) override {
+  void visit(V<ast_square_brackets> v) override {
     mark_vertex(v);
     MarkingState saved = enter_rvalue_if_none();
     parent::visit(v);
@@ -196,9 +196,18 @@ class CalculateRvalueLvalueVisitor final : public ASTVisitorFunctionBody {
     restore_state(saved);
   }
 
+  void visit(V<ast_null_coalesce_operator> v) override {
+    mark_vertex(v);
+    MarkingState saved = enter_state(MarkingState::RValue);
+    parent::visit(v);
+    restore_state(saved);
+  }
+
   void visit(V<ast_cast_as_operator> v) override {
     mark_vertex(v);
-    parent::visit(v->get_expr());   // leave lvalue state unchanged, for `mutate (t.0 as int)` both `t.0 as int` and `t.0` are lvalue
+    MarkingState saved = enter_state(MarkingState::RValue);
+    parent::visit(v->get_expr());
+    restore_state(saved);
   }
 
   void visit(V<ast_is_type_operator> v) override {
@@ -211,6 +220,13 @@ class CalculateRvalueLvalueVisitor final : public ASTVisitorFunctionBody {
   void visit(V<ast_not_null_operator> v) override {
     mark_vertex(v);
     parent::visit(v->get_expr());   // leave lvalue state unchanged, for `mutate x!` both `x!` and `x` are lvalue
+  }
+
+  void visit(V<ast_lazy_operator> v) override {
+    mark_vertex(v);
+    MarkingState saved = enter_state(MarkingState::RValue);
+    parent::visit(v);
+    restore_state(saved);
   }
 
   void visit(V<ast_match_expression> v) override {
@@ -226,8 +242,32 @@ class CalculateRvalueLvalueVisitor final : public ASTVisitorFunctionBody {
     parent::visit(v);
   }
 
+  void visit(V<ast_object_field> v) override {
+    tolk_assert(cur_state == MarkingState::RValue);
+    mark_vertex(v);
+    parent::visit(v);
+  }
+
+  void visit(V<ast_object_body> v) override {
+    tolk_assert(cur_state == MarkingState::RValue);
+    mark_vertex(v);
+    parent::visit(v);
+  }
+
+  void visit(V<ast_object_literal> v) override {
+    mark_vertex(v);
+    MarkingState saved = enter_state(MarkingState::RValue);
+    parent::visit(v);
+    restore_state(saved);
+  }
+
+  void visit(V<ast_lambda_fun> v) override {
+    mark_vertex(v);
+    // we do not traverse body of a lambda: it's traversed when that lambda is instantiated
+  }
+
   void visit(V<ast_local_var_lhs> v) override {
-    tolk_assert(cur_state == MarkingState::LValue);
+    tolk_assert(cur_state == MarkingState::LValue || v->is_lateinit);
     mark_vertex(v);
     parent::visit(v);
   }
@@ -298,10 +338,20 @@ public:
   bool should_visit_function(FunctionPtr fun_ref) override {
     return fun_ref->is_code_function() && !fun_ref->is_generic_function();
   }
+
+  void mark_lvalue_AnyV(AnyV v) {
+    cur_state = MarkingState::LValue;
+    parent::visit(v);
+  }
 };
 
 void pipeline_calculate_rvalue_lvalue() {
-  visit_ast_of_all_functions<CalculateRvalueLvalueVisitor>();
+  CalculateRvalueLvalueVisitor visitor;
+  visit_ast_of_all_functions(visitor);
+}
+
+void mark_lvalue_AnyV(AnyV v) {
+  CalculateRvalueLvalueVisitor{}.mark_lvalue_AnyV(v);
 }
 
 void pipeline_calculate_rvalue_lvalue(FunctionPtr fun_ref) {

@@ -1,13 +1,10 @@
-## 2025.03 Update
-1. New extracurrency behavior introduced, check [GlobalVersions.md](./doc/GlobalVersions.md#version-10)
-2. Optmization of validation process, in particular CellStorageStat.
-3. Flag for speeding up broadcasts in various overlays.
-4. Fixes for static builds for emulator and tonlibjson
-5. Improving getstats output: add
-  * Liteserver queries count
-  * Collated/validated blocks count, number of active sessions
-  * Persistent state sizes
-  * Initial sync progress
-6. Fixes in logging, TON Storage, external message checking, persistent state downloading, UB in tonlib
+## 2026.06 Update
 
-Besides the work of the core team, this update is based on the efforts of  @Sild from StonFi(UB in tonlib).
+1. Supported adding fullnodes to fast-sync overlay, improving sync for them.
+2. Implemented new Plumtree broadcasts in public and fast-sync overlays.
+3. Improved sync for validators via changes in consensus protocol.
+4. Separate DHT server from nodes.
+5. Global version 15: restricted publishing libraries, fixed action fine collection.
+6. Various changes and updates, including removal of legacy code and unused features, better logging in node, hardening Tonlib against crashes, stability fixes.
+
+Besides the work of the core team, this update also includes contributions from multiple bug-bounty hunters.

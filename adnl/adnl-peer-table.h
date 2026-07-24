@@ -18,29 +18,23 @@
 */
 #pragma once
 
+#include "adnl/adnl-db.h"
+#include "adnl/adnl-query.h"
+#include "auto/tl/ton_api.h"
+#include "common/io.hpp"
 #include "td/actor/actor.h"
 #include "td/utils/BufferedUdp.h"
-
-#include "adnl.h"
-#include "utils.hpp"
-#include "adnl/adnl-query.h"
-#include "adnl/adnl-db.h"
-#include "common/io.hpp"
+#include "td/utils/logging.h"
 
 #include "adnl-packet.h"
+#include "adnl.h"
+#include "utils.hpp"
 
-#include "auto/tl/ton_api.h"
+DECLARE_LOG_CATEGORY(adnl)
 
 namespace ton {
 
 namespace adnl {
-
-constexpr int VERBOSITY_NAME(ADNL_ERROR) = verbosity_WARNING;
-constexpr int VERBOSITY_NAME(ADNL_WARNING) = verbosity_INFO;
-constexpr int VERBOSITY_NAME(ADNL_NOTICE) = verbosity_DEBUG;
-constexpr int VERBOSITY_NAME(ADNL_INFO) = verbosity_DEBUG;
-constexpr int VERBOSITY_NAME(ADNL_DEBUG) = verbosity_DEBUG + 1;
-constexpr int VERBOSITY_NAME(ADNL_EXTRA_DEBUG) = verbosity_DEBUG + 10;
 
 class AdnlChannelIdShortImpl {
  public:
@@ -97,9 +91,7 @@ class AdnlPeerTable : public Adnl {
                                 td::actor::ActorId<AdnlChannel> channel) = 0;
   virtual void unregister_channel(AdnlChannelIdShort id) = 0;
 
-  virtual void add_static_node(AdnlNode node) = 0;
-  virtual void del_static_node(AdnlNodeIdShort id) = 0;
-  virtual void get_static_node(AdnlNodeIdShort id, td::Promise<AdnlNode> promise) = 0;
+  virtual td::Result<AdnlNode> get_static_node(AdnlNodeIdShort id) = 0;
 
   virtual void write_new_addr_list_to_db(AdnlNodeIdShort local_id, AdnlNodeIdShort peer_id, AdnlDbItem node,
                                          td::Promise<td::Unit> promise) = 0;
@@ -110,7 +102,8 @@ class AdnlPeerTable : public Adnl {
   virtual void deliver_query(AdnlNodeIdShort src, AdnlNodeIdShort dst, td::BufferSlice data,
                              td::Promise<td::BufferSlice> promise) = 0;
   virtual void decrypt_message(AdnlNodeIdShort dst, td::BufferSlice data, td::Promise<td::BufferSlice> promise) = 0;
-  virtual void get_conn_ip_str(AdnlNodeIdShort l_id, AdnlNodeIdShort p_id, td::Promise<td::string> promise) = 0;
+
+  virtual void set_peer_pair_idle(AdnlNodeIdShort l_id, AdnlNodeIdShort p_id, bool value) = 0;
 };
 
 }  // namespace adnl

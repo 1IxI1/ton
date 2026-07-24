@@ -1,6 +1,13 @@
 const C1 = 1;
 const C2 = C1 + 1;
 
+const zero_addr = address("EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c");
+
+enum Role {
+    User,
+    Admin,
+}
+
 @method_id(101)
 fun test1(x: int) {
     return match (x) {
@@ -22,6 +29,7 @@ fun test2() {
     }
 }
 
+@noinline
 fun isGt10(x: int) { return x > 10; }
 
 @method_id(103)
@@ -54,14 +62,14 @@ fun test5(x: int) {
 fun test6(x: coins) {
     var result1 = 0;
     match (x) {
-        ton("0.05") => { result1 = 5; }
-        ton("0.1") => { result1 = 10; }
+        grams("0.05") => { result1 = 5; }
+        grams("0.1") => { result1 = 10; }
         else => { result1 = 20; }
     }
     var result2 = 0;
     match (x) {
-        ton("0.05") => { result2 = 5 }
-        ton("0.1") => { result2 = 10 }
+        grams("0.05") => { result2 = 5 }
+        grams("0.1") => { result2 = 10 }
     }
     return (result1, result2);
 }
@@ -80,9 +88,9 @@ fun test7(x: int8) {
 
 @method_id(108)
 fun test8(x: int) {
-    var r1 = match (x) { else => 10 };
+    var r1 = match (x is int && x is int is bool) { false => 0, else => 10 };
     match (x) { }
-    match (x) { else => { r1 += 20; } }
+    match (x * 0) { 1 => {} else => { r1 += 20; } }
     return r1;
 }
 
@@ -116,10 +124,125 @@ fun test11(x: bool) {
     }
 }
 
+global g12: int;
 
-fun main() {}
+@noinline
+fun helper12(x: int) {
+    // via codegen, check that `return` is added implicitly to every case, and `IFJMP` is produced
+    match (x) {
+        1 => g12 = 1,
+        2 => g12 = 2,
+        3 => g12 = 3,
+        else => g12 = x,
+    }
+}
+
+@method_id(112)
+fun test12(x: int) {
+    g12 = 0;
+    helper12(x);
+    return g12
+}
+
+fun invalidAsmRole(): Role asm "99 PUSHINT"
+fun invalidAsmBool(): bool asm "99 PUSHINT"
+
+@noinline
+fun mapRole(r: Role): int {
+    return match (r) {
+        Role.User => 100,
+        Role.Admin => 200,
+    }
+    // no "missing return", match is exhaustive
+}
+
+@noinline
+fun mapBool(b: bool): int {
+    return match (b) {
+        true => 100,
+        false => 200,
+    }
+    // no "missing return", match is exhaustive
+}
+
+@method_id(113)
+fun test13() {
+    var ex1 = 0;
+    var ex2 = 0;
+
+    // will throw (the compiler generates "else" implicitly for enums)
+    try { ex1 = mapRole(invalidAsmRole()); }        
+    catch (ex) { ex1 = ex }
+
+    // will not throw (the compiler compiles "match" for bool as true => else =>)
+    try { ex2 = mapBool(invalidAsmBool()); }
+    catch (ex) { ex2 = ex }
+    
+    return (ex1, ex2);
+}
+
+@method_id(114)
+fun test14(case: int) {
+    return match (match (case) {
+        1 => address("Ef9nzj6RBc4mQ6p3ng7mGJ7tp7MbzERhe7obkM9A0wnCCEcf"),
+        2 => address("Ef89xh-uy860-mCcvS8zcAUs8bApmxLGygDLEKjUk5RL-311"),
+        else => zero_addr,
+    }) {
+        address("Ef9nzj6RBc4mQ6p3ng7mGJ7tp7MbzERhe7obkM9A0wnCCEcf") => 10,
+        address("Ef89xh-uy860-mCcvS8zcAUs8bApmxLGygDLEKjUk5RL-311") => 20,
+        zero_addr => 30,
+        else => throw 123,
+    }
+}
+
+@method_id(115)
+fun test15(useNone: bool) {
+    var addr = (address("Ef9nzj6RBc4mQ6p3ng7mGJ7tp7MbzERhe7obkM9A0wnCCEcf") as any_address).toCell().load();
+    if (useNone) {
+        addr = createAddressNone();
+    }
+    match (addr) {
+        address("Ef9nzj6RBc4mQ6p3ng7mGJ7tp7MbzERhe7obkM9A0wnCCEcf") =>
+            return match (addr) {
+                address("Ef9nzj6RBc4mQ6p3ng7mGJ7tp7MbzERhe7obkM9A0wnCCEcf") => 1,
+                else => 2
+            }
+    }
+    return createAddressNone() == addr ? null : 100;
+}
+
+@method_id(116)
+fun test16(x: int) {
+    var result = 0;
+    match (x) {
+        1 => assert (x < 2) throw 123,
+        2 => while (x > 0) { result += x; x -= 1; }
+        3 => do { result += x; x -= 1 } while (x > 0)
+        4 => if (x == 4) { result = 5; } else { throw 123 }
+        5 => throw 5
+        6 => return 123
+    }
+    return result;
+}
+
+
+
+
+type asdf = int;
+
+fun main() {
+    match (10) {
+        asdf => 1,      // it's match by type
+    };
+
+    var asdf = 5;
+    return match (10) {
+        asdf => 2,      // also match by type, regardless of local var
+    };
+}
 
 /**
+@testcase | 0   |          | 2
 @testcase | 101 | 1        | 100
 @testcase | 101 | 2        | 200
 @testcase | 101 | 3        | 300
@@ -143,11 +266,21 @@ fun main() {}
 @testcase | 110 | 50       | 100
 @testcase | 111 | 0        | -1
 @testcase | 111 | -1       | 0
+@testcase | 112 | 2        | 2
+@testcase | 112 | 20       | 20
+@testcase | 113 |          | 5 200
+@testcase | 114 | 2        | 20
+@testcase | 114 | 8        | 30
+@testcase | 115 | 0        | 1
+@testcase | 115 | -1       | (null)
+@testcase | 116 | 2        | 3
+@testcase | 116 | 3        | 6
+@testcase | 116 | 4        | 5
+@testcase | 116 | 6        | 123
 
 @fif_codegen
 """
-  test1 PROC:<{
-    //  x
+  test1() PROC:<{ //  x
     DUP         //  x x
     1 EQINT     //  x '3
     IF:<{       //  x
@@ -160,7 +293,7 @@ fun main() {}
         DROP    //
         200 PUSHINT     //  '1=200
       }>ELSE<{  //  x
-        3 EQINT //  '9
+        3 EQINT //  '11
         IF:<{   //
           300 PUSHINT   //  '1=300
         }>ELSE<{        //
@@ -173,33 +306,67 @@ fun main() {}
 
 @fif_codegen
 """
-  test2 PROC:<{
-    //
+  test2() PROC:<{
     300 PUSHINT
   }>
 """
 
 @fif_codegen
 """
-  test3 PROC:<{
-    //  init
+  test3() PROC:<{       //  init
     DUP                 // init init
-    isGt10 CALLDICT     // init '2
-    -1 EQINT	        // init '5
+    isGt10() CALLDICT   // init '1
+    -1 EQINT	        // init '4
     IF:<{	            // init
-      10 PUSHINT	    // init '3=10
+      10 PUSHINT	    // init '2=10
     }>ELSE<{	        // init
-      20 PUSHINT	    // init '3=20
+      20 PUSHINT	    // init '2=20
     }>	                // init r1
 """
 
 @fif_codegen
 """
-  test8 PROC:<{
-    // x
+  test8() PROC:<{   // x
     DROP            //
     30 PUSHINT      // r1
   }>
+"""
+
+@fif_codegen
+"""
+  helper12() PROC:<{
+    DUP
+    1 EQINT
+    IFJMP:<{
+      DROP
+      1 PUSHINT
+      $g12 SETGLOB
+    }>
+    DUP
+    2 EQINT
+    IFJMP:<{
+      DROP
+      2 PUSHINT
+      $g12 SETGLOB
+    }>
+    DUP
+    3 EQINT
+    IFJMP:<{
+      DROP
+      3 PUSHINT
+      $g12 SETGLOB
+    }>
+    $g12 SETGLOB
+  }>
+"""
+
+@fif_codegen
+"""
+      1 EQINT                   //  '6
+      IFNOTJMP:<{               // 
+        5 THROW
+      }>                        // 
+      200 PUSHINT               //  '1=200
 """
 
  */

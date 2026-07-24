@@ -21,7 +21,6 @@
 #include "td/actor/actor.h"
 #include "td/db/KeyValueAsync.h"
 #include "ton/ton-types.h"
-
 #include "validator/interfaces/db.h"
 
 namespace ton {
@@ -40,9 +39,6 @@ class StateDb : public td::actor::Actor {
 
   void update_shard_client_state(BlockIdExt masterchain_block_id, td::Promise<td::Unit> promise);
   void get_shard_client_state(td::Promise<BlockIdExt> promise);
-
-  void update_destroyed_validator_sessions(std::vector<ValidatorSessionId> sessions, td::Promise<td::Unit> promise);
-  void get_destroyed_validator_sessions(td::Promise<std::vector<ValidatorSessionId>> promise);
 
   void update_async_serializer_state(AsyncSerializerState state, td::Promise<td::Unit> promise);
   void get_async_serializer_state(td::Promise<AsyncSerializerState> promise);

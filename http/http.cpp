@@ -16,11 +16,11 @@
 
     Copyright 2019-2020 Telegram Systems LLP
 */
-#include "http.h"
+#include <algorithm>
 
 #include "td/utils/misc.h"
 
-#include <algorithm>
+#include "http.h"
 
 namespace ton {
 
@@ -144,6 +144,12 @@ td::Result<std::unique_ptr<HttpRequest>> HttpRequest::create(std::string method,
 
   if (!found) {
     return td::Status::Error(PSTRING() << "unsupported http method '" << method << "'");
+  }
+
+  for (char c : url) {
+    if (c == '\r' || c == '\n' || c == '\0' || c == ' ') {
+      return td::Status::Error("bad character in url");
+    }
   }
 
   return std::make_unique<HttpRequest>(std::move(method), std::move(url), std::move(proto_version));
@@ -475,6 +481,15 @@ void HttpPayload::run_callbacks() {
   }
 }
 
+void HttpPayload::flush() {
+  is_flushing_ = true;
+  for (auto &x : callbacks_) {
+    if (state_.load(std::memory_order_relaxed) != ParseState::completed) {
+      x->flush();
+    }
+  }
+}
+
 bool HttpPayload::store_http(td::ChainBufferWriter &output, size_t max_size, HttpPayload::PayloadType store_type) {
   if (store_type == PayloadType::pt_empty) {
     return false;
@@ -755,8 +770,14 @@ td::Result<std::unique_ptr<HttpResponse>> HttpResponse::create(std::string proto
     return td::Status::Error(PSTRING() << "bad status code '" << code << "'");
   }
 
-  return std::make_unique<HttpResponse>(std::move(proto_version), code, std::move(reason), force_no_payload,
-                                        keep_alive, is_tunnel);
+  for (char c : reason) {
+    if (c == '\r' || c == '\n' || c == '\0') {
+      return td::Status::Error("bad character in reason");
+    }
+  }
+
+  return std::make_unique<HttpResponse>(std::move(proto_version), code, std::move(reason), force_no_payload, keep_alive,
+                                        is_tunnel);
 }
 
 td::Status HttpResponse::complete_parse_header() {
@@ -860,12 +881,12 @@ tl_object_ptr<ton_api::http_response> HttpResponse::store_tl() {
 
 td::Status HttpHeader::basic_check() {
   for (auto &c : name) {
-    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ':') {
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ':' || c == '\0') {
       return td::Status::Error("bad character in header name");
     }
   }
   for (auto &c : value) {
-    if (c == '\r' || c == '\n') {
+    if (c == '\r' || c == '\n' || c == '\0') {
       return td::Status::Error("bad character in header value");
     }
   }
@@ -882,8 +903,14 @@ void answer_error(HttpStatusCode code, std::string reason,
       case status_bad_request:
         reason = "Bad Request";
         break;
+      case status_not_found:
+        reason = "Not Found";
+        break;
       case status_method_not_allowed:
         reason = "Method Not Allowed";
+        break;
+      case status_payload_too_large:
+        reason = "Payload Too Large";
         break;
       case status_internal_server_error:
         reason = "Internal Server Error";
@@ -899,7 +926,7 @@ void answer_error(HttpStatusCode code, std::string reason,
         break;
     }
   }
-  auto response = HttpResponse::create("HTTP/1.0", code, reason, false, false).move_as_ok();
+  auto response = HttpResponse::create("HTTP/1.1", code, reason, false, false).move_as_ok();
   response->add_header(HttpHeader{"Content-Length", "0"});
   response->complete_parse_header();
   auto payload = response->create_empty_payload().move_as_ok();

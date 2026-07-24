@@ -25,40 +25,42 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "validator-engine-console.h"
 #include "adnl/adnl-ext-client.h"
-#include "tl-utils/lite-utils.hpp"
-#include "auto/tl/ton_api_json.h"
 #include "auto/tl/lite_api.h"
+#include "auto/tl/ton_api_json.h"
+#include "block/block-auto.h"
+#include "block/block-db.h"
+#include "block/block-parse.h"
+#include "block/block.h"
+#include "block/check-proof.h"
+#include "block/mc-config.h"
 #include "td/utils/OptionParser.h"
+#include "td/utils/Random.h"
 #include "td/utils/Time.h"
+#include "td/utils/crypto.h"
 #include "td/utils/filesystem.h"
 #include "td/utils/format.h"
-#include "td/utils/Random.h"
-#include "td/utils/crypto.h"
+#include "td/utils/port/FileFd.h"
+#include "td/utils/port/StdStreams.h"
 #include "td/utils/port/signals.h"
 #include "td/utils/port/stacktrace.h"
-#include "td/utils/port/StdStreams.h"
-#include "td/utils/port/FileFd.h"
 #include "terminal/terminal.h"
+#include "tl-utils/lite-utils.hpp"
 #include "ton/lite-tl.hpp"
-#include "block/block-db.h"
-#include "block/block.h"
-#include "block/block-parse.h"
-#include "block/block-auto.h"
-#include "block/mc-config.h"
-#include "block/check-proof.h"
+#include "ton/ton-shard.h"
 #include "vm/boc.h"
 #include "vm/cellops.h"
 #include "vm/cells/MerkleProof.h"
-#include "ton/ton-shard.h"
+
+#include "validator-engine-console.h"
 
 #if TD_DARWIN || TD_LINUX
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 #endif
 #include <iostream>
 #include <sstream>
+
 #include "git.h"
 
 int verbosity;
@@ -127,10 +129,14 @@ void ValidatorEngineConsole::run() {
   add_query_runner(std::make_unique<QueryRunnerImpl<DelValidatorAdnlAddrQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<GetConfigQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<SetVerbosityQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetLogCategoryVerbosityQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetLogCategoriesQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<GetStatsQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<QuitQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<AddNetworkAddressQuery>>());
-  add_query_runner(std::make_unique<QueryRunnerImpl<AddNetworkProxyAddressQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelNetworkAddressQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<AddQuicAddressQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelQuicAddressQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<CreateElectionBidQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<CreateProposalVoteQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<CreateComplaintVoteQuery>>());
@@ -156,6 +162,25 @@ void ValidatorEngineConsole::run() {
   add_query_runner(std::make_unique<QueryRunnerImpl<GetAdnlStatsQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<AddShardQuery>>());
   add_query_runner(std::make_unique<QueryRunnerImpl<DelShardQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<AddCollatorQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelCollatorQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<CollatorNodeAddWhitelistedValidatorQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<CollatorNodeDelWhitelistedValidatorQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<CollatorNodeEnableWhitelistQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<CollatorNodeShowWhitelistQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetCollatorsListQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ClearCollatorsListQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ShowCollatorsListQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetCollationManagerStatsQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SignOverlayMemberCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ImportFastSyncMemberCertificateQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<AddFastSyncOverlayClientQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<DelFastSyncOverlayClientQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetShardBlockVerifierConfigQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ClearShardBlockVerifierConfigQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<ShowShardBlockVerifierConfigQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<SetConsensusNoncriticalParamsOverridesQuery>>());
+  add_query_runner(std::make_unique<QueryRunnerImpl<GetConsensusNoncriticalParamsOverridesQuery>>());
 }
 
 bool ValidatorEngineConsole::envelope_send_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) {

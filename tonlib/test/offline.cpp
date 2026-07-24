@@ -17,35 +17,31 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 
-#include "block/block.h"
-#include "block/block-auto.h"
-#include "block/mc-config.h"
-
-#include "vm/cells.h"
-#include "vm/boc.h"
-#include "vm/cells/CellString.h"
-
-#include "tonlib/utils.h"
-#include "tonlib/TonlibClient.h"
-#include "tonlib/Client.h"
-
 #include "auto/tl/ton_api_json.h"
 #include "auto/tl/tonlib_api_json.h"
-
+#include "block/block-auto.h"
+#include "block/block.h"
+#include "block/mc-config.h"
+#include "td/utils/PathView.h"
 #include "td/utils/benchmark.h"
 #include "td/utils/filesystem.h"
 #include "td/utils/optional.h"
 #include "td/utils/overloaded.h"
 #include "td/utils/port/path.h"
-#include "td/utils/PathView.h"
 #include "td/utils/tests.h"
+#include "tonlib/Client.h"
+#include "tonlib/TonlibClient.h"
+#include "tonlib/utils.h"
+#include "vm/boc.h"
+#include "vm/cells.h"
+#include "vm/cells/CellString.h"
 
 // KeyManager
-#include "tonlib/keys/bip39.h"
 #include "tonlib/keys/DecryptedKey.h"
 #include "tonlib/keys/EncryptedKey.h"
 #include "tonlib/keys/Mnemonic.h"
 #include "tonlib/keys/SimpleEncryption.h"
+#include "tonlib/keys/bip39.h"
 
 TEST(Tonlib, CellString) {
   for (unsigned size :
@@ -96,6 +92,25 @@ TEST(Tonlib, Address) {
   CHECK(block::StdAddress::parse("Ef9Tj6fMJp-OqhAdhKXxq36DL-HYSzCc3-9O6UNzqsgPfYFX").is_error());
   CHECK(block::StdAddress::parse("Ef9Tj6fMJp+OqhAdhKXxq36DL+HYSzCc3+9O6UNzqsgPfYFX").is_error());
   CHECK(block::StdAddress::parse(a.rserialize()).move_as_ok() == a);
+}
+
+TEST(Tonlib, AddLogMessageValidation) {
+  auto execute = [](tonlib_api::object_ptr<tonlib_api::Function> request) {
+    return Client::execute({1, std::move(request)}).object;
+  };
+  auto expect_error = [&](td::int32 verbosity_level) {
+    auto response = execute(tonlib_api::make_object<tonlib_api::addLogMessage>(verbosity_level, ""));
+    CHECK(response->get_id() == tonlib_api::error::ID);
+    auto error = tonlib_api::move_object_as<tonlib_api::error>(response);
+    CHECK(error->message_.find("INVALID_FIELD") != std::string::npos);
+  };
+
+  expect_error(0);
+  expect_error(-1);
+  expect_error(1025);
+
+  auto response = execute(tonlib_api::make_object<tonlib_api::addLogMessage>(1024, ""));
+  CHECK(response->get_id() == tonlib_api::ok::ID);
 }
 
 static auto sync_send = [](auto &client, auto query) {
@@ -292,7 +307,7 @@ TEST(Tonlib, Mnemonic) {
 TEST(Tonlib, Keys) {
   auto a = Mnemonic::create(td::SecureString(" Hello, . $^\n# World!   "), td::SecureString("cucumber")).move_as_ok();
   DecryptedKey decrypted_key(std::move(a));
-  EncryptedKey encrypted_key = decrypted_key.encrypt("qwerty");
+  EncryptedKey encrypted_key = decrypted_key.encrypt("qwerty").ensure().move_as_ok();
   auto other_decrypted_key = encrypted_key.decrypt("qwerty").move_as_ok();
   encrypted_key.decrypt("abcde").ensure_error();
   CHECK(decrypted_key.mnemonic_words == other_decrypted_key.mnemonic_words);
@@ -689,7 +704,7 @@ TEST(Tonlib, ConfigCache) {
   sync_send(client, make_object<tonlib_api::options_setConfig>(
                         make_object<tonlib_api::config>(testnet, "testnet", true, false)))
       .ensure();
-  sync_send(client, make_object<tonlib_api::options_setConfig>(
-                        make_object<tonlib_api::config>(custom, "testnet", true, false)))
+  sync_send(client,
+            make_object<tonlib_api::options_setConfig>(make_object<tonlib_api::config>(custom, "testnet", true, false)))
       .ensure_error();
 }

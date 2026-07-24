@@ -14,12 +14,14 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "queue-size-counter.hpp"
 #include "block/block-auto.h"
 #include "block/block-parse.h"
 #include "common/delay.h"
 #include "td/actor/MultiPromise.h"
 #include "td/utils/Random.h"
+#include "ton/ton-io.hpp"
+
+#include "queue-size-counter.hpp"
 
 namespace ton::validator {
 
@@ -112,7 +114,7 @@ void QueueSizeCounter::get_queue_size_ex(ton::BlockIdExt block_id, bool calc_who
                             }
                             BlockHandle handle = R.move_as_ok();
                             td::actor::send_closure(
-                                manager, &ValidatorManager::wait_block_state, handle, 0, td::Timestamp::in(10.0),
+                                manager, &ValidatorManager::wait_block_state, handle, 0, td::Timestamp::in(10.0), false,
                                 [SelfId, handle](td::Result<td::Ref<ShardState>> R) mutable {
                                   if (R.is_error()) {
                                     td::actor::send_closure(SelfId, &QueueSizeCounter::on_error, handle->id(),
@@ -159,7 +161,7 @@ void QueueSizeCounter::get_queue_size_cont(BlockHandle handle, td::Ref<ShardStat
     }
     td::uint64 prev_size = R.move_as_ok();
     td::actor::send_closure(
-        manager, &ValidatorManager::wait_block_state_short, prev_block_id, 0, td::Timestamp::in(10.0),
+        manager, &ValidatorManager::wait_block_state_short, prev_block_id, 0, td::Timestamp::in(10.0), false,
         [=](td::Result<td::Ref<ShardState>> R) {
           if (R.is_error()) {
             td::actor::send_closure(SelfId, &QueueSizeCounter::on_error, state->get_block_id(), R.move_as_error());
@@ -213,7 +215,7 @@ void QueueSizeCounter::process_top_shard_blocks() {
           return;
         }
         td::actor::send_closure(
-            manager, &ValidatorManager::wait_block_state_short, R.ok()->id(), 0, td::Timestamp::in(10.0),
+            manager, &ValidatorManager::wait_block_state_short, R.ok()->id(), 0, td::Timestamp::in(10.0), false,
             [=](td::Result<td::Ref<ShardState>> R) {
               if (R.is_error()) {
                 LOG(WARNING) << "Failed to get masterchain state: " << R.move_as_error();
@@ -256,7 +258,7 @@ void QueueSizeCounter::get_queue_size_ex_retry(BlockIdExt block_id, bool calc_wh
   get_queue_size_ex(block_id, calc_whole,
                     [=, promise = std::move(promise), SelfId = actor_id(this)](td::Result<td::uint64> R) mutable {
                       if (R.is_error()) {
-                        LOG(WARNING) << "Failed to calculate queue size for block " << block_id.to_str() << ": "
+                        LOG(WARNING) << "Failed to calculate queue size for block " << block_id << ": "
                                      << R.move_as_error();
                         delay_action(
                             [=, promise = std::move(promise)]() mutable {

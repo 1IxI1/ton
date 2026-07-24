@@ -16,19 +16,20 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "td/utils/logging.h"
-
-#include "ThreadSafeCounter.h"
-#include "td/utils/port/Clocks.h"
-#include "td/utils/port/StdStreams.h"
-#include "td/utils/port/thread_local.h"
-#include "td/utils/Slice.h"
-#include "td/utils/Time.h"
-#include "td/utils/date.h"
-
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+
+#include "td/utils/Slice.h"
+#include "td/utils/Time.h"
+#include "td/utils/TimestampFormat.h"
+#include "td/utils/date.h"
+#include "td/utils/logging.h"
+#include "td/utils/port/Clocks.h"
+#include "td/utils/port/StdStreams.h"
+#include "td/utils/port/thread_local.h"
+
+#include "ThreadSafeCounter.h"
 
 #if TD_ANDROID
 #include <android/log.h>
@@ -53,9 +54,20 @@ int VERBOSITY_NAME(actor) = VERBOSITY_NAME(DEBUG) + 10;
 int VERBOSITY_NAME(sqlite) = VERBOSITY_NAME(DEBUG) + 10;
 
 LogOptions log_options;
+std::atomic<int> log_disable_count{0};
 
 TD_THREAD_LOCAL const char *Logger::tag_ = nullptr;
 TD_THREAD_LOCAL const char *Logger::tag2_ = nullptr;
+
+Logger::Logger(LogInterface &log, const LogOptions &options, int log_level)
+    : buffer_(StackAllocator::alloc(BUFFER_SIZE))
+    , log_(log)
+    , sb_(buffer_.as_slice())
+    , options_(options)
+    , log_level_(log_level)
+    , start_at_(Clocks::rdtsc()) {
+  sb_.current_color() = log_.color_for(log_level);
+}
 
 Logger::Logger(LogInterface &log, const LogOptions &options, int log_level, Slice file_name, int line_num,
                Slice comment)
@@ -84,9 +96,9 @@ Logger::Logger(LogInterface &log, const LogOptions &options, int log_level, Slic
   }
   sb_ << thread_id << ']';
 
-  // timestamp
-  //sb_ << '[' << StringBuilder::FixedDouble(Clocks::system(), 9) << ']';
-  sb_ << '[' << date::format("%F %T", std::chrono::system_clock::now()) << ']';
+  // timestamp (no-alloc, locale-free; byte-identical to date::format("%F %T", ...) but cheap and scalable)
+  char ts_buf[TIMESTAMP_BUF_SIZE];
+  sb_ << '[' << format_system_clock(MutableSlice(ts_buf, sizeof(ts_buf)), std::chrono::system_clock::now()) << ']';
 
   // file : line
   if (!file_name.empty()) {
@@ -176,12 +188,8 @@ void TsCerr::enterCritical() {
 void TsCerr::exitCritical() {
   lock_.clear(std::memory_order_release);
 }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-pragma"
-TsCerr::Lock TsCerr::lock_ = ATOMIC_FLAG_INIT;
-#pragma clang diagnostic pop
 
-class DefaultLog : public LogInterface {
+class DefaultLog final : public LogInterface {
  public:
   void append(CSlice slice, int log_level) override {
 #if TD_ANDROID
@@ -239,23 +247,17 @@ class DefaultLog : public LogInterface {
         break;
     }
 #elif !TD_WINDOWS
-    Slice color;
-    switch (log_level) {
-      case VERBOSITY_NAME(FATAL):
-      case VERBOSITY_NAME(ERROR):
-        color = Slice(TC_RED);
-        break;
-      case VERBOSITY_NAME(WARNING):
-        color = Slice(TC_YELLOW);
-        break;
-      case VERBOSITY_NAME(INFO):
-        color = Slice(TC_CYAN);
-        break;
+#define DEFAULTLOG_UNIX_COMMON_CASE
+    td::Slice line = slice;
+    if (!line.empty() && line.back() == '\n') {
+      line = line.substr(0, line.size() - 1);
     }
-    if (!slice.empty() && slice.back() == '\n') {
-      TsCerr() << color << slice.substr(0, slice.size() - 1) << TC_EMPTY "\n";
+
+    auto color = color_for(log_level);
+    if (color != AnsiColor::Disallowed) {
+      TsCerr() << ansi_color_to_str(color) << line << ansi_color_to_str(AnsiColor::Empty) << "\n";
     } else {
-      TsCerr() << color << slice << TC_EMPTY;
+      TsCerr() << line << "\n";
     }
 #else
     // TODO: color
@@ -266,6 +268,25 @@ class DefaultLog : public LogInterface {
     }
   }
   void rotate() override {
+  }
+
+  AnsiColor color_for(int log_level) override {
+#ifdef DEFAULTLOG_UNIX_COMMON_CASE
+    switch (log_level) {
+      case VERBOSITY_NAME(FATAL):
+      case VERBOSITY_NAME(ERROR):
+        return AnsiColor::Red;
+      case VERBOSITY_NAME(WARNING):
+        return AnsiColor::Yellow;
+        break;
+      case VERBOSITY_NAME(INFO):
+        return AnsiColor::Cyan;
+      default:
+        return AnsiColor::Empty;
+    }
+#else
+    return AnsiColor::Disallowed;
+#endif
   }
 };
 static DefaultLog default_log;
@@ -279,6 +300,41 @@ void set_log_fatal_error_callback(OnFatalErrorCallback callback) {
   on_fatal_error_callback = callback;
 }
 
+namespace {
+std::mutex log_category_mutex;
+LogCategory *log_category_head = nullptr;
+}  // namespace
+
+LogCategory::LogCategory(const char *name, int default_level) : name_(name), default_level_(default_level) {
+  std::lock_guard<std::mutex> guard(log_category_mutex);
+  next_ = log_category_head;
+  log_category_head = this;
+}
+
+const LogCategory *first_log_category() {
+  std::lock_guard<std::mutex> guard(log_category_mutex);
+  return log_category_head;
+}
+
+LogCategory *find_log_category(Slice name) {
+  std::lock_guard<std::mutex> guard(log_category_mutex);
+  for (auto *c = log_category_head; c != nullptr; c = c->next()) {
+    if (c->name() == name) {
+      return c;
+    }
+  }
+  return nullptr;
+}
+
+bool set_log_category_level(Slice name, int level) {
+  auto *c = find_log_category(name);
+  if (c == nullptr) {
+    return false;
+  }
+  c->set_level(level);
+  return true;
+}
+
 void process_fatal_error(CSlice message) {
   auto callback = on_fatal_error_callback;
   if (callback) {
@@ -287,25 +343,12 @@ void process_fatal_error(CSlice message) {
   std::abort();
 }
 
-namespace {
-std::mutex sdl_mutex;
-int sdl_cnt = 0;
-int sdl_verbosity = 0;
-
-}  // namespace
 ScopedDisableLog::ScopedDisableLog() {
-  std::unique_lock<std::mutex> guard(sdl_mutex);
-  if (sdl_cnt == 0) {
-    sdl_verbosity = set_verbosity_level(std::numeric_limits<int>::min());
-  }
-  sdl_cnt++;
+  log_disable_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 ScopedDisableLog::~ScopedDisableLog() {
-  std::unique_lock<std::mutex> guard(sdl_mutex);
-  sdl_cnt--;
-  if (sdl_cnt == 0) {
-    set_verbosity_level(sdl_verbosity);
-  }
+  auto old_count = log_disable_count.fetch_sub(1, std::memory_order_relaxed);
+  CHECK(old_count > 0);
 }
 }  // namespace td

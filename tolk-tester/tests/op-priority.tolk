@@ -1,7 +1,10 @@
 fun justTrue(): bool { return true; }
 
+@noinline
 fun unary_minus_1(a: int, b: int, c: int): int{return -(a+b) *c;}
+@noinline
 fun unary_minus_2(a: int, b: int, c: int): int{return(-(a+b))*c;}
+@noinline
 fun unary_minus_3(a: int, b: int, c: int): int{return-((a+b) *c);}
 
 
@@ -52,7 +55,7 @@ fun test7(b: int): int {
 
 @method_id(108)
 fun test8(b: int): int {
-    var a = b == 3 ? 3 : b == 4 ? 4 : b = 5 ? 5 : 100;
+    var a = b == 3 ? 3 : b == 4 ? 4 : (b = (5 != 0 ? 5 : 100));
     return a;
 }
 
@@ -64,7 +67,7 @@ fun main() {
         (3 & 3) > 0, 3 & (3 > 0) as int, 3 & (`_<_`(3, 0)),
         3 & `_<p`(3, 0) as int, (1 & 2) ^ (3 | 4),
         true & ((1) == 1)
-    ];
+    ] as tuple;
 }
 
 /**
@@ -92,28 +95,22 @@ fun main() {
 
 @fif_codegen
 """
-  unary_minus_1 PROC:<{
-    //  a b c
-    -ROT	//  c a b
-    ADD	//  c '3
+  unary_minus_1() PROC:<{ //  a b c
+    s0 s2 XCHG
+    ADD	    //  c '3
     NEGATE	//  c '4
-    SWAP	//  '4 c
-    MUL	//  '5
+    MUL	    //  '5
   }>
-  unary_minus_2 PROC:<{
-    //  a b c
-    -ROT	//  c a b
-    ADD	//  c '3
+  unary_minus_2() PROC:<{  //  a b c
+    s0 s2 XCHG
+    ADD	    //  c '3
     NEGATE	//  c '4
-    SWAP	//  '4 c
-    MUL	//  '5
+    MUL	    //  '5
   }>
-  unary_minus_3 PROC:<{
-    //  a b c
-    -ROT	//  c a b
-    ADD	//  c '3
-    SWAP	//  '3 c
-    MUL	//  '4
+  unary_minus_3() PROC:<{ //  a b c
+    s0 s2 XCHG
+    ADD	    //  c '3
+    MUL	    //  '4
     NEGATE	//  '5
   }>
 """

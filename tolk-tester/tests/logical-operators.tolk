@@ -1,35 +1,34 @@
-import "imports/use-dicts.tolk"
+import "imports/use-dicts.ext.tolk"
 
+@method_id(90)
 fun simpleAllConst() {
-    return (!0, !!0 & !false, !!!0, !1, !!1, !-1, !!-1, (!5 as int == 0) == !0, !0 == true);
+    return (0 == 0, (0 != 0) & !false, 0 == 0, 1 == 0, 1 != 0, -1 == 0, -1 != 0, ((5 == 0) as int == 0) == (0 == 0), (0 == 0) == true);
 }
 
+@method_id(91)
 fun compileTimeEval1(x: int) {
-    // todo now compiler doesn't understand that bool can't be equal to number other than 0/-1
-    // (but understands that it can't be positive)
-    // that's why for now, the last condition is evaluated at runtime
-    return (!x, !x as int > 10, (!x as int) < 10, !!x as int == 5, !x as int == -10);
+    return (x == 0, (x == 0) as int > 10, ((x == 0) as int) < 10, (x != 0) as int == 5, (x == 0) as int == -10);
 }
 
 @method_id(101)
 fun withIfNot(x: int, y: int) {
-    if (!x) { return 10 }
-    else if (!y) { { return 20 } }
+    if (x == 0) { return 10 }
+    else if (y == 0) { { return 20 } }
     return x+y
 }
 
 @method_id(102)
 fun withAndOr(x: int, y: int, z: int) {
     var return_at_end = -1;
-    if (!x & !y) {
-        if (!z & !y) { return 10; }
-        else if ((z != 0) | !!y) { return_at_end = 20; }
-    } else if (!!x & !!y & !z) {
-        if (!z & (x > 10)) { return_at_end = 30; }
-        if ((x != 11) & !z) { return 40; }
+    if ((x == 0) & (y == 0)) {
+        if ((z == 0) & (y == 0)) { return 10; }
+        else if ((z != 0) | (y != 0)) { return_at_end = 20; }
+    } else if ((x != 0) & (y != 0) & (z == 0)) {
+        if ((z == 0) & (x > 10)) { return_at_end = 30; }
+        if ((x != 11) & (z == 0)) { return 40; }
         return_at_end = 50;
     } else {
-        return_at_end = !x ? !y as int : (!z as int) | 1;
+        return_at_end = x == 0 ? (y == 0) as int : ((z == 0) as int) | 1;
     }
     return return_at_end;
 }
@@ -38,7 +37,7 @@ fun withAndOr(x: int, y: int, z: int) {
 fun someSum(upto: int) {
     var x = 0;
     var should_break = false;
-    while (!x & !should_break) {
+    while ((x == 0) & !should_break) {
         if (upto < 10) { x = upto; should_break = true; }
         else { upto = upto - 1; }
     }
@@ -48,12 +47,12 @@ fun someSum(upto: int) {
 @method_id(104)
 fun testDict(last: int) {
     // prepare dict: [3 => 30, 4 => 40, 5 => x]
-    var dict = prepareDict_3_30_4_40_5_x(!last ? 100 : last);
+    var dict = prepareDict_3_30_4_40_5_x(last == 0 ? 100 : last);
     return (lookupIdxByValue(dict, 30), lookupIdxByValue(dict, last), lookupIdxByValue(dict, 100));
 }
 
 @method_id(105)
-fun testNotNull(x: int?) {
+fun testNotNull(x: int?): tuple {
     return [x == null, null == x, !(x == null), null == null, (null != null) as int];
 }
 
@@ -120,17 +119,17 @@ fun testLogicalOps2(first: int) {
         (10 == s.loadUint(32)) || (20 == s.loadUint(32)) || (3 == s.loadUint(32)) || (4 == s.loadUint(32));
         sum += s.loadUint(32);
     }
-    return (s.getRemainingBitsCount(), sum);
+    return (s.remainingBitsCount(), sum);
 }
 
 @method_id(112)
 fun mixLogicalIntsAndBools(first: int, cond: bool) {
     return (
-        (first && cond) || (!first && cond),
+        (first && cond) || (first == 0 && cond),
         ((first & -1) & cond as int) == ((first && true) && cond) as int,
         7 && cond,
         first || cond || !cond || alwaysThrows(),
-        cond || first || !first || alwaysThrows()
+        cond || first || first == 0 || alwaysThrows()
     );
 }
 
@@ -147,6 +146,164 @@ fun testConvertIfToIfnot(x: bool) {
     assert(!!x, 100);
     return -4;
 }
+
+@pure
+fun get123(): int
+    asm "123 PUSHINT";
+
+@method_id(114)
+fun test114() {
+    val fals = (get123() < 0) as int;
+    return (fals != 0 ? -1 : fals) != 0;
+}
+
+@method_id(115)
+fun test115() {
+    val tru = get123() >= 0;
+    val fals = get123() < 0;
+
+    if ((true || false) && (false || false)) {
+        throw 123;
+    }
+    if ((tru || fals) && (fals || fals)) {
+        throw 456;
+    }
+    return (tru, fals);
+}
+
+@method_id(116)
+fun testCodegenOptimizeThrowIF(b: bool, i: int) {
+    assert (!b) throw 100;
+    assert (!!b) throw 100;
+    assert (b == false) throw 100;
+    assert (b != false) throw 100;
+
+    assert (i == 0) throw 101;
+    assert (i != 0) throw 101;
+    assert (i == 0) throw 101;
+    assert (i != 0) throw 101;
+}
+
+@method_id(117)
+fun test117(x: int) {
+    var t = createEmptyTuple();
+
+    try { assert (x == 0) throw 100; }
+    catch (ex) { t.push(ex); }
+    try { assert (x != 0) throw 101; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(x == 10)) throw 102; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(x != 100)) throw 103; }
+    catch (ex) { t.push(ex); }
+    try { assert (!!(x != 100)) throw 104; }
+    catch (ex) { t.push(ex); }
+    try { assert (x != 0) throw 105; }
+    catch (ex) { t.push(ex); }
+    try { assert (x == 0) throw 106; }
+    catch (ex) { t.push(ex); }
+    try { assert ((~x) != 0) throw 107; }
+    catch (ex) { t.push(ex); }
+    try { assert ((~(x + 1)) != 0) throw 108; }
+    catch (ex) { t.push(ex); }
+
+    return t;
+}
+
+@method_id(118)
+fun test118(y: int?) {
+    var t = createEmptyTuple();
+
+    try { assert (y == null) throw 200; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(y == null)) throw 201; }
+    catch (ex) { t.push(ex); }
+    try { assert (y != null) throw 202; }
+    catch (ex) { t.push(ex); }
+    try { assert (!(y != null)) throw 203; }
+    catch (ex) { t.push(ex); }
+
+    return t;
+}
+
+@method_id(119)
+fun test119(condition: bool) {
+    var x = 7;
+    return (x, condition ? x = 9 : x = 10, x);
+}
+
+@method_id(120)
+fun test120(condition: bool) {
+    var (x, y) = (7, 7);
+    return (
+        (x, 0 && (x = 100)).0,
+        (x, 1 && (x = 101)).0,
+        (x, 0 || (x = 102)).0,
+        (x, 1 || (x = 103)).0,
+        (y, condition && (y = 101)).0,
+        (y, condition || (y = 102)).0,
+        x,
+        y,
+    )
+}
+
+@method_id(121)
+fun test121() {
+    var x = 1;
+    val c1 = true;
+    val c2 = true;
+    return (x, c1 && (x = 2), x, c2 && (x = 3), x);
+}
+
+@method_id(122)
+fun test122(cond: bool) {
+    var x = 1;
+    return (x, cond && (x = 2), x, cond && (x = 3), x);
+}
+
+@method_id(123)
+fun test123(x: int) {
+    var iterations = 0;
+    do {
+        iterations += 1;
+        if (x > 0) {
+            x -= 1;
+        } else if (x < 0) {
+            x += 1;
+        }
+    } while ((x <=> 0) != 0);
+    return iterations;
+}
+
+@method_id(124)
+fun test124(c: bool): int {
+    var x: int;
+    if ((c && ((x = 1) == 1)) || ((x = 2) == 2)) {
+    }
+    return x;
+}
+
+@method_id(125)
+fun test125(c: bool): int {
+    var x: (int, int);
+    if ((c && (x = (10, 20)).0 == 10) || ((x = (30, 40)).0 == 30)) {
+    }
+    return x.0 + x.1 * 100;
+}
+
+fun failIfTrueKeepWithAsm(x: bool): bool
+    asm "DUP 9 THROWIF"
+
+@method_id(126)
+fun test126(x: int): int {
+    val b = x != 0;
+    try {
+        return failIfTrueKeepWithAsm(!b) as int;
+    } catch (exc) {
+        return 1000 + exc;
+    }
+}
+
 
 fun main() {
 
@@ -187,11 +344,33 @@ fun main() {
 @testcase | 112 | 5 0    | 0 -1 0 -1 -1
 @testcase | 112 | 0 -1   | -1 -1 -1 -1 -1
 @testcase | 113 | 0      | 1
+@testcase | 114 |        | 0
+@testcase | 115 |        | -1 0
+@testcase | 117 | -1     | [ 100 103 106 107 ]
+@testcase | 117 | -2     | [ 100 103 106 108 ]
+@testcase | 117 | 10     | [ 100 102 103 106 ]
+@testcase | 117 | 100    | [ 100 104 106 ]
+@testcase | 118 | null   | [ 201 202 ]
+@testcase | 118 | 5      | [ 200 203 ]
+@testcase | 119 | 0      | 7 10 10
+@testcase | 119 | -1     | 7 9 9
+@testcase | 120 | 0      | 7 7 101 102 7 7 102 102
+@testcase | 120 | -1     | 7 7 101 102 7 101 102 101
+@testcase | 121 |        | 1 -1 2 -1 3
+@testcase | 122 | -1     | 1 -1 2 -1 3
+@testcase | 122 | 0      | 1 0 1 0 1
+@testcase | 123 | 5      | 5
+@testcase | 123 | 0      | 1
+@testcase | 123 | -5     | 5
+@testcase | 124 | -1     | 1
+@testcase | 124 | 0      | 2
+@testcase | 125 | -1     | 2010
+@testcase | 125 | 0      | 4030
+@testcase | 126 | 1      | 0
 
 @fif_codegen
 """
-  simpleAllConst PROC:<{
-    //
+  simpleAllConst() PROC:<{
     TRUE
     0 PUSHINT
     TRUE
@@ -206,45 +385,41 @@ fun main() {
 
 @fif_codegen
 """
-  compileTimeEval1 PROC:<{
-    //  x
+  compileTimeEval1() PROC:<{  //  x
     DUP	//  x x
-    0 EQINT	//  x '1
-    FALSE	//  x '1 '4
-    TRUE	//  x '1 '4 '7
-    FALSE	//  x '1 '4 '7 '11
-    s0 s4 XCHG	//  '11 '1 '4 '7 x
-    0 EQINT	//  '11 '1 '4 '7 '12
-    -10 EQINT	//  '11 '1 '4 '7 '14
-    s3 s4 XCHG
-    s1 s3 s0 XCHG3	//  '1 '4 '7 '11 '14
+    0 EQINT	//  x '2
+    FALSE	//  x '2 '6
+    TRUE	//  x '2 '6 '10
+    FALSE	//  x '2 '6 '10 '14
+    s0 s4 XCHG	//  '14 '2 '6 '10 x
+    0 EQINT	//  '14 '2 '6 '10 '16
+    -10 EQINT	//  '14 '2 '6 '10 '18
+    s3 s4 XCHG	//  '2 '14 '6 '10 '18
+    s1 s3 s0 XCHG3	//  '2 '6 '10 '14 '18
   }>
 """
 
 @fif_codegen
 """
-  withIfNot PROC:<{
-    c2 SAVE
-    SAMEALTSAVE	//  x y
+  withIfNot() PROC:<{  //  x y
     OVER	//  x y x
-    IFNOTJMP:<{	//  x y
+    0 EQINT   // x y '3
+    IFJMP:<{	//  x y
       2DROP	//
-      10 PUSHINT	//  '2=10
+      10 PUSHINT	//  '4=10
     }>	//  x y
     DUP	//  x y y
     IFNOTJMP:<{	//  x y
       2DROP	//
-      20 PUSHINT	//  '3=20
-      RETALT
+      20 PUSHINT	//  '7=20
     }>	//  x y
-    ADD	//  '4
+    ADD	//  '8
   }>
 """
 
 @fif_codegen
 """
-  testAndConstCodegen PROC:<{
-    //
+  testAndConstCodegen() PROC:<{
     FALSE
     0 PUSHINT
     DUP
@@ -253,21 +428,20 @@ fun main() {
     FALSE
     0 PUSHINT
     DUP
-    TRIPLE
+    3 TUPLE
     TRUE
     TRUE
     TRUE
-    TRIPLE
+    3 TUPLE
     FALSE
     TRUE
-    PAIR
+    2 TUPLE
   }>
 """
 
 @fif_codegen
 """
-  testOrConstCodegen PROC:<{
-    //
+  testOrConstCodegen() PROC:<{
     -1 PUSHINT
     TRUE
     FALSE
@@ -276,14 +450,14 @@ fun main() {
     FALSE
     FALSE
     FALSE
-    TRIPLE
+    3 TUPLE
     -1 PUSHINT
     DUP
     TRUE
-    TRIPLE
+    3 TUPLE
     -1 PUSHINT
     FALSE
-    PAIR
+    2 TUPLE
   }>
 """
 
@@ -292,8 +466,7 @@ For example, `a && b` can be expressed without IFs.
 These are moments of future optimizations. For now, it's more than enough.
 @fif_codegen
 """
-  testAndSimpleCodegen PROC:<{
-    //  a b
+  testAndSimpleCodegen() PROC:<{  //  a b
     SWAP	//  b a
     IF:<{	//  b
       0 NEQINT	//  '2
@@ -306,8 +479,7 @@ These are moments of future optimizations. For now, it's more than enough.
 
 @fif_codegen
 """
-  testOrSimpleCodegen PROC:<{
-    //  a b
+  testOrSimpleCodegen() PROC:<{   //  a b
     SWAP	//  b a
     0 GTINT	//  b '3
     IF:<{	//  b
@@ -322,8 +494,7 @@ These are moments of future optimizations. For now, it's more than enough.
 
 @fif_codegen
 """
-  testConvertIfToIfnot PROC:<{
-    //  x
+  testConvertIfToIfnot() PROC:<{  //  x
     DUP	//  x x
     100 THROWIF
     DUP	//  x x
@@ -339,7 +510,28 @@ These are moments of future optimizations. For now, it's more than enough.
       1 PUSHINT	//  '6=1
     }>	//  x
     100 THROWIFNOT
-    -4 PUSHINT	//  '9=-4
+    -4 PUSHINT	//  '8=-4
+  }>
+"""
+
+@fif_codegen
+"""
+  testCodegenOptimizeThrowIF() PROC:<{
+    OVER
+    100 THROWIF
+    OVER
+    100 THROWIFNOT
+    OVER
+    100 THROWIF
+    SWAP
+    100 THROWIFNOT
+    DUP
+    101 THROWIF
+    DUP
+    101 THROWIFNOT
+    DUP
+    101 THROWIF
+    101 THROWIFNOT
   }>
 """
 

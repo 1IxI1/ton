@@ -16,17 +16,14 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "dht.hpp"
-
-#include "td/utils/tl_storers.h"
-#include "td/utils/crypto.h"
-#include "td/utils/Random.h"
-
-#include "td/utils/format.h"
-
 #include "auto/tl/ton_api.hpp"
+#include "td/utils/Random.h"
+#include "td/utils/crypto.h"
+#include "td/utils/format.h"
+#include "td/utils/tl_storers.h"
 
 #include "dht-remote-node.hpp"
+#include "dht.hpp"
 
 namespace ton {
 
@@ -98,7 +95,7 @@ void DhtRemoteNode::send_ping(bool client_only, td::actor::ActorId<adnl::Adnl> a
     }
     auto P = td::PromiseCreator::lambda([key, node, adnl, our_network_id](td::Result<td::BufferSlice> R) {
       if (R.is_error()) {
-        VLOG(DHT_INFO) << "[dht]: received error for query to " << key << ": " << R.move_as_error();
+        VLOG(dht, INFO) << "[dht]: received error for query to " << key << ": " << R.move_as_error();
         return;
       }
       auto F = fetch_tl_object<ton_api::dht_node>(R.move_as_ok(), true);
@@ -108,12 +105,12 @@ void DhtRemoteNode::send_ping(bool client_only, td::actor::ActorId<adnl::Adnl> a
         if (N.is_ok()) {
           td::actor::send_closure(node, &DhtMember::receive_ping, key, N.move_as_ok());
         } else {
-          VLOG(DHT_WARNING) << "[dht]: bad answer from " << key
-                            << ": dropping bad getSignedAddressList() query answer: " << N.move_as_error();
+          VLOG(dht, WARNING) << "[dht]: bad answer from " << key
+                             << ": dropping bad getSignedAddressList() query answer: " << N.move_as_error();
         }
       } else {
-        VLOG(DHT_WARNING) << "[dht]: bad answer from " << key
-                          << ": dropping invalid getSignedAddressList() query answer: " << F.move_as_error();
+        VLOG(dht, WARNING) << "[dht]: bad answer from " << key
+                           << ": dropping invalid getSignedAddressList() query answer: " << F.move_as_error();
       }
     });
     auto Q = create_serialize_tl_object<ton_api::dht_getSignedAddressList>();

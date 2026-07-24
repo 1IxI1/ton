@@ -26,7 +26,7 @@ function getenv(name, def = null) {
 const TOLKFIFTLIB_MODULE = getenv('TOLKFIFTLIB_MODULE')
 const TOLKFIFTLIB_WASM = getenv('TOLKFIFTLIB_WASM')
 const FIFT_EXECUTABLE = getenv('FIFT_EXECUTABLE')
-const FIFT_LIBS_FOLDER = getenv('FIFTPATH')  // this env is needed for fift to work properly
+const FIFT_LIBS_FOLDER = getenv('FIFTPATH')
 const STDLIB_FOLDER = __dirname + '/../crypto/smartcont/tolk-stdlib'
 const TMP_DIR = os.tmpdir()
 
@@ -130,9 +130,12 @@ class TolkTestCaseInputOutput {
         this.expected_output = output_str
     }
 
-    check(/**string[]*/ stdout_lines, /**number*/ line_idx) {
-        if (stdout_lines[line_idx] !== this.expected_output)
-            throw new CompareOutputError(`error on case #${line_idx + 1} (${this.method_id} | ${this.input}):\n    expect: ${this.expected_output}\n    actual: ${stdout_lines[line_idx]}`, stdout_lines.join("\n"))
+    check(/**string[]*/ stdout_lines, /**number*/ line_idx, /**number*/ pivot_typeid) {
+        let expected_str = this.expected_output
+        if (expected_str.includes("typeid"))
+            expected_str = expected_str.replace(/typeid-(\d+)/g, (match, p1) => pivot_typeid + (+p1))
+        if (stdout_lines[line_idx] !== expected_str)
+            throw new CompareOutputError(`error on case #${line_idx + 1} (${this.method_id} | ${this.input}):\n    expect: ${expected_str}\n    actual: ${stdout_lines[line_idx]}`, stdout_lines.join("\n"))
     }
 }
 
@@ -269,10 +272,16 @@ class TolkTestFile {
         this.input_output = []
         /** @type {TolkTestCaseFifCodegen[]} */
         this.fif_codegen = []
+        /** @type {TolkTestCaseFifCodegen[]} */
+        this.abi_json = []
         /** @type {TolkTestCaseExpectedHash | null} */
         this.expected_hash = null
-        /** @type {string | null} */
-        this.experimental_options = null
+        /** @type {Object} */
+        this.path_mappings = {}
+        /** @type {boolean} */
+        this.enable_tolk_lines_comments = false
+        /** @type {number} */
+        this.pivot_typeid = 128
     }
 
     parse_input_from_tolk_file() {
@@ -280,7 +289,13 @@ class TolkTestFile {
         this.line_idx = 0
 
         while (this.line_idx < lines.length) {
-            const line = lines[this.line_idx]
+            let line = lines[this.line_idx]
+            // support both "@tag" and "// @tag" syntax
+            if (line.startsWith("// @") && !line.startsWith("// @testcase")) {
+                line = line.substring(3)
+                lines[this.line_idx] = line
+            }
+
             if (line.startsWith('@testcase')) {
                 let s = line.split("|").map(p => p.trim())
                 if (s.length !== 4)
@@ -288,16 +303,25 @@ class TolkTestFile {
                 this.input_output.push(new TolkTestCaseInputOutput(s[1], s[2], s[3]))
             } else if (line.startsWith('@compilation_should_fail')) {
                 this.compilation_should_fail = true
+            } else if (line.startsWith('@stderr_avoid')) {
+                this.stderr_includes.push(new TolkTestCaseStderr(this.parse_string_value(lines), true))
             } else if (line.startsWith('@stderr')) {
                 this.stderr_includes.push(new TolkTestCaseStderr(this.parse_string_value(lines), false))
             } else if (line.startsWith("@fif_codegen_avoid")) {
                 this.fif_codegen.push(new TolkTestCaseFifCodegen(this.parse_string_value(lines), true))
+            } else if (line.startsWith("@fif_codegen_enable_comments")) {
+                this.enable_tolk_lines_comments = true
             } else if (line.startsWith("@fif_codegen")) {
                 this.fif_codegen.push(new TolkTestCaseFifCodegen(this.parse_string_value(lines), false))
+            } else if (line.startsWith("@abi_json_avoid")) {
+                this.abi_json.push(new TolkTestCaseFifCodegen(this.parse_string_value(lines), true))
+            } else if (line.startsWith("@abi_json")) {
+                this.abi_json.push(new TolkTestCaseFifCodegen(this.parse_string_value(lines), false))
             } else if (line.startsWith("@code_hash")) {
                 this.expected_hash = new TolkTestCaseExpectedHash(this.parse_string_value(lines, false)[0])
-            } else if (line.startsWith("@experimental_options")) {
-                this.experimental_options = line.substring(22)
+            } else if (line.startsWith("@path_mapping")) {
+                let eq_pos = line.indexOf('=')
+                this.path_mappings[line.substring(14, eq_pos)] = line.substring(eq_pos+1).replace('{DIR}', path.dirname(this.tolk_filename)).replace(/[\\\/]+$/, '')
             }
             this.line_idx++
         }
@@ -345,10 +369,13 @@ class TolkTestFile {
 
     async run_and_check() {
         const wasmModule = await compileWasm(TOLKFIFTLIB_MODULE, TOLKFIFTLIB_WASM)
-        let res = compileFile(wasmModule, this.tolk_filename, this.experimental_options)
+        let outputStr = compileFile(wasmModule, this.tolk_filename, this.enable_tolk_lines_comments, this.path_mappings)
+        /** @var {{status: string, message: string, fiftCode: string, codeBoc: string, codeHashHex: string, abiJson: Object}} */
+        let res = JSON.parse(outputStr);
         let exit_code = res.status === 'ok' ? 0 : 1
-        let stderr = res.message
+        let stderr = res.message || res.stderr
         let stdout = ''
+        let abiJson = res.abiJson
 
         if (exit_code === 0 && this.compilation_should_fail)
             throw new TolkCompilationSucceededError("compilation succeeded, but it should have failed")
@@ -390,12 +417,18 @@ class TolkTestFile {
             throw new CompareOutputError(`unexpected number of fift output: ${stdout_lines.length} lines, but ${this.input_output.length} testcases`, stdout)
 
         for (let i = 0; i < stdout_lines.length; ++i)
-            this.input_output[i].check(stdout_lines, i)
+            this.input_output[i].check(stdout_lines, i, this.pivot_typeid)
 
         if (this.fif_codegen.length) {
             const fif_output = fs.readFileSync(this.get_compiled_fif_filename(), 'utf-8').split(/\r?\n/)
             for (let fif_codegen of this.fif_codegen)
                 fif_codegen.check(fif_output)
+        }
+
+        if (this.abi_json.length) {
+            const abi_output = outputStr.substring(outputStr.indexOf("\"abiJson\":"), outputStr.indexOf("\"compiler_version\"")).split('\n')
+            for (let abi_json of this.abi_json)
+                abi_json.check(abi_output)
         }
 
         if (this.expected_hash !== null)
@@ -487,40 +520,68 @@ function copyFromCString(mod, ptr) {
     return mod.UTF8ToString(ptr);
 }
 
-/** @return {{status: string, message: string, fiftCode: string, codeBoc: string, codeHashHex: string}} */
-function compileFile(mod, filename, experimentalOptions) {
+/** @return string */
+function compileFile(mod, filename, withSrcLineComments, pathMappings) {
     // see tolk-wasm.cpp: typedef void (*WasmFsReadCallback)(int, char const*, char**, char**)
     const callbackPtr = mod.addFunction((kind, dataPtr, destContents, destError) => {
-        if (kind === 0) { // realpath
-            try {
-                let relative = copyFromCString(mod, dataPtr)
-                if (relative.startsWith('@stdlib/')) {
-                    // import "@stdlib/filename" or import "@stdlib/filename.tolk"
-                    relative = STDLIB_FOLDER + '/' + relative.substring(7)
-                    if (!relative.endsWith('.tolk')) {
-                        relative += '.tolk'
+        switch (kind) {   // enum ReadCallback::Kind in C++
+            case 0:       // realpath
+                let relativeFilename = copyFromCString(mod, dataPtr)  // from `import` statement, relative to cur file
+                // handle import "@third_party/utils", map it to import "/absolute/folder/utils"
+                if (relativeFilename.startsWith('@') && !relativeFilename.startsWith('@stdlib/') && !relativeFilename.startsWith('@fiftlib/')) {
+                    const slash = relativeFilename.indexOf('/');
+                    if (slash === -1 || slash >= relativeFilename.length - 1) {
+                        copyToCStringPtr(mod, "import path with @ prefix must specify a file, e.g. @third_party/math-utils", destError)
+                        break
                     }
+                    const atPrefix = relativeFilename.substring(0, slash);
+                    const absFolder = pathMappings[atPrefix];
+                    if (absFolder == null || absFolder === '') {
+                        copyToCStringPtr(mod, `path mapping ${atPrefix} was not registered`, destError)
+                        break
+                    }
+                    relativeFilename = absFolder + relativeFilename.substring(slash)
                 }
-                copyToCStringPtr(mod, fs.realpathSync(relative), destContents);
-            } catch (err) {
-                copyToCStringPtr(mod, 'cannot find file', destError);
-            }
-        } else if (kind === 1) { // read file
-            try {
-                const absolute = copyFromCString(mod, dataPtr) // already normalized (as returned above)
-                copyToCStringPtr(mod, fs.readFileSync(absolute).toString('utf-8'), destContents);
-            } catch (err) {
-                copyToCStringPtr(mod, err.message || err.toString(), destError);
-            }
-        } else {
-            copyToCStringPtr(mod, 'Unknown callback kind=' + kind, destError);
+                if (relativeFilename.endsWith('/') || relativeFilename.endsWith('\\')) {
+                    copyToCStringPtr(mod, "import path must specify a file, not a directory", destError)
+                    break
+                }
+                if (!relativeFilename.endsWith('.tolk') && !relativeFilename.endsWith('.fif')) {
+                    relativeFilename += '.tolk'
+                }
+                let resRealpath = path.normalize(relativeFilename)
+                copyToCStringPtr(mod, resRealpath, destContents)
+                break
+            case 1:       // read file
+                try {
+                    const filename = copyFromCString(mod, dataPtr) // already normalized (as returned above)
+                    if (filename.startsWith('@stdlib/')) {
+                        const contents = fs.readFileSync(STDLIB_FOLDER + '/' + filename.substring(8)).toString('utf-8');
+                        copyToCStringPtr(mod, contents, destContents)
+                    } else if (filename.startsWith('@fiftlib/')) {
+                        const contents = fs.readFileSync(FIFT_LIBS_FOLDER + '/' + filename.substring(9)).toString('utf-8');
+                        copyToCStringPtr(mod, contents, destContents)
+                    } else try {
+                        const contents = fs.readFileSync(filename).toString('utf-8');
+                        copyToCStringPtr(mod, contents, destContents)
+                    } catch (ex) {
+                        throw `cannot find file "${filename}"`
+                    }
+                } catch (err) {
+                    copyToCStringPtr(mod, err.message || err.toString(), destError)
+                }
+                break
+            default:
+                copyToCStringPtr(mod, 'Unknown callback kind=' + kind, destError)
+                break
         }
-    }, 'viiii');
+    }, 'viiiii');
 
     const config = {
         optimizationLevel: 2,
         withStackComments: true,
-        experimentalOptions: experimentalOptions || undefined,
+        withSrcLineComments: withSrcLineComments,
+        withSymbolTypes: false,
         entrypointFileName: filename
     };
 
@@ -528,7 +589,7 @@ function compileFile(mod, filename, experimentalOptions) {
 
     const responsePtr = mod._tolk_compile(configPtr, callbackPtr);
 
-    return JSON.parse(copyFromCString(mod, responsePtr));
+    return copyFromCString(mod, responsePtr);
 }
 
 async function compileWasm(tolkFiftLibJsFileName, tolkFiftLibWasmFileName) {

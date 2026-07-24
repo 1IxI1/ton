@@ -17,22 +17,25 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 
+#include <cmath>
+
 #include "RttStats.h"
 #include "rldp.hpp"
-#include <cmath>
 
 namespace ton {
 namespace rldp2 {
 void RttStats::on_rtt_sample(double rtt_sample, double ack_delay, td::Timestamp now) {
+  // Accept RTT samples from 1ms to 10s
   if (rtt_sample < 0.001 || rtt_sample > 10) {
-    VLOG(RLDP_INFO) << "Suspicious rtt sample " << rtt_sample;
+    VLOG(rldp2, INFO) << "Suspicious rtt sample " << rtt_sample;
     return;
   }
   if (ack_delay < -1e-9 || ack_delay > 10) {
-    VLOG(RLDP_INFO) << "Suspicious ack_delay " << ack_delay;
+    VLOG(rldp2, INFO) << "Suspicious ack_delay " << ack_delay;
     return;
   }
-  rtt_sample = td::max(0.01, rtt_sample);
+  // Floor at 1ms - prevents issues with near-zero RTT
+  rtt_sample = td::max(0.001, rtt_sample);
 
   last_rtt = rtt_sample;
 

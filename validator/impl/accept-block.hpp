@@ -18,12 +18,13 @@
 */
 #pragma once
 
-#include "td/actor/actor.h"
-#include "ton/ton-types.h"
-#include "ton/ton-shard.h"
+#include "block/signature-set.h"
+#include "block/validator-set.h"
 #include "interfaces/validator-manager.h"
-#include "validator-set.hpp"
-#include "signature-set.hpp"
+#include "td/actor/actor.h"
+#include "ton/ton-shard.h"
+#include "ton/ton-types.h"
+
 #include "shard.hpp"
 
 namespace ton {
@@ -49,11 +50,11 @@ class AcceptBlockQuery : public td::actor::Actor {
   struct IsFake {};
   struct ForceFork {};
   AcceptBlockQuery(BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
-                   td::Ref<ValidatorSet> validator_set, td::Ref<BlockSignatureSet> signatures,
-                   td::Ref<BlockSignatureSet> approve_signatures, int send_broadcast_mode,
+                   td::Ref<block::ValidatorSet> validator_set, td::Ref<block::BlockSignatureSet> signatures,
+                   int block_broadcast_mode, int finality_broadcast_mode, bool send_shard_block_desc, bool apply,
                    td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise);
   AcceptBlockQuery(IsFake fake, BlockIdExt id, td::Ref<BlockData> data, std::vector<BlockIdExt> prev,
-                   td::Ref<ValidatorSet> validator_set, td::actor::ActorId<ValidatorManager> manager,
+                   td::Ref<block::ValidatorSet> validator_set, td::actor::ActorId<ValidatorManager> manager,
                    td::Promise<td::Unit> promise);
   AcceptBlockQuery(ForceFork ffork, BlockIdExt id, td::Ref<BlockData> data,
                    td::actor::ActorId<ValidatorManager> manager, td::Promise<td::Unit> promise);
@@ -71,10 +72,8 @@ class AcceptBlockQuery : public td::actor::Actor {
   void written_block_data();
   void written_block_signatures();
   void got_block_handle(BlockHandle handle);
-  void got_block_candidate_data(td::BufferSlice data);
   void got_block_handle_cont();
   void written_block_info();
-  void got_block_data(td::Ref<BlockData> data);
   void got_prev_state(td::Ref<ShardState> state);
   void written_state(td::Ref<ShardState> state);
   void written_block_proof();
@@ -89,17 +88,20 @@ class AcceptBlockQuery : public td::actor::Actor {
   void written_block_next();
   void written_block_info_2();
   void applied();
+  void send_broadcasts();
 
  private:
   BlockIdExt id_;
   Ref<BlockData> data_;
   std::vector<BlockIdExt> prev_;
-  Ref<ValidatorSetQ> validator_set_;
-  Ref<BlockSignatureSetQ> signatures_;
-  Ref<BlockSignatureSetQ> approve_signatures_;
+  Ref<block::ValidatorSet> validator_set_;
+  Ref<block::BlockSignatureSet> signatures_;
   bool is_fake_;
   bool is_fork_;
-  int send_broadcast_mode_{0};
+  int block_broadcast_mode_{0};
+  int finality_broadcast_mode_{0};
+  bool send_shard_block_desc_ = false;
+  bool apply_ = true;
   bool ancestors_split_{false}, is_key_block_{false};
   td::Timestamp timeout_ = td::Timestamp::in(600.0);
   td::actor::ActorId<ValidatorManager> manager_;
@@ -116,6 +118,7 @@ class AcceptBlockQuery : public td::actor::Actor {
   UnixTime created_at_;
   RootHash state_keep_old_hash_, state_old_hash_, state_hash_;
   BlockIdExt mc_blkid_, prev_mc_blkid_;
+  bool before_split_;
 
   Ref<MasterchainStateQ> last_mc_state_;
   BlockIdExt last_mc_id_;

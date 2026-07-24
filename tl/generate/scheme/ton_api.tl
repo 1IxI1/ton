@@ -55,20 +55,15 @@ pub.overlay name:bytes = PublicKey;
 
 adnl.id.short id:int256 = adnl.id.Short;
 
-adnl.proxyToFastHash ip:int port:int date:int data_hash:int256 shared_secret:int256 = adnl.ProxyTo;
-adnl.proxyToFast ip:int port:int date:int signature:int256 = adnl.ProxyToSign;
-
-adnl.proxy.none id:int256 = adnl.Proxy;
-adnl.proxy.fast id:int256 shared_secret:bytes = adnl.Proxy;
-
-
 adnl.address.udp ip:int port:int = adnl.Address;
 adnl.address.udp6 ip:int128 port:int = adnl.Address;
 //adnl.address.tcp ip:int port:int = adnl.Address;
 //adnl.address.tcp6 ip:int128 port:int = adnl.Address;
 
-adnl.address.tunnel to:int256 pubkey:PublicKey = adnl.Address; 
+adnl.address.tunnel to:int256 pubkey:PublicKey = adnl.Address;
 adnl.address.reverse = adnl.Address;
+
+adnl.address.quic ip:int port:int = adnl.Address;
 
 adnl.addressList addrs:(vector adnl.Address) version:int reinit_date:int priority:int expire_at:int = adnl.AddressList;
 
@@ -79,52 +74,35 @@ adnl.nodes nodes:(vector adnl.node) = adnl.Nodes;
 
 ---types---
 
-adnl.packetContents 
-  rand1:bytes 
-  flags:# 
-  from:flags.0?PublicKey 
+adnl.packetContents
+  rand1:bytes
+  flags:#
+  from:flags.0?PublicKey
   from_short:flags.1?adnl.id.short
-  message:flags.2?adnl.Message 
+  message:flags.2?adnl.Message
   messages:flags.3?(vector adnl.Message)
-  address:flags.4?adnl.addressList 
+  address:flags.4?adnl.addressList
   priority_address:flags.5?adnl.addressList
-  seqno:flags.6?long 
-  confirm_seqno:flags.7?long 
+  seqno:flags.6?long
+  confirm_seqno:flags.7?long
   recv_addr_list_version:flags.8?int
   recv_priority_addr_list_version:flags.9?int
-  reinit_date:flags.10?int 
+  reinit_date:flags.10?int
   dst_reinit_date:flags.10?int
-  signature:flags.11?bytes 
-  rand2:bytes 
+  signature:flags.11?bytes
+  rand2:bytes
         = adnl.PacketContents;
 
-adnl.tunnelPacketContents 
-  rand1:bytes 
-  flags:# 
+adnl.tunnelPacketContents
+  rand1:bytes
+  flags:#
   from_ip:flags.0?int
   from_port:flags.0?int
-  message:flags.1?bytes 
+  message:flags.1?bytes
   statistics:flags.2?bytes
   payment:flags.3?bytes
-  rand2:bytes 
+  rand2:bytes
         = adnl.TunnelPacketContents;
-
-
-// flag 16 - packet is outbound
-// flag 17 - control packet
-adnl.proxyPacketHeader
-  proxy_id:int256
-  flags:# 
-  ip:flags.0?int
-  port:flags.0?int
-  adnl_start_time:flags.1?int
-  seqno:flags.2?long
-  date:flags.3?int
-  signature:int256 = adnl.ProxyPacketHeader;
-
-adnl.proxyControlPacketPing id:int256 = adnl.ProxyControlPacket;
-adnl.proxyControlPacketPong id:int256 = adnl.ProxyControlPacket;
-adnl.proxyControlPacketRegister ip:int port:int = adnl.ProxyControlPacket;
 
 
 adnl.message.createChannel key:int256 date:int = adnl.Message;
@@ -161,7 +139,7 @@ adnl.stats.localIdPackets ts_start:double ts_end:double
     decrypted_packets:(vector adnl.stats.ipPackets) dropped_packets:(vector adnl.stats.ipPackets) = adnl.stats.LocalIdPackets;
 adnl.stats.localId short_id:int256
     current_decrypt:(vector adnl.stats.ipPackets)
-    packets_recent:adnl.stats.localIdPackets packets_total:adnl.stats.localIdPackets
+    packets_recent:adnl.stats.localIdPackets
     peers:(vector adnl.stats.peerPair) = adnl.stats.LocalId;
 adnl.stats timestamp:double local_ids:(vector adnl.stats.localId) = adnl.Stats;
 
@@ -196,7 +174,7 @@ dht.updateRule.overlayNodes = dht.UpdateRule;
 
 dht.keyDescription key:dht.key id:PublicKey update_rule:dht.UpdateRule signature:bytes = dht.KeyDescription;
 
-dht.value key:dht.keyDescription value:bytes ttl:int signature:bytes = dht.Value; 
+dht.value key:dht.keyDescription value:bytes ttl:int signature:bytes = dht.Value;
 
 dht.pong random_id:long = dht.Pong;
 
@@ -217,8 +195,8 @@ dht.db.key.bucket id:int = dht.db.Key;
 
 dht.ping random_id:long = dht.Pong;
 dht.store value:dht.value = dht.Stored;
-dht.findNode key:int256 k:int = dht.Nodes; 
-dht.findValue key:int256 k:int = dht.ValueResult; 
+dht.findNode key:int256 k:int = dht.Nodes;
+dht.findValue key:int256 k:int = dht.ValueResult;
 dht.getSignedAddressList = dht.Node;
 dht.registerReverseConnection node:PublicKey ttl:int signature:bytes = dht.Stored;
 dht.requestReversePing target:adnl.Node signature:bytes client:int256 k:int = dht.ReversePingResult;
@@ -232,7 +210,7 @@ overlay.node.toSignEx id:adnl.id.short overlay:int256 flags:int version:int = ov
 overlay.node id:PublicKey overlay:int256 version:int signature:bytes = overlay.Node;
 overlay.nodeV2 id:PublicKey overlay:int256 flags:int version:int signature:bytes certificate:overlay.MemberCertificate = overlay.NodeV2;
 overlay.nodes nodes:(vector overlay.node) = overlay.Nodes;
-overlay.nodesV2 nodes:(vector overlay.NodeV2) = overlay.NodesV2;
+overlay.nodesV2 nodes:(vector overlay.nodeV2) = overlay.NodesV2;
 
 overlay.pong = overlay.Pong;
 
@@ -245,7 +223,7 @@ overlay.broadcastList hashes:(vector int256) = overlay.BroadcastList;
 overlay.fec.received hash:int256 = overlay.Broadcast;
 overlay.fec.completed hash:int256 = overlay.Broadcast;
 
-overlay.broadcast.id src:int256 data_hash:int256 flags:int = overlay.broadcast.Id; 
+overlay.broadcast.id src:int256 data_hash:int256 flags:int = overlay.broadcast.Id;
 overlay.broadcastFec.id src:int256 type:int256 data_hash:int256 size:int flags:int = overlay.broadcastFec.Id;
 overlay.broadcastFec.partId broadcast_hash:int256 data_hash:int256 seqno:int = overlay.broadcastFec.PartId;
 
@@ -265,19 +243,26 @@ overlay.unicast data:bytes = overlay.Broadcast;
 overlay.broadcast src:PublicKey certificate:overlay.Certificate flags:int data:bytes date:int signature:bytes = overlay.Broadcast;
 overlay.broadcastFec src:PublicKey certificate:overlay.Certificate data_hash:int256 data_size:int flags:int
           data:bytes seqno:int fec:fec.Type date:int signature:bytes = overlay.Broadcast;
-overlay.broadcastFecShort src:PublicKey certificate:overlay.Certificate broadcast_hash:int256 part_data_hash:int256 seqno:int signature:bytes = overlay.Broadcast; 
+overlay.broadcastFecShort src:PublicKey certificate:overlay.Certificate broadcast_hash:int256 part_data_hash:int256 seqno:int signature:bytes = overlay.Broadcast;
 overlay.broadcastNotFound = overlay.Broadcast;
+
+overlay.broadcastTwostepSimple flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data:bytes extra:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastTwostepFec flags:int date:int src:PublicKey src_adnl_id:int256 certificate:overlay.Certificate data_hash:int256 data_size:int seqno:int part:bytes extra:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastTwostep.id flags:int date:int src:int256 src_adnl_id:int256 data_hash:int256 data_size:int part_size:int extra:bytes = overlay.broadcastTwostep.Id;
+overlay.broadcastTwostepSimple.toSign id:int256 data:bytes = overlay.broadcastTwostepSimple.ToSign;
+overlay.broadcastTwostepFec.toSign id:int256 seqno:int part:bytes = overlay.broadcastTwostepFec.ToSign;
 
 ---functions---
 
 overlay.getRandomPeers peers:overlay.nodes = overlay.Nodes;
-overlay.getRandomPeersV2 peers:overlay.NodesV2 = overlay.NodesV2;
+overlay.getRandomPeersV2 peers:overlay.nodesV2 = overlay.NodesV2;
 overlay.ping = overlay.Pong;
 
 overlay.query overlay:int256 = True;
 overlay.queryWithExtra overlay:int256 extra:overlay.messageExtra = True;
 overlay.getBroadcast hash:int256 = overlay.Broadcast;
 overlay.getBroadcastList list:overlay.broadcastList = overlay.BroadcastList;
+overlay.repairPlumtreePart broadcast_id:int256 timestamp:double part_index:int tree_index:int = overlay.Broadcast;
 
 ---types---
 
@@ -289,77 +274,11 @@ overlay.db.key.nodes local_id:int256 overlay:int256 = overlay.db.Key;
 
 ---types---
 
-catchain.block.id incarnation:int256 src:int256 height:int data_hash:int256 = catchain.block.Id;
-catchain.block.dep src:int height:int data_hash:int256 signature:bytes = catchain.block.Dep;
-catchain.block.data prev:catchain.block.dep deps:(vector catchain.block.dep) = catchain.block.Data;
-catchain.block incarnation:int256 src:int height:int data:catchain.block.data signature:bytes = catchain.Block;
-catchain.blocks blocks:(vector catchain.block) = catchain.Blocks;
-catchain.blockUpdate block:catchain.block = catchain.Update;
-
-catchain.block.data.badBlock block:catchain.block = catchain.block.inner.Data;
-catchain.block.data.fork left:catchain.block.Dep right:catchain.block.Dep = catchain.block.inner.Data;
-catchain.block.data.nop = catchain.block.inner.Data;
-//catchain.block.data.vector msgs:(vector bytes) = catchain.block.inner.Data;
-//catchain.block.data.custom = catchain.block.inner.Data;
-
-catchain.firstblock unique_hash:int256 nodes:(vector int256) = catchain.FirstBlock;
-
-catchain.difference sent_upto:(vector int) = catchain.Difference;
-catchain.differenceFork left:catchain.block.dep right:catchain.block.dep = catchain.Difference;
-
-catchain.blockNotFound = catchain.BlockResult;
-catchain.blockResult block:catchain.block = catchain.BlockResult;
-
----functions---
-
-catchain.getBlock block:int256 = catchain.BlockResult;
-catchain.getDifference rt:(vector int) = catchain.Difference;
-//catchain.getForkDifference src:int fork:catchain.fork = catchain.ForkDifference;
-
----types---
-
-validatorSession.round.id session:int256 height:long prev_block:int256 seqno:int = validatorSession.round.Id;
-
-validatorSession.candidate.id round:int256 block_hash:int256 = validatorSession.tempBlock.Id;
-
-validatorSession.message.startSession = validatorSession.Message;
-validatorSession.message.finishSession = validatorSession.Message;
-
-validatorSession.message.submittedBlock round:int root_hash:int256 file_hash:int256 
-               collated_data_file_hash:int256 = validatorSession.round.Message;
-validatorSession.message.approvedBlock round:int candidate:int256 signature:bytes = validatorSession.round.Message;
-validatorSession.message.rejectedBlock round:int candidate:int256 reason:bytes = validatorSession.round.Message;
-validatorSession.message.commit round:int candidate:int256 signature:bytes = validatorSession.round.Message;
-
-validatorSession.message.vote round:int attempt:int candidate:int256 = validatorSession.round.Message;
-validatorSession.message.voteFor round:int attempt:int candidate:int256 = validatorSession.round.Message;
-validatorSession.message.precommit round:int attempt:int candidate:int256 = validatorSession.round.Message;
-validatorSession.message.empty round:int attempt:int = validatorSession.round.Message;
-
-validatorSession.pong hash:long = validatorSession.Pong;
-
-validatorSession.candidateId src:int256 root_hash:int256 file_hash:int256 collated_data_file_hash:int256 = validatorSession.CandidateId;
-
-validatorSession.blockUpdate ts:long actions:(vector validatorSession.round.Message) state:int = validatorSession.BlockUpdate;
 validatorSession.candidate src:int256 round:int root_hash:int256 data:bytes collated_data:bytes = validatorSession.Candidate;
 validatorSession.compressedCandidate flags:# src:int256 round:int root_hash:int256 decompressed_size:int data:bytes = validatorSession.Candidate;
-
-validatorSession.config catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
-        max_round_attempts:int max_block_size:int max_collated_data_size:int = validatorSession.Config;
-validatorSession.configNew catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
-        max_round_attempts:int max_block_size:int max_collated_data_size:int new_catchain_ids:Bool = validatorSession.Config;
-validatorSession.configVersioned catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
-        max_round_attempts:int max_block_size:int max_collated_data_size:int version:int = validatorSession.Config;
-
-validatorSession.catchainOptions idle_timeout:double max_deps:int max_block_size:int block_hash_covers_data:Bool
-        max_block_height_ceoff:int debug_disable_db:Bool = validatorSession.CatChainOptions;
-validatorSession.configVersionedV2 catchain_opts:validatorSession.CatChainOptions round_candidates:int next_candidate_delay:double
-        round_attempt_duration:int max_round_attempts:int max_block_size:int max_collated_data_size:int version:int = validatorSession.Config;
+validatorSession.compressedCandidateV2 flags:# src:int256 round:int root_hash:int256 data:bytes = validatorSession.Candidate;
 
 ---functions---
-
-validatorSession.ping hash:long = validatorSession.Pong;
-validatorSession.downloadCandidate round:int id:validatorSession.candidateId = validatorSession.Candidate; 
 
 ---types---
 
@@ -375,7 +294,7 @@ hashable.validatorSessionRoundAttempt seqno:int votes:int precommitted:int vote_
 hashable.validatorSessionRound locked_round:int locked_block:int seqno:int precommitted:Bool
           first_attempt:int approved_blocks:int signatures:int attempts:int = Hashable;
 hashable.blockSignature signature:int = Hashable;
-hashable.sentBlock src:int root_hash:int file_hash:int collated_data_file_hash:int = Hashable; 
+hashable.sentBlock src:int root_hash:int file_hash:int collated_data_file_hash:int = Hashable;
 hashable.sentBlockEmpty = Hashable;
 hashable.vote block:int node:int = Hashable;
 hashable.blockCandidate block:int approved:int = Hashable;
@@ -391,15 +310,30 @@ hashable.validatorSession ts:int old_rounds:int cur_round:int = Hashable;
 ---types---
 
 
-tonNode.sessionId workchain:int shard:long cc_seqno:int opts_hash:int256 = tonNode.SessionId; 
+tonNode.sessionId workchain:int shard:long cc_seqno:int opts_hash:int256 = tonNode.SessionId;
 
 
 tonNode.blockSignature who:int256 signature:bytes = tonNode.BlockSignature;
+tonNode.signatureSet.ordinary cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature) = tonNode.SignatureSet;
+tonNode.signatureSet.simplex final:Bool cc_seqno:int validator_set_hash:int signatures:(vector tonNode.blockSignature)
+    session_id:int256 slot:int candidate:consensus.CandidateHashData = tonNode.SignatureSet;
 
 tonNode.blockId workchain:int shard:long seqno:int = tonNode.BlockId;
 tonNode.blockIdExt workchain:int shard:long seqno:int root_hash:int256 file_hash:int256 = tonNode.BlockIdExt;
-tonNode.zeroStateIdExt workchain:int root_hash:int256 file_hash:int256 = tonNode.ZeroStateIdExt;
 tonNode.shardId workchain:int shard:long = tonNode.ShardId;
+overlay.broadcastPlumtreeSimple flags:int timestamp:double src:PublicKey certificate:overlay.Certificate broadcast_id:int256 tree_index:int data:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastPlumtreeFec flags:int timestamp:double src:PublicKey certificate:overlay.Certificate full_data_hash:int256 full_data_size:int part_index:int tree_index:int data:bytes signature:bytes = overlay.Broadcast;
+overlay.broadcastPlumtreeIHave broadcast_id:int256 timestamp:double part_index:int tree_index:int src:PublicKey certificate:overlay.Certificate payload_timestamp:double data_size:int data_hash:int256 signature:bytes = overlay.Broadcast;
+overlay.broadcastPlumtreePrune broadcast_id:int256 timestamp:double part_index:int tree_index:int = overlay.Broadcast;
+overlay.broadcastPlumtreeUseful broadcast_id:int256 timestamp:double part_index:int tree_index:int = overlay.Broadcast;
+overlay.plumtreeStatsRecord src:int256 epoch:int tree_index:int eager_0:(vector long) eager_index:(vector long) delivered_bcsts:int parts_in_p99_bcsts:int useful_avg_ms:int useful_max_ms:int useful_p99_ms:int = overlay.PlumtreeStatsRecord;
+overlay.plumtreeStatsPush record:overlay.plumtreeStatsRecord = overlay.Broadcast;
+overlay.plumtreeStatsExchange overlay:int256 overlay_type:string shard:tonNode.shardId records:(vector overlay.plumtreeStatsRecord) = overlay.PlumtreeStatsExchange;
+overlay.plumtreeStatsDump overlay:int256 overlay_type:string shard:tonNode.shardId received_from:int256 received_at:double records:(vector overlay.plumtreeStatsRecord) = overlay.PlumtreeStatsDump;
+overlay.broadcastPlumtreeFec.id flags:int full_data_hash:int256 full_data_size:int part_size:int = overlay.broadcastPlumtreeFec.Id;
+overlay.broadcastPlumtreeSimple.toSign id:int256 timestamp:double tree_index:int data_size:int data_hash:int256 = overlay.broadcastPlumtreeSimple.ToSign;
+overlay.broadcastPlumtreeFec.toSign id:int256 timestamp:double part_index:int tree_index:int data_size:int data_hash:int256 = overlay.broadcastPlumtreeFec.ToSign;
+tonNode.zeroStateIdExt workchain:int root_hash:int256 file_hash:int256 = tonNode.ZeroStateIdExt;
 
 tonNode.blockDescriptionEmpty = tonNode.BlockDescription;
 tonNode.blockDescription id:tonNode.blockIdExt = tonNode.BlockDescription;
@@ -409,14 +343,15 @@ tonNode.preparedProof = tonNode.PreparedProof;
 tonNode.preparedProofLink = tonNode.PreparedProof;
 tonNode.preparedState = tonNode.PreparedState;
 tonNode.notFoundState = tonNode.PreparedState;
+tonNode.persistentStateIdV2 block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt effective_shard:long = tonNode.PersistentStateIdV2;
 tonNode.persistentStateSize size:long = tonNode.PersistentStateSize;
+tonNode.persistentStateSizeNotFound = tonNode.PersistentStateSize;
 tonNode.prepared = tonNode.Prepared;
 tonNode.notFound = tonNode.Prepared;
 tonNode.data data:bytes = tonNode.Data;
 //tonNode.preparedKeyBlockProofEmpty = tonNode.PreparedKeyBlockProof;
 //tonNode.preparedKeyBlockProof block_id:tonNode.blockIdExt = tonNode.PreparedKeyBlockProof;
 
-tonNode.ihrMessage data:bytes = tonNode.IhrMessage;
 tonNode.externalMessage data:bytes = tonNode.ExternalMessage;
 
 tonNode.newShardBlock block:tonNode.blockIdExt cc_seqno:int data:bytes = tonNode.NewShardBlock;
@@ -428,7 +363,9 @@ tonNode.blockBroadcast id:tonNode.blockIdExt catchain_seqno:int validator_set_ha
               proof:bytes data:bytes = tonNode.Broadcast;
 tonNode.blockBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
               flags:# compressed:bytes = tonNode.Broadcast;
-tonNode.ihrMessageBroadcast message:tonNode.ihrMessage = tonNode.Broadcast;
+tonNode.blockBroadcastCompressedV2 id:tonNode.blockIdExt signature_set:tonNode.SignatureSet flags:# proof:bytes data_compressed:bytes = tonNode.Broadcast;
+tonNode.finalityBroadcastId id:tonNode.blockIdExt = tonNode.FinalityBroadcastId;
+tonNode.blockFinalityBroadcast id:tonNode.blockIdExt signature_set:tonNode.SignatureSet = tonNode.Broadcast;
 tonNode.externalMessageBroadcast message:tonNode.externalMessage = tonNode.Broadcast;
 tonNode.newShardBlockBroadcast block:tonNode.newShardBlock = tonNode.Broadcast;
 // signature may be empty, at least for now
@@ -436,11 +373,18 @@ tonNode.newBlockCandidateBroadcast id:tonNode.blockIdExt catchain_seqno:int vali
               collator_signature:tonNode.blockSignature data:bytes = tonNode.Broadcast;
 tonNode.newBlockCandidateBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
               collator_signature:tonNode.blockSignature flags:# compressed:bytes = tonNode.Broadcast;
+tonNode.newBlockCandidateBroadcastCompressedV2 id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
+              collator_signature:tonNode.blockSignature flags:# compressed:bytes = tonNode.Broadcast;
+
+// optimistic broadcast of response to tonNode.getOutMsgQueueProof with dst_shard, block and limits arguments
+tonNode.outMsgQueueProofBroadcast dst_shard:tonNode.shardId block:tonNode.blockIdExt
+              limits:ImportedMsgQueueLimits proof:tonNode.OutMsgQueueProof = tonNode.Broadcast;
 
 tonNode.shardPublicOverlayId workchain:int shard:long zero_state_file_hash:int256 = tonNode.ShardPublicOverlayId;
 
 tonNode.privateBlockOverlayId zero_state_file_hash:int256 nodes:(vector int256) = tonNode.PrivateBlockOverlayId;
 tonNode.customOverlayId zero_state_file_hash:int256 name:string nodes:(vector int256) = tonNode.CustomOverlayId;
+tonNode.fastSyncOverlayId zero_state_file_hash:int256 shard:tonNode.shardId = tonNode.FastSyncOverlayId;
 
 tonNode.keyBlocks blocks:(vector tonNode.blockIdExt) incomplete:Bool error:Bool = tonNode.KeyBlocks;
 
@@ -449,7 +393,10 @@ ton.blockIdApprove root_cell_hash:int256 file_hash:int256 = ton.BlockId;
 
 tonNode.dataFull id:tonNode.blockIdExt proof:bytes block:bytes is_link:Bool = tonNode.DataFull;
 tonNode.dataFullCompressed id:tonNode.blockIdExt flags:# compressed:bytes is_link:Bool = tonNode.DataFull;
+tonNode.dataFullCompressedV2 id:tonNode.blockIdExt flags:# proof:bytes block_compressed:bytes is_link:Bool = tonNode.DataFull;
 tonNode.dataFullEmpty = tonNode.DataFull;
+
+tonNode.nextBlocksFull blocks:(vector tonNode.DataFull) = tonNode.NextBlocksFull;
 
 tonNode.capabilities#f5bf60c0 version_major:int version_minor:int flags:# = tonNode.Capabilities;
 
@@ -463,6 +410,8 @@ tonNode.outMsgQueueProof queue_proofs:bytes block_state_proofs:bytes msg_counts:
 tonNode.outMsgQueueProofEmpty = tonNode.OutMsgQueueProof;
 
 tonNode.forgetPeer = tonNode.ForgetPeer;
+tonNode.newFastSyncMemberCertificate adnl_id:int256 certificate:overlay.MemberCertificate = tonNode.NewFastSyncMemberCertificate;
+
 
 ---functions---
 
@@ -471,19 +420,13 @@ tonNode.getNextBlocksDescription prev_block:tonNode.blockIdExt limit:int = tonNo
 tonNode.getPrevBlocksDescription next_block:tonNode.blockIdExt limit:int cutoff_seqno:int = tonNode.BlocksDescription;
 tonNode.prepareBlockProof block:tonNode.blockIdExt allow_partial:Bool = tonNode.PreparedProof;
 tonNode.prepareKeyBlockProof block:tonNode.blockIdExt allow_partial:Bool = tonNode.PreparedProof;
-tonNode.prepareBlockProofs blocks:(vector tonNode.blockIdExt) allow_partial:Bool = tonNode.PreparedProof;
-tonNode.prepareKeyBlockProofs blocks:(vector tonNode.blockIdExt) allow_partial:Bool = tonNode.PreparedProof;
 tonNode.prepareBlock block:tonNode.blockIdExt = tonNode.Prepared;
-tonNode.prepareBlocks blocks:(vector tonNode.blockIdExt) = tonNode.Prepared;
-tonNode.preparePersistentState block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.PreparedState;
-tonNode.getPersistentStateSize block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.PersistentStateSize;
 tonNode.prepareZeroState block:tonNode.blockIdExt = tonNode.PreparedState;
 tonNode.getNextKeyBlockIds block:tonNode.blockIdExt max_size:int = tonNode.KeyBlocks;
 tonNode.downloadNextBlockFull prev_block:tonNode.blockIdExt = tonNode.DataFull;
+tonNode.downloadNextBlocksFull prev_block:tonNode.blockIdExt max_blocks:int = tonNode.NextBlocksFull;
 tonNode.downloadBlockFull block:tonNode.blockIdExt = tonNode.DataFull;
 tonNode.downloadBlock block:tonNode.blockIdExt = tonNode.Data;
-tonNode.downloadPersistentState block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.Data;
-tonNode.downloadPersistentStateSlice block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt offset:long max_size:long = tonNode.Data;
 tonNode.downloadZeroState block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadBlockProof block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadKeyBlockProof block:tonNode.blockIdExt = tonNode.Data;
@@ -494,6 +437,10 @@ tonNode.getShardArchiveInfo masterchain_seqno:int shard_prefix:tonNode.shardId =
 tonNode.getArchiveSlice archive_id:long offset:long max_size:int = tonNode.Data;
 tonNode.getOutMsgQueueProof dst_shard:tonNode.shardId blocks:(vector tonNode.blockIdExt)
     limits:tonNode.importedMsgQueueLimits = tonNode.OutMsgQueueProof;
+
+tonNode.preparePersistentState block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.PreparedState;
+tonNode.downloadPersistentStateSliceV2 state:tonNode.persistentStateIdV2 offset:long max_size:long = tonNode.Data;
+tonNode.getPersistentStateSizeV2 state:tonNode.persistentStateIdV2 = tonNode.PersistentStateSize;
 
 tonNode.getCapabilities = tonNode.Capabilities;
 
@@ -511,8 +458,8 @@ tonNode.query = Object;
 
 db.root.dbDescription version:int first_masterchain_block_id:tonNode.blockIdExt flags:int = db.root.DbDescription;
 
-db.root.key.cellDb version:int = db.root.Key; 
-db.root.key.blockDb version:int = db.root.Key; 
+db.root.key.cellDb version:int = db.root.Key;
+db.root.key.blockDb version:int = db.root.Key;
 
 db.root.config celldb_version:int blockdb_version:int = db.root.Config;
 db.root.key.config = db.root.Key;
@@ -524,9 +471,9 @@ db.block.info#4ac6e727 id:tonNode.blockIdExt flags:# prev_left:flags.1?tonNode.b
                                             prev_right:flags.2?tonNode.blockIdExt
                                             next_left:flags.3?tonNode.blockIdExt
                                             next_right:flags.4?tonNode.blockIdExt
-                                            lt:flags.13?long 
+                                            lt:flags.13?long
                                             ts:flags.14?int
-                                            state:flags.17?int256 
+                                            state:flags.17?int256
                                             masterchain_ref_seqno:flags.23?int = db.block.Info;
 db.block.packedInfo id:tonNode.blockIdExt unixtime:int offset:long = db.block.Info;
 db.block.archivedInfo id:tonNode.blockIdExt flags:# next:flags.0?tonNode.blockIdExt = db.block.Info;
@@ -537,12 +484,14 @@ db.blockdb.key.lru id:tonNode.blockIdExt = db.blockdb.Key;
 db.blockdb.key.value id:tonNode.blockIdExt = db.blockdb.Key;
 
 db.candidate source:PublicKey id:tonNode.blockIdExt data:bytes collated_data:bytes = db.Candidate;
-db.candidate.id source:PublicKey id:tonNode.blockIdExt collated_data_file_hash:int256 = db.candidate.Id; 
+db.candidate.id source:PublicKey id:tonNode.blockIdExt collated_data_file_hash:int256 = db.candidate.Id;
 
 db.filedb.key.empty = db.filedb.Key;
-db.filedb.key.blockFile block_id:tonNode.blockIdExt = db.filedb.Key; 
-db.filedb.key.zeroStateFile block_id:tonNode.blockIdExt = db.filedb.Key; 
-db.filedb.key.persistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key; 
+db.filedb.key.blockFile block_id:tonNode.blockIdExt = db.filedb.Key;
+db.filedb.key.zeroStateFile block_id:tonNode.blockIdExt = db.filedb.Key;
+db.filedb.key.persistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key;
+db.filedb.key.splitAccountStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt effective_shard:long = db.filedb.Key;
+db.filedb.key.splitPersistentStateFile block_id:tonNode.blockIdExt masterchain_block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.proof block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.proofLink block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.signatures block_id:tonNode.blockIdExt = db.filedb.Key;
@@ -560,6 +509,8 @@ db.state.asyncSerializer block:tonNode.blockIdExt last:tonNode.blockIdExt last_t
 db.state.hardforks blocks:(vector tonNode.blockIdExt) = db.state.Hardforks;
 db.state.dbVersion version:int = db.state.DbVersion;
 db.state.persistentStateDescriptionShards shard_blocks:(vector tonNode.blockIdExt) = db.state.PersistentStateDescriptionShards;
+db.state.persistentStateDescriptionShard block:tonNode.blockIdExt split_depth:int = db.state.PersistentStateDescriptionShard;
+db.state.persistentStateDescriptionShardsV2 shard_blocks:(vector db.state.PersistentStateDescriptionShard) = db.state.PersistentStateDescriptionShards;
 db.state.persistentStateDescriptionHeader masterchain_id:tonNode.blockIdExt start_time:int end_time:int = db.state.PersistentStateDescriptionHeader;
 db.state.persistentStateDescriptionsList list:(vector db.state.persistentStateDescriptionHeader) = db.state.PersistentStateDescriptionsList;
 
@@ -578,8 +529,8 @@ db.lt.desc.key workchain:int shard:long = db.lt.Key;
 db.lt.shard.key idx:int = db.lt.Key;
 db.lt.status.key = db.lt.Key;
 db.lt.el.value id:tonNode.blockIdExt lt:long ts:int = db.lt.el.Value;
-db.lt.desc.value first_idx:int last_idx:int last_seqno:int last_lt:long last_ts:int = db.lt.desc.Value; 
-db.lt.shard.value workchain:int shard:long = db.lt.shard.Value; 
+db.lt.desc.value first_idx:int last_idx:int last_seqno:int last_lt:long last_ts:int = db.lt.desc.Value;
+db.lt.shard.value workchain:int shard:long = db.lt.shard.Value;
 db.lt.status.value total_shards:int = db.lt.status.Value;
 
 db.files.index.key = db.files.Key;
@@ -587,17 +538,19 @@ db.files.package.key package_id:int key:Bool temp:Bool = db.files.Key;
 
 db.files.index.value packages:(vector int) key_packages:(vector int) temp_packages:(vector int) = db.files.index.Value;
 db.files.package.firstBlock workchain:int shard:long seqno:int unixtime:int lt:long = db.files.package.FirstBlock;
-db.files.package.value package_id:int key:Bool temp:Bool firstblocks:(vector db.files.package.firstBlock) deleted:Bool 
-                   = db.files.package.Value; 
+db.files.package.value package_id:int key:Bool temp:Bool firstblocks:(vector db.files.package.firstBlock) deleted:Bool
+                   = db.files.package.Value;
+
+db.event.blockApplied block_id:tonNode.blockIdExt = db.Event;
+db.event.blockSigned block_id:tonNode.blockIdExt = db.Event;
+db.event.blockCandidateReceived block_id:tonNode.blockIdExt = db.Event;
 
 ---functions---
 
 ---types---
 
-validator.groupMember public_key_hash:int256 adnl:int256 weight:long = engine.validator.GroupMember; 
-validator.group workchain:int shard:long catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group; 
-validator.groupEx workchain:int shard:long vertical_seqno:int catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group; 
-validator.groupNew workchain:int shard:long vertical_seqno:int last_key_block_seqno:int catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group; 
+validator.groupMember public_key_hash:int256 adnl:int256 weight:long = engine.validator.GroupMember;
+validator.groupNew workchain:int shard:long vertical_seqno:int last_key_block_seqno:int catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group;
 
 validator.telemetry flags:# timestamp:double adnl_id:int256
     node_version:string os_version:string node_started_at:int
@@ -631,31 +584,37 @@ liteserver.descV2.sliceSimple shards:(vector tonNode.shardId) = liteserver.descV
 liteserver.descV2.shardInfo shard_id:tonNode.shardId seqno:int utime:int lt:long = liteserver.descV2.ShardInfo;
 liteserver.descV2.sliceTimed shards_from:(vector liteserver.descV2.shardInfo) shards_to:(vector liteserver.descV2.shardInfo) = liteserver.descV2.Slice;
 
-liteserver.desc id:PublicKey ip:int port:int = liteserver.Desc;
-liteserver.descV2 id:PublicKey ip:int port:int slices:(vector liteserver.descV2.Slice) = liteserver.DescV2;
+liteserver.desc id:PublicKey ip:int port:int hostname:string = liteserver.Desc;
+liteserver.descV2 id:PublicKey ip:int port:int hostname:string slices:(vector liteserver.descV2.Slice) = liteserver.DescV2;
 liteclient.config.global liteservers:(vector liteserver.desc) liteservers_v2:(vector liteserver.descV2) validator:validator.config.global = liteclient.config.Global;
 
 engine.adnl id:int256 category:int = engine.Adnl;
 engine.addr ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.Addr;
-engine.addrProxy in_ip:int in_port:int out_ip:int out_port:int 
-          proxy_type:adnl.Proxy categories:(vector int) priority_categories:(vector int) = engine.Addr;
+engine.quicAddr ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.Addr;
 engine.dht id:int256 = engine.Dht;
 engine.validatorTempKey key:int256 expire_at:int = engine.ValidatorTempKey;
 engine.validatorAdnlAddress id:int256 expire_at:int = engine.ValidatorAdnlAddress;
 engine.validator id:int256 temp_keys:(vector engine.validatorTempKey) adnl_addrs:(vector engine.validatorAdnlAddress) election_date:int expire_at:int = engine.Validator;
+engine.collator adnl_id:int256 shard:tonNode.shardId = engine.Collator;
 engine.liteServer id:int256 port:int = engine.LiteServer;
 engine.controlProcess id:int256 permissions:int = engine.ControlProcess;
-engine.controlInterface id:int256 port:int allowed:(vector engine.controlProcess) = engine.ControlInterface; 
+engine.controlInterface id:int256 port:int allowed:(vector engine.controlProcess) = engine.ControlInterface;
 engine.gc ids:(vector int256) = engine.Gc;
 
 engine.dht.config dht:(vector engine.dht) gc:engine.gc = engine.dht.Config;
 engine.validator.fullNodeMaster port:int adnl:int256 = engine.validator.FullNodeMaster;
 engine.validator.fullNodeSlave ip:int port:int adnl:PublicKey = engine.validator.FullNodeSlave;
 engine.validator.fullNodeConfig ext_messages_broadcast_disabled:Bool = engine.validator.FullNodeConfig;
-engine.validator.extraConfig state_serializer_enabled:Bool = engine.validator.ExtraConfig;
+engine.validator.fastSyncMemberCertificate adnl_id:int256 certificate:overlay.MemberCertificate = engine.validator.FastSyncMemberCertificate;
+engine.validator.fastSyncOverlayClient adnl_id:int256 slot:int = engine.validator.FastSyncOverlayClient;
+engine.validator.collatorNodeWhitelist enabled:Bool adnl_ids:(vector int256) = engine.validator.CollatorNodeWhitelist;
+engine.validator.extraConfig state_serializer_enabled:Bool fast_sync_member_certificates:(vector engine.validator.fastSyncMemberCertificate)
+    collator_node_whitelist:engine.validator.collatorNodeWhitelist
+    fast_sync_overlay_clients:(vector engine.validator.fastSyncOverlayClient) = engine.validator.ExtraConfig;
 engine.validator.config out_port:int addrs:(vector engine.Addr) adnl:(vector engine.adnl)
         dht:(vector engine.dht)
-        validators:(vector engine.validator) fullnode:int256 fullnodeslaves:(vector engine.validator.fullNodeSlave)
+        validators:(vector engine.validator) collators:(vector engine.collator)
+        fullnode:int256 fullnodeslaves:(vector engine.validator.fullNodeSlave)
         fullnodemasters:(vector engine.validator.fullNodeMaster)
         fullnodeconfig:engine.validator.fullNodeConfig
         extraconfig:engine.validator.extraConfig
@@ -663,23 +622,27 @@ engine.validator.config out_port:int addrs:(vector engine.Addr) adnl:(vector eng
         shards_to_monitor:(vector tonNode.shardId)
         gc:engine.gc = engine.validator.Config;
 
-engine.validator.customOverlayNode adnl_id:int256 msg_sender:Bool msg_sender_priority:int block_sender:Bool = engine.validator.CustomOverlayNode;
+engine.validator.customOverlayNode adnl_id:int256 msg_sender:Bool msg_sender_priority:int block_sender:Bool accept_queries:Bool = engine.validator.CustomOverlayNode;
 engine.validator.customOverlay name:string nodes:(vector engine.validator.customOverlayNode) sender_shards:(vector tonNode.shardId)
-    = engine.validator.CustomOverlay;
+    skip_public_msg_send:Bool use_quic:Bool send_queries:Bool = engine.validator.CustomOverlay;
 engine.validator.customOverlaysConfig overlays:(vector engine.validator.customOverlay) = engine.validator.CustomOverlaysConfig;
 
 engine.validator.collatorOptions
   deferring_enabled:Bool defer_messages_after:int defer_out_queue_size_limit:long
   dispatch_phase_2_max_total:int dispatch_phase_3_max_total:int
   dispatch_phase_2_max_per_initiator:int dispatch_phase_3_max_per_initiator:int
-  whitelist:(vector string) prioritylist:(vector string) = engine.validator.CollatorOptions;
+  whitelist:(vector string) prioritylist:(vector string)
+  force_full_collated_data:Bool ignore_collated_data_limits:Bool = engine.validator.CollatorOptions;
 
----functions---
----types---
+engine.validator.collatorsList.collator adnl_id:int256 = engine.validator.collatorsList.Collator;
+engine.validator.collatorsList.shard shard_id:tonNode.shardId collators:(vector engine.validator.collatorsList.collator)
+    self_collate:Bool select_mode:string = engine.validator.collatorsList.Shard;
+engine.validator.collatorsList shards:(vector engine.validator.collatorsList.shard) = engine.validator.CollatorsList;
 
-engine.adnlProxy.port in_port:int out_port:int dst_ip:int dst_port:int proxy_type:adnl.Proxy = engine.adnlProxy.Port;
-
-engine.adnlProxy.config ports:(vector engine.adnlProxy.port) = engine.adnlProxy.Config;
+engine.validator.shardBlockVerifierConfig.shard shard_id:(tonNode.shardId) trusted_nodes:(vector int256)
+    required_confirms:int = engine.validator.shardBlockVerifierConfig.Shard;
+engine.validator.shardBlockVerifierConfig shards:(vector engine.validator.shardBlockVerifierConfig.shard)
+    = engine.validator.ShardBlockVerifierConfig;
 
 ---functions---
 
@@ -707,7 +670,7 @@ engine.validator.success = engine.validator.Success;
 
 engine.validator.jsonConfig data:string = engine.validator.JsonConfig;
 
-engine.validator.electionBid election_date:int perm_key:int256 adnl_addr:int256 to_send_payload:bytes = engine.validator.ElectionBid; 
+engine.validator.electionBid election_date:int perm_key:int256 adnl_addr:int256 to_send_payload:bytes = engine.validator.ElectionBid;
 engine.validator.proposalVote perm_key:int256 to_send:bytes = engine.validator.ProposalVote;
 
 engine.validator.dhtServerStatus id:int256 status:int = engine.validator.DhtServerStatus;
@@ -720,9 +683,13 @@ engine.validator.overlayStatsNode adnl_id:int256 ip_addr:string is_neighbour:Boo
     traffic:engine.validator.overlayStatsTraffic traffic_responses:engine.validator.overlayStatsTraffic
     last_ping_at:double last_ping_time:double = engine.validator.OverlayStatsNode;
 
+engine.validator.overlayStatsBroadcasts source:int256 ts_start:double ts_end:double
+    count:long total_size:long total_out_traffic:long = engine.validator.OverlayStatsBroadcasts;
+
 engine.validator.overlayStats overlay_id:int256 overlay_id_full:PublicKey adnl_id:int256 scope:string
     nodes:(vector engine.validator.overlayStatsNode) stats:(vector engine.validator.oneStat)
     total_traffic:engine.validator.overlayStatsTraffic total_traffic_responses:engine.validator.overlayStatsTraffic
+    broadcasts:(vector engine.validator.overlayStatsBroadcasts)
     extra:string = engine.validator.OverlayStats;
 engine.validator.overlaysStats overlays:(vector engine.validator.overlayStats) = engine.validator.OverlaysStats;
 
@@ -730,6 +697,8 @@ engine.validator.shardOverlayStats.neighbour id:string verison_major:int version
     roundtrip:double unreliability:double = engine.validator.shardOverlayStats.Neighbour;
 engine.validator.shardOverlayStats shard:string active:Bool
     neighbours:(vector engine.validator.shardOverlayStats.neighbour) = engine.validator.ShardOverlayStats;
+engine.validator.fastSyncOverlayStats shard:string validators_adnl:(vector int256) root_public_keys:(vector int256)
+    member_certificate:overlay.MemberCertificate receive_broadcasts:Bool = engine.validator.FastSyncOverlayStats;
 
 engine.validator.onePerfTimerStat time:int min:double avg:double max:double = engine.validator.OnePerfTimerStat;
 engine.validator.perfTimerStatsByName name:string stats:(vector engine.validator.OnePerfTimerStat) = engine.validator.PerfTimerStatsByName;
@@ -739,6 +708,11 @@ engine.validator.shardOutQueueSize size:long = engine.validator.ShardOutQueueSiz
 
 engine.validator.exportedPrivateKeys encrypted_data:bytes = engine.validator.ExportedPrivateKeys;
 
+engine.validator.collationManagerStats.shard shard_id:tonNode.shardId self_collate:Bool select_mode:string active:Bool collators:(vector int256) = engine.validator.collationManagerStats.Shard;
+engine.validator.collationManagerStats.collator adnl_id:int256 active:Bool alive:Bool ping_in:double last_ping_ago:double last_ping_status:string banned_for:double = engine.validator.collationManagerStats.Collator;
+engine.validator.collationManagerStats.localId adnl_id:int256 shards:(vector engine.validator.collationManagerStats.shard)
+    collators:(vector engine.validator.collationManagerStats.collator) = engine.validator.collationManagerStats.LocalId;
+engine.validator.collationManagerStats local_ids:(vector engine.validator.collationManagerStats.localId) = engine.validator.CollationManagerStats;
 
 ---functions---
 
@@ -752,7 +726,7 @@ engine.validator.addDhtId key_hash:int256 = engine.validator.Success;
 engine.validator.addValidatorPermanentKey key_hash:int256 election_date:int ttl:int = engine.validator.Success;
 engine.validator.addValidatorTempKey permanent_key_hash:int256 key_hash:int256 ttl:int = engine.validator.Success;
 engine.validator.addValidatorAdnlAddress permanent_key_hash:int256 key_hash:int256 ttl:int = engine.validator.Success;
-engine.validator.changeFullNodeAdnlAddress adnl_id:int256 = engine.validator.Success; 
+engine.validator.changeFullNodeAdnlAddress adnl_id:int256 = engine.validator.Success;
 engine.validator.addLiteserver key_hash:int256 port:int = engine.validator.Success;
 engine.validator.addControlInterface key_hash:int256 port:int = engine.validator.Success;
 engine.validator.addControlProcess key_hash:int256 port:int peer_key:int256 permissions:int = engine.validator.Success;
@@ -764,9 +738,10 @@ engine.validator.delValidatorTempKey permanent_key_hash:int256 key_hash:int256 =
 engine.validator.delValidatorAdnlAddress permanent_key_hash:int256 key_hash:int256 = engine.validator.Success;
 
 engine.validator.addListeningPort ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
-engine.validator.addProxy in_ip:int in_port:int out_ip:int out_port:int proxy:adnl.Proxy categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
 engine.validator.delListeningPort ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
-engine.validator.delProxy out_ip:int out_port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
+
+engine.validator.addQuicAddr ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
+engine.validator.delQuicAddr ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
 
 engine.validator.sign key_hash:int256 data:bytes = engine.validator.Signature;
 engine.validator.exportAllPrivateKeys encryption_key:PublicKey = engine.validator.ExportedPrivateKeys;
@@ -774,11 +749,13 @@ engine.validator.exportAllPrivateKeys encryption_key:PublicKey = engine.validato
 engine.validator.getStats = engine.validator.Stats;
 engine.validator.getConfig = engine.validator.JsonConfig;
 
-engine.validator.setVerbosity verbosity:int = engine.validator.Success; 
+engine.validator.setVerbosity verbosity:int = engine.validator.Success;
+engine.validator.setLogCategoryVerbosity name:string verbosity:int = engine.validator.Success;
+engine.validator.getLogCategories = engine.validator.TextStats;
 
 engine.validator.createElectionBid election_date:int election_addr:string wallet:string = engine.validator.ElectionBid;
-engine.validator.createProposalVote vote:bytes = engine.validator.ProposalVote; 
-engine.validator.createComplaintVote election_id:int vote:bytes = engine.validator.ProposalVote; 
+engine.validator.createProposalVote vote:bytes = engine.validator.ProposalVote;
+engine.validator.createComplaintVote election_id:int vote:bytes = engine.validator.ProposalVote;
 
 engine.validator.checkDhtServers id:int256 = engine.validator.DhtServersStatus;
 
@@ -808,6 +785,29 @@ engine.validator.getActorTextStats = engine.validator.TextStats;
 
 engine.validator.addShard shard:tonNode.shardId = engine.validator.Success;
 engine.validator.delShard shard:tonNode.shardId = engine.validator.Success;
+
+engine.validator.addCollator adnl_id:int256 shard:tonNode.shardId = engine.validator.Success;
+engine.validator.delCollator adnl_id:int256 shard:tonNode.shardId = engine.validator.Success;
+
+engine.validator.collatorNodeSetWhitelistedValidator adnl_id:int256 add:Bool = engine.validator.Success;
+engine.validator.collatorNodeSetWhitelistEnabled enabled:Bool = engine.validator.Success;
+engine.validator.showCollatorNodeWhitelist = engine.validator.CollatorNodeWhitelist;
+
+engine.validator.setCollatorsList list:engine.validator.collatorsList = engine.validator.Success;
+engine.validator.clearCollatorsList = engine.validator.Success;
+engine.validator.showCollatorsList = engine.validator.CollatorsList;
+engine.validator.getCollationManagerStats = engine.validator.CollationManagerStats;
+
+engine.validator.signOverlayMemberCertificate sign_by:int256 adnl_id:int256 slot:int expire_at:int = overlay.MemberCertificate;
+engine.validator.importFastSyncMemberCertificate adnl_id:int256 certificate:overlay.MemberCertificate = engine.validator.Success;
+engine.validator.addFastSyncClient adnl_id:int256 slot:int = engine.validator.Success;
+engine.validator.delFastSyncClient adnl_id:int256 = engine.validator.Success;
+
+engine.validator.setShardBlockVerifierConfig config:engine.validator.shardBlockVerifierConfig = engine.validator.Success;
+engine.validator.showShardBlockVerifierConfig = engine.validator.ShardBlockVerifierConfig;
+
+engine.validator.waitForLiteServer = engine.validator.Success;
+engine.validator.waitForInitialSync = engine.validator.Success;
 
 ---types---
 
@@ -855,38 +855,98 @@ http.server.config dhs:(vector http.server.dnsEntry) local_hosts:(vector http.se
 
 ---types---
 
-validatorSession.collationStats bytes:int gas:int lt_delta:int cat_bytes:int cat_gas:int cat_lt_delta:int
-  limits_log:string ext_msgs_total:int ext_msgs_filtered:int ext_msgs_accepted:int ext_msgs_rejected:int = validadorSession.CollationStats;
+validatorStats.stats.producer flags:#
+  validator_id:int256 block_status:int
+  candidate_id:flags.0?int256 block_id:flags.0?tonNode.blockIdExt collated_data_hash:flags.0?int256
+  is_accepted:flags.0?Bool is_ours:flags.0?Bool
+  got_block_at:flags.0?double got_block_by:flags.0?int got_submit_at:flags.0?double gen_utime:flags.0?int comment:flags.0?string
+  collation_time:flags.1?double collated_at:flags.1?double collation_cached:flags.1?Bool self_collated:flags.1?Bool collator_node_id:flags.2?int256
+  validation_time:flags.3?double validated_at:flags.3?double validation_cached:flags.3?Bool
+  approved_weight:flags.0?long approved_33pct_at:flags.0?double approved_66pct_at:flags.0?double approvers:flags.0?string
+  signed_weight:flags.0?long signed_33pct_at:flags.0?double signed_66pct_at:flags.0?double signers:flags.0?string
+  serialize_time:flags.4?double deserialize_time:flags.4?double serialized_size:flags.4?int = validatorStats.stats.Producer;
 
-validatorSession.statsProducer id:int256 candidate_id:int256 block_status:int root_hash:int256 file_hash:int256
-  comment:string block_timestamp:double is_accepted:Bool is_ours:Bool got_submit_at:double
-  collation_time:double collated_at:double collation_cached:Bool
-  collation_work_time:double collation_cpu_work_time:double
-  collation_stats:validatorSession.collationStats
-  validation_time:double validated_at:double validation_cached:Bool
-  validation_work_time:double validation_cpu_work_time:double
-  gen_utime:double
-  approved_weight:long approved_33pct_at:double approved_66pct_at:double approvers:string
-  signed_weight:long signed_33pct_at:double signed_66pct_at:double signers:string
-  serialize_time:double deserialize_time:double serialized_size:int = validatorSession.StatsProducer;
+validatorStats.stats.round started_at:double producers:(vector validatorStats.stats.producer) = validatorStats.stats.Round;
 
-validatorSession.statsRound timestamp:double producers:(vector validatorSession.statsProducer) = validatorSession.StatsRound;
+validatorStats.stats flags:#
+    session_id:int256 self:int256 block_id:tonNode.blockIdExt cc_seqno:int success:Bool timestamp:double
+    creator:flags.0?int256
+    total_validators:int total_weight:long
+    signatures:flags.0?int signatures_weight:flags.0?long
+    approve_signatures:flags.0?int approve_signatures_weight:flags.0?long
+    first_round:int rounds:(vector validatorStats.stats.round) = validatorStats.Stats;
 
-validatorSession.stats success:Bool id:tonNode.blockIdExt timestamp:double self:int256 session_id:int256 cc_seqno:int
-    creator:int256 total_validators:int total_weight:long
-    signatures:int signatures_weight:long approve_signatures:int approve_signatures_weight:long
-    first_round:int rounds:(vector validatorSession.statsRound) = validatorSession.Stats;
+validatorStats.blockLimitsStatus
+    bytes:int gas:int lt_delta:int collated_data_bytes:int
+    cat_bytes:int cat_gas:int cat_lt_delta:int cat_collated_data_bytes:int
+    load_fraction_queue_cleanup:double load_fraction_dispatch:double
+    load_fraction_internals:double load_fraction_externals:double
+    load_fraction_new_msgs:double
+    limits_log:string = validatorStats.BlockLimitsStatus;
+validatorStats.blockStats.extMsgsStats
+    ext_msgs_total:int ext_msgs_filtered:int ext_msgs_accepted:int ext_msgs_rejected:int = validatorStats.ExtMsgsStats;
+validatorStats.blockStats.neighborStats shard:tonNode.shardId is_trivial:Bool is_local:Bool msg_limit:int
+    processed_msgs:int skipped_msgs:int limit_reached:Bool = validatorStats.blockStats.NeighborStats;
+validatorStats.blockStats
+    ext_msgs:validatorStats.blockStats.extMsgsStats transactions:int shard_configuration:(vector tonNode.blockIdExt)
+    old_out_msg_queue_size:long new_out_msg_queue_size:long msg_queue_cleaned:int
+    neighbors:(vector validatorStats.blockStats.neighborStats)
+    mc_block_id:tonNode.blockIdExt = validatorStats.BlockStats;
+validatorStats.storageStatCacheStats
+    small_cnt:long small_cells:long hit_cnt:long hit_cells:long miss_cnt:long miss_cells:long = validatorStats.StorageStatCacheStats;
 
-validatorSession.newValidatorGroupStats.node id:int256 weight:long = validatorSession.newValidatorGroupStats.Node;
-validatorSession.newValidatorGroupStats session_id:int256 workchain:int shard:long cc_seqno:int
-    last_key_block_seqno:int timestamp:double
-    self_idx:int nodes:(vector validatorSession.newValidatorGroupStats.node) = validatorSession.NewValidatorGroupStats;
+validatorStats.collatedBlock
+    block_id:tonNode.blockIdExt collated_data_hash:int256 cc_seqno:int collated_at:double
+    bytes:int collated_data_bytes:int attempt:int
+    self:int256 is_validator:Bool
+    total_time:double work_time:double cpu_work_time:double time_stats:string
+    work_time_real_stats:string
+    work_time_cpu_stats:string
+    wait_externals_time:double check_load_do_collate_time:double check_load_total_time:double
+    block_limits:validatorStats.blockLimitsStatus
+    block_stats:validatorStats.blockStats
+    storage_stat_cache:validatorStats.storageStatCacheStats = validatorSession.stats.CollatedBlock;
 
-validatorSession.endValidatorGroupStats.node id:int256 catchain_blocks:int = validatorSession.endValidatorGroupStats.Node;
-validatorSession.endValidatorGroupStats session_id:int256 timestamp:double
-    nodes:(vector validatorSession.endValidatorGroupStats.node) = validatorSession.EndValidatorGroupStats;
+validatorStats.validatedBlock
+    block_id:tonNode.blockIdExt collated_data_hash:int256 validated_at:double
+    self:int256
+    valid:Bool comment:string
+    bytes:int collated_data_bytes:int
+    total_time:double work_time:double actual_time:double cpu_work_time:double time_stats:string
+    work_time_real_stats:string
+    work_time_cpu_stats:string
+    storage_stat_cache:validatorStats.storageStatCacheStats
+    parallel_accounts_validation:Bool = validatorStats.ValidatedBlock;
+
+validatorStats.newValidatorGroup.node id:int256 pubkey:PublicKey adnl_id:int256 weight:long = validatorStats.newValidatorGroup.Node;
+validatorStats.newValidatorGroup session_id:int256 shard:tonNode.shardId cc_seqno:int
+    last_key_block_seqno:int started_at:double prev:(vector tonNode.blockIdExt)
+    self_idx:int self:int256 nodes:(vector validatorStats.newValidatorGroup.node) = validatorStats.NewValidatorGroup;
+
+validatorStats.endValidatorGroup.node id:int256 catchain_blocks:int = validatorStats.endValidatorGroup.Node;
+validatorStats.endValidatorGroup session_id:int256 timestamp:double self:int256
+    nodes:(vector validatorStats.endValidatorGroup.node) = validatorStats.EndValidatorGroup;
+
+validatorStats.collatorNodeResponse self:int256 validator_id:int256 timestamp:double
+    block_id:tonNode.blockIdExt original_block_id:tonNode.blockIdExt collated_data_hash:int256
+    = validatorStats.CollatorNodeResponse;
+
+collatorNode.candidate source:PublicKey id:tonNode.blockIdExt data:bytes collated_data:bytes = collatorNode.Candidate;
+collatorNode.compressedCandidate flags:# source:PublicKey id:tonNode.blockIdExt decompressed_size:int data:bytes = collatorNode.Candidate;
+collatorNode.compressedCandidateV2 flags:# source:PublicKey id:tonNode.blockIdExt data:bytes = collatorNode.Candidate;
+collatorNode.pong#5bbf0521 flags:# version:flags.0?int = collatorNode.Pong;
+collatorNode.error code:int message:string = collatorNode.Error;
+
+shardBlockVerifier.subscribed flags:# = shardBlockVerifier.Subscribed;
+shardBlockVerifier.confirmBlocks blocks:(vector tonNode.blockIdExt) = shardBlockVerifier.ConfirmBlocks;
 
 ---functions---
+collatorNode.generateBlock shard:tonNode.shardId cc_seqno:int prev_blocks:(vector tonNode.blockIdExt)
+    creator:int256 round:int first_block_round:int priority:int = collatorNode.Candidate;
+collatorNode.requestBlockCallback flags:# block_id:tonNode.BlockIdExt = collatorNode.Candidate;
+collatorNode.ping flags:# = collatorNode.Pong;
+
+shardBlockVerifier.subscribe shard:tonNode.shardId flags:# = shardBlockVerifier.Subscribed;
 
 ---types---
 
@@ -1026,3 +1086,113 @@ storage.daemon.removeStorageProvider = storage.daemon.Success;
 
 ---types---
 proxyLiteserver.config port:int id:PublicKey = proxyLiteserver.Config;
+---functions---
+
+---types---
+quic.message data:bytes = quic.Request;
+quic.query data:bytes = quic.Request;
+quic.answer data:bytes = quic.Response;
+
+engineConsoleClient.config address:string server_public_key:PublicKey client_private_key:PrivateKey = engineConsoleClient.Config;
+
+consensus.overlayId session_id:int256 nodes:(vector int256) = consensus.OverlayId;
+consensus.blockSyncOverlayId session_id:int256 = consensus.BlockOverlayId;
+consensus.dbId session_id:int256 is_validator:Bool validator_key:int256 adnl_id:int256 = consensus.DbId;
+consensus.dataToSign session_id:int256 data:bytes = consensus.DataToSign;
+
+consensus.candidateId slot:int hash:int256 = consensus.CandidateId;
+consensus.candidateParent id:consensus.CandidateId = consensus.CandidateParent;
+consensus.candidateWithoutParents = consensus.CandidateParent;
+
+consensus.candidateHashDataOrdinary block:tonNode.blockIdExt collated_file_hash:int256 parent:consensus.CandidateParent = consensus.CandidateHashData;
+consensus.candidateHashDataEmpty block:tonNode.blockIdExt parent:consensus.candidateId = consensus.CandidateHashData;
+
+consensus.block slot:int parent:consensus.CandidateParent candidate:bytes signature:bytes = consensus.CandidateData;
+consensus.empty slot:int parent:consensus.CandidateId block:tonNode.blockIdExt signature:bytes = consensus.CandidateData;
+
+consensus.broadcastExtra slot:int = consensus.BroadcastExtra;
+
+consensus.requestError = consensus.RequestError;
+
+consensus.simplex.notarizeVote id:consensus.CandidateId = consensus.simplex.UnsignedVote;
+consensus.simplex.finalizeVote id:consensus.CandidateId = consensus.simplex.UnsignedVote;
+consensus.simplex.skipVote slot:int = consensus.simplex.UnsignedVote;
+consensus.simplex.vote vote:consensus.simplex.UnsignedVote signature:bytes = consensus.simplex.Vote;
+
+consensus.simplex.voteSignature who:int signature:bytes = consensus.simplex.VoteSignature;
+consensus.simplex.voteSignatureSet votes:(vector consensus.simplex.VoteSignature) = consensus.simplex.VoteSignatureSet;
+consensus.simplex.certificate vote:consensus.simplex.UnsignedVote signatures:consensus.simplex.VoteSignatureSet = consensus.simplex.Certificate;
+
+consensus.simplex.candidateAndCert candidate:bytes notar:bytes = consensus.simplex.CandidateAndCert;
+
+consensus.simplex.db.key.vote vote_hash:int256 = consensus.simplex.db.key.Vote;
+consensus.simplex.db.ourVote vote:consensus.simplex.UnsignedVote seqno:long = consensus.simplex.db.Vote;
+consensus.simplex.db.cert cert:consensus.simplex.Certificate = consensus.simplex.db.Vote;
+
+consensus.simplex.db.key.poolState = consensus.simplex.db.key.PoolState;
+consensus.simplex.db.poolState first_nonannounced_window:int = consensus.simplex.db.PoolState;
+
+consensus.simplex.db.key.finalizedBlock candidateId:consensus.candidateId = consensus.simplex.db.key.FinalizedBlock;
+consensus.simplex.db.finalizedBlock block_id:tonNode.blockIdExt parent:consensus.CandidateParent is_final:Bool = consensus.simplex.db.FinalizedBlock;
+
+consensus.simplex.db.key.candidate candidateId:consensus.candidateId = consensus.simplex.db.key.Candidate;
+
+consensus.simplex.db.key.candidateResolver.candidateInfo candidateId:consensus.candidateId = consensus.simplex.db.key.candidateResolver.CandidateInfo;
+consensus.simplex.db.candidateResolver.candidateInfo leader_id:int candidate_hash_data:consensus.CandidateHashData signature:bytes = consensus.simplex.db.candidateResolver.CandidateInfo;
+consensus.simplex.db.key.candidateResolver.notarCert candidateId:consensus.candidateId = consensus.simplex.db.key.candidateResolver.NotarCert;
+consensus.simplex.db.candidateResolver.notarCert notar:consensus.simplex.voteSignatureSet = consensus.simplex.db.candidateResolver.NotarCert;
+
+consensus.stats.block id:tonNode.blockIdExt = consensus.stats.CandidateBlock;
+consensus.stats.empty = consensus.stats.CandidateBlock;
+
+consensus.stats.id workchain:int shard:long cc_seqno:int idx:int total_validators:int weight:long total_weight:long slots_per_leader_window:int = consensus.stats.Event;
+consensus.stats.collateStarted target_slot:int = consensus.stats.Event;
+consensus.stats.collateFinished target_slot:int id:consensus.candidateId = consensus.stats.Event;
+consensus.stats.collatedEmpty id:consensus.candidateId = consensus.stats.Event;
+consensus.stats.candidateReceived id:consensus.candidateId parent:consensus.CandidateParent block:consensus.stats.CandidateBlock is_collator:Bool = consensus.stats.Event;
+consensus.stats.validationStarted id:consensus.candidateId = consensus.stats.Event;
+consensus.stats.validationFinished id:consensus.candidateId = consensus.stats.Event;
+consensus.stats.blockAccepted id:consensus.candidateId = consensus.stats.Event;
+consensus.stats.timestampedEvent ts:double event:consensus.stats.Event = consensus.stats.TimestampedEvent;
+consensus.stats.events id:int256 events:(vector consensus.stats.timestampedEvent) = consensus.stats.Events;
+
+consensus.simplex.stats.voted vote:consensus.simplex.UnsignedVote = consensus.stats.Event;
+consensus.simplex.stats.certObserved vote:consensus.simplex.UnsignedVote = consensus.stats.Event;
+
+consensus.simplex.noncriticalParams
+    flags:#
+    target_rate_ms:flags.0?int
+    first_block_timeout_ms:flags.1?int
+    first_block_timeout_multiplier:flags.2?double
+    first_block_timeout_cap_ms:flags.3?int
+    candidate_resolve_timeout_ms:flags.4?int
+    candidate_resolve_timeout_multiplier:flags.5?double
+    candidate_resolve_timeout_cap_ms:flags.6?int
+    candidate_resolve_cooldown_ms:flags.7?int
+    standstill_timeout_ms:flags.8?int
+    standstill_max_egress_bytes_per_s:flags.9?int
+    max_leader_window_desync:flags.10?int
+    bad_signature_ban_duration_ms:flags.11?int
+    candidate_resolve_rate_limit:flags.12?int
+    min_block_interval_ms:flags.13?int
+    no_empty_blocks_on_error_timeout_ms:flags.14?int
+    certificate_gossip_neighbors:flags.15?int
+    = consensus.NoncriticalParams;
+
+consensus.noncriticalParamsOverride
+    workchain:int
+    shard:long
+    from_seqno:int
+    to_seqno:int
+    override:consensus.NoncriticalParams
+    = consensus.NoncriticalParamsOverride;
+
+consensus.noncriticalParamsOverrideList
+    overrides:(vector consensus.noncriticalParamsOverride)
+    = consensus.NoncriticalParamsOverrideList;
+
+---functions---
+consensus.simplex.requestCandidate id:consensus.CandidateId want_candidate:Bool want_notar:Bool = consensus.simplex.CandidateAndCert;
+
+engine.validator.setConsensusNoncriticalParamsOverrides overrides:consensus.noncriticalParamsOverrideList = engine.validator.Success;
+engine.validator.getConsensusNoncriticalParamsOverrides = consensus.NoncriticalParamsOverrideList;

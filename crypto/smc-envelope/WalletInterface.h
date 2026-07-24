@@ -18,17 +18,17 @@
 */
 #pragma once
 
-#include "td/utils/common.h"
-#include "Ed25519.h"
-#include "block/block.h"
+#include <algorithm>
+
 #include "block/block-parse.h"
+#include "block/block.h"
+#include "td/utils/common.h"
 #include "vm/cells/CellString.h"
 
+#include "Ed25519.h"
+#include "GenericAccount.h"
 #include "SmartContract.h"
 #include "SmartContractCode.h"
-#include "GenericAccount.h"
-
-#include <algorithm>
 
 namespace ton {
 class WalletInterface : public SmartContract {
@@ -74,10 +74,11 @@ class WalletInterface : public SmartContract {
   td::Result<td::Ref<vm::Cell>> get_init_message(const td::Ed25519::PrivateKey &private_key,
                                                  td::uint32 valid_until = std::numeric_limits<td::uint32>::max()) const;
 
+  static td::Result<td::Ref<vm::Cell>> try_create_int_message(const Gift &gift);
   static td::Ref<vm::Cell> create_int_message(const Gift &gift);
 
  private:
-  static void store_gift_message(vm::CellBuilder &cb, const Gift &gift);
+  static td::Status store_gift_message(vm::CellBuilder &cb, const Gift &gift);
 };
 
 template <class WalletT, class TraitsT>

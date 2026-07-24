@@ -17,8 +17,9 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include "vm/cells.h"
 #include "block/block.h"
+#include "vm/cells.h"
+
 #include "Ed25519.h"
 #include "SmartContract.h"
 
@@ -35,8 +36,8 @@ class GenericAccount {
   }
   static block::StdAddress get_address(ton::WorkchainId workchain_id, const td::Ref<vm::Cell>& init_state) noexcept;
   static td::Ref<vm::Cell> create_ext_message(const block::StdAddress& address, td::Ref<vm::Cell> new_state,
-                                              td::Ref<vm::Cell> body) noexcept;
-  static void store_int_message(vm::CellBuilder& cb, const block::StdAddress& dest_address, td::int64 gramms,
+                                              td::Ref<vm::Cell> body);
+  static bool store_int_message(vm::CellBuilder& cb, const block::StdAddress& dest_address, td::int64 gramms,
                                 td::Ref<vm::Cell> extra_currencies);
 
   static td::Result<td::Ed25519::PublicKey> get_public_key(const SmartContract& sc);

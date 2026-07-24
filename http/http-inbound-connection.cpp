@@ -16,8 +16,9 @@
 
     Copyright 2019-2020 Telegram Systems LLP
 */
-#include "http-inbound-connection.h"
 #include "td/utils/misc.h"
+
+#include "http-inbound-connection.h"
 
 namespace ton {
 
@@ -104,7 +105,6 @@ td::Status HttpInboundConnection::receive(td::ChainBufferReader &input) {
 void HttpInboundConnection::send_answer(std::unique_ptr<HttpResponse> response, std::shared_ptr<HttpPayload> payload) {
   CHECK(payload);
   response->store_http(buffered_fd_.output_buffer());
-
   write_payload(std::move(payload));
   loop();
 }

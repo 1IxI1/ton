@@ -15,13 +15,12 @@
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 Copyright 2017-2020 Telegram Systems LLP
 */
-#include "TestWallet.h"
-#include "GenericAccount.h"
-
-#include "SmartContractCode.h"
-
-#include "vm/boc.h"
 #include "td/utils/base64.h"
+#include "vm/boc.h"
+
+#include "GenericAccount.h"
+#include "SmartContractCode.h"
+#include "TestWallet.h"
 
 namespace ton {
 td::Ref<vm::Cell> TestWallet::get_init_state(const td::Ed25519::PublicKey& public_key, td::int32 revision) noexcept {
@@ -32,14 +31,19 @@ td::Ref<vm::Cell> TestWallet::get_init_state(const td::Ed25519::PublicKey& publi
 
 td::Ref<vm::Cell> TestWallet::get_init_message_new(const td::Ed25519::PrivateKey& private_key) noexcept {
   std::string seq_no(4, 0);
-  auto signature =
-      private_key.sign(vm::CellBuilder().store_bytes(seq_no).finalize()->get_hash().as_slice()).move_as_ok();
+  auto r_signature = private_key.sign(vm::CellBuilder().store_bytes(seq_no).finalize()->get_hash().as_slice());
+  if (r_signature.is_error()) {
+    return {};
+  }
+  auto signature = r_signature.move_as_ok();
   return vm::CellBuilder().store_bytes(signature).store_bytes(seq_no).finalize();
 }
 
 td::Ref<vm::Cell> TestWallet::make_a_gift_message_static(const td::Ed25519::PrivateKey& private_key, td::uint32 seqno,
                                                          td::Span<Gift> gifts) noexcept {
-  CHECK(gifts.size() <= max_gifts_size);
+  if (gifts.size() > max_gifts_size) {
+    return {};
+  }
 
   vm::CellBuilder cb;
   cb.store_long(seqno, 32);
@@ -49,10 +53,18 @@ td::Ref<vm::Cell> TestWallet::make_a_gift_message_static(const td::Ed25519::Priv
     if (gift.gramms == -1) {
       send_mode += 128;
     }
-    cb.store_long(send_mode, 8).store_ref(create_int_message(gift));
+    auto message = create_int_message(gift);
+    if (message.is_null()) {
+      return {};
+    }
+    cb.store_long(send_mode, 8).store_ref(std::move(message));
   }
   auto message_outer = cb.finalize();
-  auto signature = private_key.sign(message_outer->get_hash().as_slice()).move_as_ok();
+  auto r_signature = private_key.sign(message_outer->get_hash().as_slice());
+  if (r_signature.is_error()) {
+    return {};
+  }
+  auto signature = r_signature.move_as_ok();
   return vm::CellBuilder().store_bytes(signature).append_cellslice(vm::load_cell_slice(message_outer)).finalize();
 }
 

@@ -1,12 +1,18 @@
 fun extractFromTypedTuple(params: [int]) {
-    var [payload: int] = params;
+    var [payload: int, ] = params;
     return payload + 10;
+}
+
+fun int.increment(mutate self): self {
+    self += 1;
+    return self;
 }
 
 @method_id(101)
 fun test101(x: int) {
     var params = [x, ];
-    return extractFromTypedTuple(params);
+    __expect_type(params, "array<int>");
+    return extractFromTypedTuple(params as unknown as [int]);
 }
 
 fun autoInferIntNull(x: int) {
@@ -20,8 +26,8 @@ fun typesAsIdentifiers(builder: builder) {
     var slice = cell.beginParse();
     {
         var cell: cell = cell;
-        var tuple: tuple = createEmptyTuple();
-        var bool: bool = tuple.tupleAt<int>(0) > 0;
+        var tuple: array<int> = createEmptyTuple() as array<int>;
+        var bool: bool = tuple.get(0) > 0;
     }
     return int;
 }
@@ -29,90 +35,38 @@ fun typesAsIdentifiers(builder: builder) {
 global callOrder: tuple;
 
 fun getTensor_12() {
-    callOrder.tuplePush(100);
+    callOrder.push(100);
     return (1, 2);
 }
 fun getTensor_1X(x: int) {
-    callOrder.tuplePush(101);
+    callOrder.push(101);
     return (1, x);
 }
-fun getTuple_12() {
-    callOrder.tuplePush(110);
+fun getTuple_12(): [int, int] {
+    callOrder.push(110);
     return [1, 2, ];
 }
-fun getTuple_1X(x: int) {
-    callOrder.tuplePush(111);
+fun getTuple_1X(x: int): [int, int] {
+    callOrder.push(111);
     return [1, x];
 }
 fun getUntypedTuple_12() {
-    callOrder.tuplePush(120);
-    var t = createEmptyTuple(); t.tuplePush(1); t.tuplePush(2);
+    callOrder.push(120);
+    var t = createEmptyTuple(); t.push(1); t.push(2);
     return t;
 }
 fun getUntypedTuple_1X(x: int) {
-    callOrder.tuplePush(121);
-    var t = createEmptyTuple(); t.tuplePush(1); t.tuplePush(x);
+    callOrder.push(121);
+    var t = createEmptyTuple(); t.push(1); t.push(x);
     return t;
 }
 fun getIntValue5() {
-    callOrder.tuplePush(10);
+    callOrder.push(10);
     return 5;
 }
 fun getIntValueX(x: int) {
-    callOrder.tuplePush(11);
+    callOrder.push(11);
     return x;
-}
-
-@method_id(102)
-fun test102() {
-    callOrder = createEmptyTuple();
-    var x = 0;
-    getTensor_12().0 = getIntValue5();
-    getTensor_1X(5).1 = getIntValue5();
-    getTensor_1X(x = 10).0 = getIntValueX(x);
-    return (callOrder, x);
-}
-
-@method_id(103)
-fun test103() {
-    callOrder = createEmptyTuple();
-    var x = 0;
-    getTuple_12().0 = getIntValue5();
-    getTuple_1X(5).1 = getIntValue5();
-    getTuple_1X(x = 10).0 = getIntValueX(x);
-    return (callOrder, x);
-}
-
-@method_id(104)
-fun test104() {
-    callOrder = createEmptyTuple();
-    var x = 0;
-    getUntypedTuple_12().0 = getIntValue5();
-    getUntypedTuple_1X(5).1 = getIntValue5();
-    getUntypedTuple_1X(x = 10).0 = getIntValueX(x);
-    return (callOrder, x);
-}
-
-@method_id(105)
-fun test105() {
-    callOrder = createEmptyTuple();
-    getTensor_12().0 = getTensor_1X(getIntValue5()).1 = getIntValueX(getTensor_12().1);
-    return callOrder;
-}
-
-@method_id(106)
-fun test106() {
-    callOrder = createEmptyTuple();
-    getTuple_12().0 = getTuple_1X(getIntValue5()).1 = getIntValueX(getTuple_12().1);
-    return callOrder;
-}
-
-global t107: (int, int);
-
-@method_id(107)
-fun test107() {
-    ((t107 = (1, 2)).0, (t107 = (3, 4)).1) = (5, 6);
-    return t107;
 }
 
 global g108: int;
@@ -121,55 +75,20 @@ fun assertEq(a: int, b: int) {
     return b;
 }
 
-@method_id(108)
-fun test108() {
-    callOrder = createEmptyTuple();
-    g108 = 0;
-    getTensor_1X(g108 = 8).1 = assertEq(g108, 8);
-    return (callOrder, g108);
-}
-
-@method_id(109)
-fun test109() {
-    callOrder = createEmptyTuple();
-    var x = 0;
-    [getTuple_12().0, getTuple_1X(x = getIntValue5()).1, getTuple_1X(x += 10).0] = [getIntValue5(), getIntValue5(), getIntValueX(x), ];
-    return (callOrder, x);
-}
-
 global g110: int;
 global t110: (int, int);
 
-@method_id(110)
-fun test110() {
-    callOrder = createEmptyTuple();
-    var xy = [0, 0];
-    [xy.0, getTuple_1X(g110 = 8).0] = [g110 += 5, getIntValueX(g110 += 10)];
-    [xy.1, getTuple_1X((t110 = (8, 9)).0).1] = [t110.0 += 5, getIntValueX(t110.1 += 10)];
-    return (xy, callOrder, g110, t110);
-}
-
-@method_id(111)
-fun test111() {
-    callOrder = createEmptyTuple();
-    var z = -1;
-    var xy = [0, z = 0];
-    var rhs = [getIntValueX(xy.1 += 10), xy.1, xy.0, z += 50];
-    [xy.0, getTuple_1X(g110 = 8 + getIntValueX(xy.1)).0, xy.1, z] = rhs;
-    return (xy, g110, callOrder, z);
-}
-
 @method_id(112)
 fun test112() {
-    var xy = [1, 2];
+    var xy = [1, 2] as [coins, coins];
     ((((xy))).0, ((xy.1))) = ((xy).1, ((xy.0)));
     return xy;
 }
 
 @method_id(113)
 fun test113() {
-    var (a, t, z) = (1, [2,3], (-1,-1));
-    (a, t, a, z, t.1, z.1) = (10, [a,12], 13, (a, t.1), 14, t.1);
+    var (a, t, z, ) = (1, [2,3] as [uint8, uint16], (-1,-1));
+    (a, t.0, z.0, t.1, z.1) = (13, a += 1, a, 14, t.1);
     return (a, t, z);
 }
 
@@ -181,23 +100,14 @@ global z114: (int, int);
 fun test114() {
     g114 = 1;
     t114 = [2, 3];
-    (g114, t114, g114, z114, t114.1, z114.1) = (10, [g114,12], 13, (g114, t114.1), 14, t114.1);
+    (g114, t114.0, t114.1, z114) = (13, g114 += 1, 14, (g114, t114.1));
     return (g114, t114, z114);
-}
-
-@method_id(115)
-fun test115() {
-    callOrder = createEmptyTuple();
-    var x = 0;
-    var y = 0;
-    [getTensor_1X(x = 5).0, y] = getTuple_1X(x = 9);
-    return (callOrder, x, y);
 }
 
 @method_id(116)
 fun test116() {
     var (a,b,c,d) = (0,0,0,0);
-    var rhs = [1, 2, 3, 4];
+    var rhs = [1, 2, 3, 4] as [int,int,int,int];
     var rhs2 = ([a,b,c,d] = rhs);
     __expect_type(rhs2, "[int, int, int, int]");
     return (a, b, c, d, rhs2);
@@ -206,16 +116,161 @@ fun test116() {
 @method_id(117)
 fun test117() {
     var c = [((1, ), ), ];
-    __expect_type(c, "[int]");
-    c.0 = 10;
-    c.0 = (20, );
+    __expect_type(c, "array<int>");
+    c.set(10, 0);
+    c.set((20, ), 0);
     return c;
 }
 
+struct Storage {
+    owner: slice;
+}
 
+@method_id(118)
+fun test118(x: int) {
+    var i1: int;
+    if (10 > 3) {
+        i1 = 10;
+    } else { { (_, i1) = (5, 20); } }
+
+    var i2: int10;
+    match (x) {
+        1 => i2 = 1,
+        2 => i2 = 2,
+        3 => i2 = 3,
+        else => i2 = 4,
+    }
+
+    var st: Storage?;
+    if (x > 100) {
+        throw 123;
+    } else {
+        if (x < -100) { throw 456; }
+        else { st = { owner: "".beginParse() }}
+    }
+
+    var i3: (int, int) | builder;
+    match (i1) {
+        int => i3 = (1, 2),
+    }
+
+    var unused: int8;
+
+    return (i1, i2, st.owner.remainingBitsCount(), i3.0);
+}
+
+@method_id(119)
+fun test119(a: int, b: int) {
+    var t: [unknown, unknown] = [a + 1, b * 2];
+    __expect_type(t.1, "unknown");
+    val l = (t as unknown as tuple).size();
+    val [c,d:int] = [t.0 as int, t.1 as int];
+    return (l, c, d);
+}
+
+struct Point {
+    x: int
+    y: int
+}
+
+struct ROLine {
+    readonly from: Point
+    readonly to: Point
+}
+
+fun eq<T>(v: T) { return v }
+
+global i122: int;
+global ab122: (int, int);
+
+@method_id(122)
+fun test122() {
+    (i122, ab122) = (0, (0,0));
+    ab122.0 = 10;
+    return (i122, ab122);
+}
+
+@method_id(123)
+fun test123() {
+    var a = 0;
+    a = a = a = 10;
+    a = a.increment();
+    a = a.increment().increment();
+    return a;
+}
+
+// now globals can have more than 15 items (they are tupled)
+global g124: (int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int);
+
+@method_id(124)
+fun test124() {
+    g124 = (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18);
+    var (a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15,a16,a17,a18) = g124;
+    return (a1, a18);
+}
+
+@method_id(125)
+fun test125() {
+    var (a, [b, c]) = (10, [20, 30]);
+    return (a, b, c);
+}
+
+struct Small126 {
+    x: int
+}
+
+struct Large126 {
+    x: int
+    y: int
+}
+
+fun makeUnion126(useSmall: int): Small126 | Large126 {
+    return useSmall != 0 ? Small126 { x: 1 } : Large126 { x: 2, y: 3 };
+}
+
+@method_id(126)
+fun test126(useSmall: int) {
+    var u = makeUnion126(useSmall);
+    var other = 7;
+    if (u is Small126) {
+        (u, other) = (Small126 { x: 9 }, other);
+    }
+    return match (u) {
+        Small126 => (1, u.x, other, 0),
+        Large126 => (2, u.x, other, u.y),
+    };
+}
+
+@method_id(127)
+fun test127() {
+    val sh: [int, [int, [int, int]]] = [10, [20, [30, 40]]];
+    var [a, [b, [c, d]]] = sh;
+    var [e, (f, [g, h])] = [50, (60, [70, 80])];
+    return (a, b, c, d, e, f, g, h);
+}
+
+@method_id(128)
+fun test128() {
+    var (a, b, c, d) = (0, 0, 0, 0);
+    [a, [b, [c, d]]] = [11, [22, [33, 44]]];
+
+    var (e, f, g, h) = (0, 0, 0, 0);
+    [e, (f, [g, h])] = [55, (66, [77, 88])];
+    return (a, b, c, d, e, f, g, h);
+}
+
+@method_id(129)
+fun test129() {
+    var `self` = 123;
+    {
+        var `self` = beginCell();
+        __expect_type(`self`, "builder");
+    }
+    return `self` + 6;
+}
 
 fun main(value: int, ) {
-    var (x: int?, y) = (autoInferIntNull(value), autoInferIntNull(value * 2));
+    var (x: int?, y,) = (autoInferIntNull(value), autoInferIntNull(value * 2));
     if (x == null && y == null) { return null; }
     return x == null || y == null ? -1 : x! + y!;
 }
@@ -225,36 +280,41 @@ fun main(value: int, ) {
 @testcase | 0   | 6      | -1
 @testcase | 0   | 11     | (null)
 @testcase | 101 | 78     | 88
-@testcase | 102 |        | [ 100 10 101 10 101 11 ] 10
-@testcase | 103 |        | [ 110 10 111 10 111 11 ] 10
-@testcase | 104 |        | [ 120 10 121 10 121 11 ] 10
-@testcase | 105 |        | [ 100 10 101 100 11 ]
-@testcase | 106 |        | [ 110 10 111 110 11 ]
-@testcase | 107 |        | 3 4
-@testcase | 108 |        | [ 101 ] 8
-@testcase | 109 |        | [ 110 10 111 111 10 10 11 ] 15
-@testcase | 110 |        | [ 13 13 ] [ 111 11 111 11 ] 23 13 19
-@testcase | 111 |        | [ 10 0 ] 18 [ 11 11 111 ] 50
 @testcase | 112 |        | [ 2 1 ]
-@testcase | 113 |        | 13 [ 1 14 ] 1 3
-@testcase | 114 |        | 13 [ 1 14 ] 1 3
-@testcase | 115 |        | [ 101 111 ] 9 9
+@testcase | 113 |        | 13 [ 2 14 ] 2 3
+@testcase | 114 |        | 13 [ 2 14 ] 2 3
 @testcase | 116 |        | 1 2 3 4 [ 1 2 3 4 ]
 @testcase | 117 |        | [ 20 ]
+@testcase | 118 | 3      | 10 3 0 1
+@testcase | 119 | 1 2    | 2 2 4
+@testcase | 122 |        | 0 10 0
+@testcase | 123 |        | 13
+@testcase | 124 |        | 1 18
+@testcase | 125 |        | 10 20 30
+@testcase | 126 | 1      | 1 9 7 0
+@testcase | 127 |        | 10 20 30 40 50 60 70 80
+@testcase | 128 |        | 11 22 33 44 55 66 77 88
+@testcase | 129 |        | 129
 
 
 @fif_codegen
 """
-  test116 PROC:<{
-    //
-    1 PUSHINT	//  '10=1
-    2 PUSHINT	//  '10=1 '11=2
-    3 PUSHINT	//  '10=1 '11=2 '12=3
-    4 PUSHINT	//  '10=1 '11=2 '12=3 '13=4
-    4 TUPLE	//  rhs
-    DUP	//  rhs rhs
-    4 UNTUPLE	//  rhs2 a b c d
-    4 ROLL	//  a b c d rhs2
+  test123() PROC:<{
+    13 PUSHINT
+  }>
+"""
+
+@fif_codegen
+"""
+  test116() PROC:<{ //
+    1 PUSHINT	    //  '9=1
+    2 PUSHINT	    //  '9=1 '10=2
+    3 PUSHINT	    //  '9=1 '10=2 '11=3
+    4 PUSHINT	    //  '9=1 '10=2 '11=3 '12=4
+    4 TUPLE	        //  rhs
+    DUP	            //  rhs rhs
+    4 UNTUPLE	    //  rhs2 a b c d
+    4 ROLL	        //  a b c d rhs2
   }>
 """
 */

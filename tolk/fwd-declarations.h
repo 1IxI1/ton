@@ -19,29 +19,53 @@
 namespace tolk {
 
 struct ASTNodeBase;
+struct ASTNodeDeclaredTypeBase;
 struct ASTNodeExpressionBase;
 struct ASTNodeStatementBase;
 
 using AnyV = const ASTNodeBase*;
+using AnyTypeV = const ASTNodeDeclaredTypeBase*;
 using AnyExprV = const ASTNodeExpressionBase*;
 using AnyStatementV = const ASTNodeStatementBase*;
 
+struct SrcFile;
 struct Symbol;
 struct LocalVarData;
 struct FunctionData;
 struct GlobalVarData;
 struct GlobalConstData;
 struct AliasDefData;
+struct StructFieldData;
+struct StructData;
+struct EnumMemberData;
+struct EnumDefData;
 
+using SrcFilePtr = const SrcFile*;
 using LocalVarPtr = const LocalVarData*;
 using FunctionPtr = const FunctionData*;
 using GlobalVarPtr = const GlobalVarData*;
 using GlobalConstPtr = const GlobalConstData*;
 using AliasDefPtr = const AliasDefData*;
+using StructFieldPtr = const StructFieldData*;
+using StructPtr = const StructData*;
+using EnumMemberPtr = const EnumMemberData*;
+using EnumDefPtr = const EnumDefData*;
 
 class TypeData;
 using TypePtr = const TypeData*;
 
+struct GenericsSubstitutions;
+
 struct SrcFile;
+
+enum class FunctionInlineMode {
+  notCalculated,
+  inlineViaFif,
+  inlineRef,
+  inlineInPlace,
+  noInline,
+};
+
+typedef int var_idx_t;
 
 } // namespace tolk

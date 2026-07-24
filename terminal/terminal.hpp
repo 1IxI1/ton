@@ -18,17 +18,21 @@
 */
 #pragma once
 
-#include "terminal.h"
 #include <iostream>
+#include <optional>
+#include <queue>
+
 #include "td/utils/port/FileFd.h"
 #include "td/utils/port/StdStreams.h"
-#include <queue>
+
+#include "terminal.h"
 
 namespace td {
 
 class TerminalLogInterface : public LogInterface {
  public:
   void append(CSlice slice, int log_level) override;
+  AnsiColor color_for(int log_level) override;
 };
 
 class TerminalIOImpl : public TerminalIO, td::ObserverBase {
@@ -79,7 +83,7 @@ class TerminalIOImpl : public TerminalIO, td::ObserverBase {
 
  private:
   static constexpr td::uint32 buf_size = 1 << 20;
-  td::BufferedStdin stdin_;
+  std::optional<td::BufferedStdin> stdin_;
 
   std::string prompt_;
   bool use_readline_ = false;

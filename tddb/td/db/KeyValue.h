@@ -17,12 +17,13 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <functional>
+
+#include "td/utils/Span.h"
 #include "td/utils/Status.h"
+#include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/Time.h"
 #include "td/utils/logging.h"
-#include "td/utils/Span.h"
-#include "td/utils/ThreadSafeCounter.h"
-#include <functional>
 namespace td {
 struct UsageStats {
   size_t get_count{};
@@ -60,8 +61,8 @@ class KeyValueReader {
   virtual ~KeyValueReader() = default;
   enum class GetStatus : int32 { Ok, NotFound };
 
-  virtual Result<GetStatus> get(Slice key, std::string &value) = 0;
-  virtual Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string> *values) = 0;
+  virtual Result<GetStatus> get(Slice key, std::string& value) = 0;
+  virtual Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string>* values) = 0;
   virtual Result<size_t> count(Slice prefix) = 0;
   virtual Status for_each(std::function<Status(Slice, Slice)> f) {
     return Status::Error("for_each is not supported");
@@ -79,13 +80,18 @@ class PrefixedKeyValueReader : public KeyValueReader {
   Result<GetStatus> get(Slice key, std::string& value) override {
     return reader_->get(PSLICE() << prefix_ << key, value);
   }
-  Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string> *values) override {
-    std::vector<Slice> prefixed_keys;
+  Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string>* values) override {
+    std::vector<std::string> prefixed_keys;
     prefixed_keys.reserve(keys.size());
-    for (auto &key : keys) {
-      prefixed_keys.push_back(PSLICE() << prefix_ << key);
+    for (auto& key : keys) {
+      prefixed_keys.push_back(prefix_ + key.str());
     }
-    return reader_->get_multi(prefixed_keys, values);
+    std::vector<Slice> prefixed_keys_s;
+    prefixed_keys_s.reserve(keys.size());
+    for (auto& s : prefixed_keys) {
+      prefixed_keys_s.push_back(Slice{s});
+    }
+    return reader_->get_multi(prefixed_keys_s, values);
   }
   Result<size_t> count(Slice prefix) override {
     return reader_->count(PSLICE() << prefix_ << prefix);
@@ -135,10 +141,10 @@ class PrefixedKeyValue : public KeyValue {
   Result<GetStatus> get(Slice key, std::string& value) override {
     return kv_->get(PSLICE() << prefix_ << key, value);
   }
-  Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string> *values) override {
+  Result<std::vector<GetStatus>> get_multi(td::Span<Slice> keys, std::vector<std::string>* values) override {
     std::vector<Slice> prefixed_keys;
     prefixed_keys.reserve(keys.size());
-    for (auto &key : keys) {
+    for (auto& key : keys) {
       prefixed_keys.push_back(PSLICE() << prefix_ << key);
     }
     return kv_->get_multi(prefixed_keys, values);

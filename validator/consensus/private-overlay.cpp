@@ -1,0 +1,304 @@
+/*
+ * Copyright (c) 2025-2026, TON CORE TECHNOLOGIES CO. L.L.C
+ *
+ * SPDX-License-Identifier: LGPL-2.0-or-later
+ */
+
+#include <map>
+#include <random>
+#include <vector>
+
+#include "adnl/adnl-node-id.hpp"
+#include "auto/tl/ton_api.h"
+#include "overlay/overlays.h"
+#include "td/utils/Random.h"
+#include "td/utils/Status.h"
+#include "td/utils/logging.h"
+#include "ton/ton-io.hpp"
+
+#include "bus.h"
+
+namespace ton::validator::consensus {
+
+namespace tl {
+
+using requestError = ton_api::consensus_requestError;
+using RequestErrorRef = tl_object_ptr<requestError>;
+
+}  // namespace tl
+
+namespace {
+
+class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<Bus> {
+ public:
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  static bool should_be_spawned(const Bus& bus) {
+    return bus.is_validator() || bus.config.observers_in_private_overlay();
+  }
+
+  void start_up() override {
+    auto& bus = *owning_bus();
+
+    overlays_ = bus.overlays;
+    local_adnl_id_ = bus.local_adnl_id;
+    adnl_sender_ = bus.adnl_sender;
+
+    std::vector<td::Bits256> overlay_nodes_tl;
+    std::map<PublicKeyHash, td::uint32> authorized_keys;
+
+    td::uint32 max_broadcast_size = bus.config.max_block_size + bus.config.max_collated_data_size + (1 << 20);
+    for (const auto& peer : bus.validator_set) {
+      adnl_id_to_peer_[peer.adnl_id] = peer;
+      short_id_to_peer_[peer.short_id] = peer;
+      overlay_nodes_.push_back(peer.adnl_id);
+      overlay_nodes_tl.push_back(peer.short_id.bits256_value());
+      authorized_keys.emplace(peer.short_id, max_broadcast_size);
+    }
+
+    td::actor::send_closure(adnl_sender_, &adnl::AdnlSenderEx::add_id, local_adnl_id_);
+
+    auto overlay_seed = create_tl_object<tl::overlayId>(bus.session_id, std::move(overlay_nodes_tl));
+    auto overlay_full_id = overlay::OverlayIdFull{serialize_tl_object(overlay_seed, true)};
+    overlay_id_ = overlay_full_id.compute_short_id();
+
+    overlay::OverlayOptions options;
+    options.name_ = PSTRING() << "valgroup" << bus.shard << "." << bus.cc_seqno;
+    options.private_ping_peers_ = true;
+    options.twostep_broadcast_sender_ = adnl_sender_;
+    options.send_twostep_broadcast_ = true;
+    options.allow_old_broadcasts_ = false;
+
+    if (bus.config.observers_in_private_overlay()) {
+      overlay_nodes_ = bus.all_validators;
+    }
+
+    td::actor::send_closure(overlays_, &overlay::Overlays::create_private_overlay_ex, local_adnl_id_,
+                            std::move(overlay_full_id), overlay_nodes_, make_callback(),
+                            overlay::OverlayPrivacyRules{0, 0, std::move(authorized_keys)},
+                            PSTRING() << R"({ "type": "consensus", "shard": ")" << bus.shard << R"(", "cc_seqno": )"
+                                      << bus.cc_seqno << R"( })",
+                            std::move(options));
+
+    for (auto node : overlay_nodes_) {
+      if (node != local_adnl_id_) {
+        other_overlay_nodes_.push_back(node);
+      }
+    }
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::delete_overlay, local_adnl_id_, overlay_id_);
+    stop();
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const OutgoingProtocolMessage> message) {
+    auto send_to_peer = [&](const adnl::AdnlNodeIdShort& adnl_id) {
+      CHECK(adnl_id != local_adnl_id_);
+      td::actor::send_closure(overlays_, &overlay::Overlays::send_message_via, adnl_id, local_adnl_id_, overlay_id_,
+                              message->message.data.clone(), adnl_sender_);
+    };
+
+    auto broadcast_all_fn = [&](const OutgoingProtocolMessage::BroadcastToAll&) {
+      for (const auto& adnl_id : other_overlay_nodes_) {
+        send_to_peer(adnl_id);
+      }
+    };
+
+    auto broadcast_validators_fn = [&](const OutgoingProtocolMessage::BroadcastToValidators&) {
+      for (const auto& [adnl_id, _] : adnl_id_to_peer_) {
+        if (adnl_id != local_adnl_id_) {
+          send_to_peer(adnl_id);
+        }
+      }
+    };
+
+    auto gossip_fn = [&](const OutgoingProtocolMessage::BroadcastToRandom& r) {
+      std::vector<adnl::AdnlNodeIdShort> selected_peers;
+      std::sample(other_overlay_nodes_.begin(), other_overlay_nodes_.end(), std::back_inserter(selected_peers),
+                  std::min(r.count, other_overlay_nodes_.size()), gossip_rng_);
+
+      for (auto peer : selected_peers) {
+        send_to_peer(peer);
+      }
+    };
+
+    std::visit(td::overloaded(broadcast_all_fn, broadcast_validators_fn, gossip_fn), message->recipient);
+  }
+
+  template <>
+  td::actor::Task<ProtocolMessage> process(BusHandle, std::shared_ptr<OutgoingOverlayRequest> message) {
+    auto destination = message->destination;
+    if (!destination) {
+      CHECK(!other_overlay_nodes_.empty());
+      size_t node_idx = td::Random::fast(0, static_cast<int>(other_overlay_nodes_.size()) - 1);
+      destination = other_overlay_nodes_[node_idx];
+    }
+
+    auto [awaiter, promise] = td::actor::StartedTask<td::BufferSlice>::make_bridge();
+    // FIXME: Pass max response size from the caller.
+    td::actor::send_closure(
+        overlays_, &overlay::Overlays::send_query_via, *destination, local_adnl_id_, overlay_id_, "",
+        std::move(promise), message->timeout, std::move(message->request.data),
+        owning_bus()->config.max_block_size + owning_bus()->config.max_collated_data_size + (1 << 20), adnl_sender_);
+    auto response = co_await std::move(awaiter);
+    if (fetch_tl_object<tl::requestError>(response, true).is_ok()) {
+      co_return td::Status::Error("Peer returned an error");
+    }
+    co_return ProtocolMessage{std::move(response)};
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const CandidateGenerated> event) {
+    auto& bus = *owning_bus();
+    if (bus.config.enable_block_sync()) {
+      return;
+    }
+
+    CHECK(bus.is_validator());
+    td::BufferSlice extra = create_serialize_tl_object<ton_api::consensus_broadcastExtra>(event->candidate->id.slot);
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_with_extra, local_adnl_id_, overlay_id_,
+                            bus.local_id->short_id, 0, event->candidate->serialize(), std::move(extra));
+  }
+
+ private:
+  std::unique_ptr<overlay::Overlays::Callback> make_callback() {
+    class Callback final : public overlay::Overlays::Callback {
+     public:
+      explicit Callback(td::actor::ActorId<PrivateOverlayImpl> owner) : owner_(owner) {
+      }
+
+      void receive_message(adnl::AdnlNodeIdShort src, overlay::OverlayIdShort, td::BufferSlice data) override {
+        td::actor::send_closure(owner_, &PrivateOverlayImpl::on_overlay_message, src, std::move(data));
+      }
+
+      void receive_query(adnl::AdnlNodeIdShort src, overlay::OverlayIdShort, td::BufferSlice data,
+                         td::Promise<td::BufferSlice> promise) override {
+        td::actor::send_closure(owner_, &PrivateOverlayImpl::on_query, src, std::move(data), std::move(promise));
+      }
+
+      void receive_broadcast_with_extra(PublicKeyHash src, overlay::OverlayIdShort, td::BufferSlice data,
+                                        td::BufferSlice extra) override {
+        td::actor::send_closure(owner_, &PrivateOverlayImpl::on_overlay_broadcast, src, std::move(data),
+                                std::move(extra));
+      }
+
+      void precheck_broadcast(PublicKeyHash src, overlay::OverlayIdShort overlay_id, td::Bits256 broadcast_id,
+                              td::BufferSlice extra, bool signature_checked, td::Promise<> promise) override {
+        td::actor::send_closure(owner_, &PrivateOverlayImpl::precheck_broadcast, src, broadcast_id, std::move(extra),
+                                signature_checked, std::move(promise));
+      }
+
+     private:
+      td::actor::ActorId<PrivateOverlayImpl> owner_;
+    };
+
+    return std::make_unique<Callback>(actor_id(this));
+  }
+
+  void on_overlay_message(adnl::AdnlNodeIdShort src_adnl_id, td::BufferSlice data) {
+    auto peer = adnl_id_to_peer_.find(src_adnl_id);
+    std::optional<PeerValidatorId> source_validator;
+    if (peer != adnl_id_to_peer_.end()) {
+      source_validator = peer->second.idx;
+    }
+
+    owning_bus().publish<IncomingProtocolMessage>(source_validator, src_adnl_id, std::move(data));
+  }
+
+  void on_overlay_broadcast(PublicKeyHash src, td::BufferSlice data, td::BufferSlice extra) {
+    auto& bus = *owning_bus();
+
+    if (bus.config.enable_block_sync()) {
+      LOG(WARNING) << "Dropping candidate broadcast from " << src << " in private overlay: protocol violation";
+      return;
+    }
+    if (bus.is_validator() && src == bus.local_id->short_id) {
+      return;
+    }
+
+    auto parsed_extra = fetch_tl_object<ton_api::consensus_broadcastExtra>(extra, true).move_as_ok();
+
+    auto peer = short_id_to_peer_.at(src);
+    auto maybe_candidate = Candidate::deserialize(std::move(data), bus, peer.idx, parsed_extra->slot_);
+
+    if (maybe_candidate.is_error()) {
+      // FIXME: If we actually collected signed broadcast parts, we could have produced a
+      //        MisbehaviorProof here.
+      LOG(WARNING) << "MISBEHAVIOR: Failed to deserialize block candidate broadcast: "
+                   << maybe_candidate.move_as_error();
+      return;
+    }
+    auto candidate = maybe_candidate.move_as_ok();
+
+    if (!candidate->is_empty()) {
+      const BlockCandidate& block = std::get<BlockCandidate>(candidate->block);
+      td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, block.clone());
+    }
+
+    owning_bus().publish<CandidateReceived>(std::move(candidate));
+  }
+
+  td::actor::Task<> precheck_broadcast(PublicKeyHash src, td::Bits256 broadcast_id, td::BufferSlice extra,
+                                       bool signature_checked) {
+    if (owning_bus()->config.enable_block_sync()) {
+      co_return td::Status::Error("Precheck failed: Candidate broadcasts in private overlay are disabled");
+    }
+    auto parsed_extra = fetch_tl_object<ton_api::consensus_broadcastExtra>(extra, true);
+    if (parsed_extra.is_error()) {
+      co_return parsed_extra.move_as_error_prefix("Precheck failed: Failed to parse broadcast extra: ");
+    }
+
+    auto& bus = *owning_bus();
+    auto peer = short_id_to_peer_.at(src).idx;
+    td::uint32 slot = parsed_extra.move_as_ok()->slot_;
+    if (peer != bus.collator_schedule->expected_collator_for(slot)) {
+      co_return td::Status::Error("Precheck failed: Broadcast is not from the expected collator");
+    }
+
+    co_return co_await owning_bus()
+        .publish<PrecheckCandidateBroadcast>(slot, broadcast_id, signature_checked)
+        .trace("Precheck failed");
+  }
+
+  void on_query(adnl::AdnlNodeIdShort src, td::BufferSlice data, td::Promise<td::BufferSlice> promise) {
+    auto peer = adnl_id_to_peer_.find(src);
+    auto peer_idx = peer != adnl_id_to_peer_.end() ? std::optional{peer->second.idx} : std::nullopt;
+
+    auto request = std::make_shared<IncomingOverlayRequest>(peer_idx, src, std::move(data));
+
+    auto task = [](BusHandle bus, auto message, auto promise) -> td::actor::Task<> {
+      auto response = co_await bus.publish(message).wrap();
+      if (response.is_ok()) {
+        promise.set_value(response.move_as_ok().data);
+      } else {
+        LOG(WARNING) << "Failed to process overlay request from " << message->source << ": "
+                     << response.move_as_error();
+        promise.set_value(create_serialize_tl_object<tl::requestError>());
+      }
+      co_return {};
+    };
+    task(owning_bus(), request, std::move(promise)).start().detach();
+  }
+
+  td::actor::ActorId<overlay::Overlays> overlays_;
+  td::actor::ActorId<adnl::AdnlSenderEx> adnl_sender_;
+  overlay::OverlayIdShort overlay_id_;
+  adnl::AdnlNodeIdShort local_adnl_id_;
+  std::vector<adnl::AdnlNodeIdShort> overlay_nodes_;
+  std::vector<adnl::AdnlNodeIdShort> other_overlay_nodes_;
+  std::map<adnl::AdnlNodeIdShort, PeerValidator> adnl_id_to_peer_;
+  std::map<PublicKeyHash, PeerValidator> short_id_to_peer_;
+
+  std::mt19937 gossip_rng_ = td::Random::fast_gen();
+};
+
+}  // namespace
+
+void PrivateOverlay::register_in(td::actor::Runtime& runtime) {
+  runtime.register_actor<PrivateOverlayImpl>("PrivateOverlay");
+}
+
+}  // namespace ton::validator::consensus
