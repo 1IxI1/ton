@@ -65,7 +65,7 @@ RocksDbSecondary RocksDbSecondary::clone() const {
 }
 
 Result<RocksDbSecondary> RocksDbSecondary::open(std::string path, RocksDbOptions options) {
-  rocksdb::DB *db;
+  std::unique_ptr<rocksdb::DB> db;
   {
     rocksdb::Options db_options;
     db_options.merge_operator = options.merge_operator;
@@ -117,7 +117,7 @@ Result<RocksDbSecondary> RocksDbSecondary::open(std::string path, RocksDbOptions
     delete handles[0];
   }
   TRY_STATUS(from_rocksdb(db->TryCatchUpWithPrimary()));
-  return RocksDbSecondary(std::shared_ptr<rocksdb::DB>(db), std::move(options));
+  return RocksDbSecondary(std::shared_ptr<rocksdb::DB>(std::move(db)), std::move(options));
 }
 
 Status RocksDbSecondary::try_catch_up_with_primary() {

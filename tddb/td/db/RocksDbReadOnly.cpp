@@ -56,7 +56,7 @@ RocksDbReadOnly RocksDbReadOnly::clone() const {
 }
 
 Result<RocksDbReadOnly> RocksDbReadOnly::open(std::string path, RocksDbOptions options) {
-  rocksdb::DB *db;
+  std::unique_ptr<rocksdb::DB> db;
   {
     rocksdb::Options db_options;
     db_options.merge_operator = options.merge_operator;
@@ -106,7 +106,7 @@ Result<RocksDbReadOnly> RocksDbReadOnly::open(std::string path, RocksDbOptions o
     // default column family
     delete handles[0];
   }
-  return RocksDbReadOnly(std::shared_ptr<rocksdb::DB>(db), std::move(options));
+  return RocksDbReadOnly(std::shared_ptr<rocksdb::DB>(std::move(db)), std::move(options));
 }
 
 std::unique_ptr<KeyValueReader> RocksDbReadOnly::snapshot() {
