@@ -1,6 +1,6 @@
 [submodule "third-party/rocksdb"]
 	path = third-party/rocksdb
-	url = https://github.com/facebook/rocksdb.git
+	url = https://github.com/meta/rocksdb.git
 	ignore = all
 [submodule "third-party/crc32c"]
 	path = third-party/crc32c
