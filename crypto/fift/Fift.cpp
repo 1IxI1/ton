@@ -16,11 +16,11 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "td/utils/PathView.h"
+
 #include "Fift.h"
 #include "IntCtx.h"
 #include "words.h"
-
-#include "td/utils/PathView.h"
 
 namespace fift {
 
@@ -49,7 +49,6 @@ td::Result<int> Fift::interpret_istream(std::istream& stream, std::string curren
 }
 
 td::Result<int> Fift::do_interpret(IntCtx& ctx, bool is_interactive) {
-  ctx.ton_db = &config_.ton_db;
   ctx.source_lookup = &config_.source_lookup;
   ctx.dictionary = ctx.main_dictionary = ctx.context = config_.dictionary;
   ctx.output_stream = config_.output_stream;

@@ -20,29 +20,23 @@
 
 #include <set>
 
-#include "td/utils/int_types.h"
+#include "adnl/adnl.h"
+#include "adnl/utils.hpp"
+#include "auto/tl/ton_api.hpp"
+#include "keys/encryptor.h"
 #include "td/actor/actor.h"
 #include "td/utils/List.h"
+#include "td/utils/int_types.h"
+#include "td/utils/logging.h"
 
-#include "adnl/adnl.h"
-
-#include "adnl/utils.hpp"
-#include "keys/encryptor.h"
-
-#include "dht.h"
 #include "dht-node.hpp"
+#include "dht.h"
 
-#include "auto/tl/ton_api.hpp"
+DECLARE_LOG_CATEGORY(dht)
 
 namespace ton {
 
 namespace dht {
-
-constexpr int VERBOSITY_NAME(DHT_WARNING) = verbosity_INFO;
-constexpr int VERBOSITY_NAME(DHT_NOTICE) = verbosity_DEBUG;
-constexpr int VERBOSITY_NAME(DHT_INFO) = verbosity_DEBUG;
-constexpr int VERBOSITY_NAME(DHT_DEBUG) = verbosity_DEBUG + 1;
-constexpr int VERBOSITY_NAME(DHT_EXTRA_DEBUG) = verbosity_DEBUG + 10;
 
 class DhtGlobalConfig {
  public:

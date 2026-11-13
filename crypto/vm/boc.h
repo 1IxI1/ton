@@ -17,18 +17,26 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include <set>
 #include <map>
-#include "vm/db/DynamicBagOfCellsDb.h"
-#include "vm/cells.h"
-#include "td/utils/Status.h"
-#include "td/utils/buffer.h"
+#include <set>
+
+#include "td/utils/CancellationToken.h"
 #include "td/utils/HashMap.h"
 #include "td/utils/HashSet.h"
+#include "td/utils/Status.h"
+#include "td/utils/Time.h"
+#include "td/utils/Timer.h"
+#include "td/utils/buffer.h"
 #include "td/utils/port/FileFd.h"
+#include "vm/cells.h"
+#include "vm/db/DynamicBagOfCellsDb.h"
+
+#include "utils.h"
 
 namespace vm {
 using td::Ref;
+
+class MerkleUpdateLeftStat;
 
 class NewCellStorageStat {
  public:
@@ -86,44 +94,44 @@ class NewCellStorageStat {
   }
 
   void add_cell(Ref<Cell> cell);
-  void add_proof(Ref<Cell> cell, const CellUsageTree* usage_tree);
-  void add_cell_and_proof(Ref<Cell> cell, const CellUsageTree* usage_tree);
+  void add_proof(Ref<Cell> cell, CellUsageTree* usage_tree, MerkleUpdateLeftStat* merkle_update_left_stat = nullptr);
+  void add_cell_and_proof(Ref<Cell> cell, CellUsageTree* usage_tree);
   Stat tentative_add_cell(Ref<Cell> cell) const;
-  Stat tentative_add_proof(Ref<Cell> cell, const CellUsageTree* usage_tree) const;
+  Stat tentative_add_proof(Ref<Cell> cell, CellUsageTree* usage_tree) const;
   void set_zero() {
     stat_.set_zero();
     proof_stat_.set_zero();
   }
 
  private:
-  const CellUsageTree* usage_tree_;
-  std::set<vm::Cell::Hash> seen_;
+  CellUsageTree* usage_tree_;
+  td::HashSet<Cell::Hash> seen_;
   Stat stat_;
-  std::set<vm::Cell::Hash> proof_seen_;
+  td::HashSet<std::pair<Cell::Hash, unsigned>> proof_seen_;  // hash, merkle_depth
   Stat proof_stat_;
+  td::HashSet<Ref<Cell>, RefCellHash> mu_left_seen_;  // Compare actual Cell objects, not hashes
+  MerkleUpdateLeftStat* merkle_update_left_stat_ = nullptr;
   const NewCellStorageStat* parent_{nullptr};
 
-  void dfs(Ref<Cell> cell, bool need_stat, bool need_proof_stat);
+  void dfs(Ref<Cell> cell, unsigned merkle_depth, bool need_stat, bool need_proof_stat, bool need_left_mu_stat);
 };
 
 struct CellStorageStat {
   unsigned long long cells;
   unsigned long long bits;
-  unsigned long long public_cells;
   struct CellInfo {
     td::uint32 max_merkle_depth = 0;
   };
-  std::map<vm::Cell::Hash, CellInfo> seen;
-  CellStorageStat() : cells(0), bits(0), public_cells(0) {
+  td::HashMap<vm::Cell::Hash, CellInfo> seen;
+  CellStorageStat() : cells(0), bits(0) {
   }
-  explicit CellStorageStat(unsigned long long limit_cells)
-      : cells(0), bits(0), public_cells(0), limit_cells(limit_cells) {
+  explicit CellStorageStat(unsigned long long limit_cells) : cells(0), bits(0), limit_cells(limit_cells) {
   }
   void clear_seen() {
     seen.clear();
   }
   void clear() {
-    cells = bits = public_cells = 0;
+    cells = bits = 0;
     clear_limit();
     clear_seen();
   }
@@ -141,6 +149,7 @@ struct CellStorageStat {
   td::Result<CellInfo> add_used_storage(const CellSlice& cs, bool kill_dup = true, unsigned skip_count_root = 0);
   td::Result<CellInfo> add_used_storage(CellSlice&& cs, bool kill_dup = true, unsigned skip_count_root = 0);
   td::Result<CellInfo> add_used_storage(Ref<vm::Cell> cell, bool kill_dup = true, unsigned skip_count_root = 0);
+  td::Result<CellInfo> add_used_storage(td::Span<Ref<Cell>> cells, bool kill_dup = true, unsigned skip_count_root = 0);
 
   unsigned long long limit_cells = std::numeric_limits<unsigned long long>::max();
   unsigned long long limit_bits = std::numeric_limits<unsigned long long>::max();
@@ -159,6 +168,42 @@ struct VmStorageStat {
   bool check_visited(const Ref<Cell>& cell) {
     return check_visited(cell->get_hash());
   }
+};
+
+class ProofStorageStat {
+ public:
+  void add_loaded_cell(const Ref<DataCell>& cell, td::uint8 max_level = Cell::max_level);
+  void add_loaded_cell(const Ref<Cell>& cell);
+  void add_loaded_cells(const ProofStorageStat& other);
+  td::uint64 estimate_proof_size() const;
+
+  enum CellStatus { c_none = 0, c_prunned = 1, c_loaded = 2 };
+  CellStatus get_cell_status(const Cell::Hash& hash) const;
+  bool is_loaded(const Cell::Hash& hash) const {
+    return get_cell_status(hash) == c_loaded;
+  }
+
+  static td::uint64 estimate_prunned_size(const detail::LevelMask& level_mask);
+  static td::uint64 estimate_serialized_size(const Ref<DataCell>& cell);
+
+ private:
+  td::HashMap<Cell::Hash, std::pair<CellStatus, td::uint64>> cells_;
+  td::uint64 proof_size_ = 0;
+};
+
+class MerkleUpdateLeftStat {
+ public:
+  void add_loaded_cell(const Ref<Cell>& cell, unsigned merkle_depth);
+  td::uint64 estimate_proof_size() const;
+
+ private:
+  enum CellStatus { c_none = 0, c_prunned = 1, c_loaded = 2 };
+  struct CellInfo {
+    CellStatus status = c_none;
+    td::uint64 size = 0;
+  };
+  td::HashMap<std::pair<Cell::Hash, unsigned>, CellInfo> cells_;
+  td::uint64 proof_size_ = 0;
 };
 
 struct CellSerializationInfo {
@@ -182,9 +227,56 @@ struct CellSerializationInfo {
   td::Status init(td::uint8 d1, td::uint8 d2, int ref_byte_size);
   td::Result<int> get_bits(td::Slice cell) const;
 
-  td::Result<Ref<DataCell>> create_data_cell(td::Slice data, td::Span<Ref<Cell>> refs) const;
+  td::Result<Ref<DataCell>> create_data_cell(td::Slice data, td::Span<Ref<Cell>> refs, bool trust_hashes = false) const;
 };
 
+class BagOfCellsLogger {
+ public:
+  BagOfCellsLogger() = default;
+  explicit BagOfCellsLogger(td::CancellationToken cancellation_token)
+      : cancellation_token_(std::move(cancellation_token)) {
+  }
+
+  void start_stage(std::string stage) {
+    log_speed_at_ = td::Timestamp::in(LOG_SPEED_PERIOD);
+    last_speed_log_ = td::Timestamp::now();
+    processed_cells_ = 0;
+    last_token_check_ = 0;
+    timer_ = {};
+    stage_ = std::move(stage);
+  }
+  void finish_stage(td::Slice desc) {
+    LOG(ERROR) << "serializer: " << stage_ << " took " << timer_.elapsed() << "s, " << desc;
+  }
+  td::Status on_cells_processed(size_t count) {
+    processed_cells_ += count;
+    if (processed_cells_ / 1000 > last_token_check_) {
+      TRY_STATUS(cancellation_token_.check());
+      last_token_check_ = processed_cells_ / 1000;
+    }
+    if (log_speed_at_.is_in_past()) {
+      double period = td::Timestamp::now().at() - last_speed_log_.at();
+
+      LOG(WARNING) << "serializer: " << stage_ << " " << (double)processed_cells_ / period << " cells/s";
+      TRY_STATUS(cancellation_token_.check());
+      processed_cells_ = 0;
+      last_token_check_ = 0;
+      last_speed_log_ = td::Timestamp::now();
+      log_speed_at_ = td::Timestamp::in(LOG_SPEED_PERIOD);
+    }
+    return td::Status::OK();
+  }
+
+ private:
+  std::string stage_;
+  td::Timer timer_;
+  td::CancellationToken cancellation_token_;
+  td::Timestamp log_speed_at_;
+  size_t processed_cells_ = 0;
+  size_t last_token_check_ = 0;
+  td::Timestamp last_speed_log_;
+  static constexpr double LOG_SPEED_PERIOD = 120.0;
+};
 class BagOfCells {
  public:
   enum { hash_bytes = vm::Cell::hash_bytes, default_max_roots = 16384 };
@@ -212,18 +304,18 @@ class BagOfCells {
       valid = false;
     }
     long long parse_serialized_header(const td::Slice& slice);
-    unsigned long long read_int(const unsigned char* ptr, unsigned bytes);
-    unsigned long long read_ref(const unsigned char* ptr) {
+    unsigned long long read_int(const unsigned char* ptr, unsigned bytes) const;
+    unsigned long long read_ref(const unsigned char* ptr) const {
       return read_int(ptr, ref_byte_size);
     }
-    unsigned long long read_offset(const unsigned char* ptr) {
+    unsigned long long read_offset(const unsigned char* ptr) const {
       return read_int(ptr, offset_byte_size);
     }
-    void write_int(unsigned char* ptr, unsigned long long value, int bytes);
-    void write_ref(unsigned char* ptr, unsigned long long value) {
+    void write_int(unsigned char* ptr, unsigned long long value, int bytes) const;
+    void write_ref(unsigned char* ptr, unsigned long long value) const {
       write_int(ptr, value, ref_byte_size);
     }
-    void write_offset(unsigned char* ptr, unsigned long long value) {
+    void write_offset(unsigned char* ptr, unsigned long long value) const {
       write_int(ptr, value, offset_byte_size);
     }
   };
@@ -269,6 +361,7 @@ class BagOfCells {
   const unsigned char* index_ptr{nullptr};
   const unsigned char* data_ptr{nullptr};
   std::vector<unsigned long long> custom_index;
+  BagOfCellsLogger* logger_ptr_{nullptr};
 
  public:
   void clear();
@@ -278,14 +371,17 @@ class BagOfCells {
   int add_root(td::Ref<vm::Cell> add_root);
   td::Status import_cells() TD_WARN_UNUSED_RESULT;
   BagOfCells() = default;
+  void set_logger(BagOfCellsLogger* logger_ptr) {
+    logger_ptr_ = logger_ptr;
+  }
   std::size_t estimate_serialized_size(int mode = 0);
-  BagOfCells& serialize(int mode = 0);
-  std::string serialize_to_string(int mode = 0);
+  td::Status serialize(int mode = 0);
+  td::string serialize_to_string(int mode = 0);
   td::Result<td::BufferSlice> serialize_to_slice(int mode = 0);
-  std::size_t serialize_to(unsigned char* buffer, std::size_t buff_size, int mode = 0);
+  td::Result<std::size_t> serialize_to(unsigned char* buffer, std::size_t buff_size, int mode = 0);
   td::Status serialize_to_file(td::FileFd& fd, int mode = 0);
-  template<typename WriterT>
-  std::size_t serialize_to_impl(WriterT& writer, int mode = 0);
+  template <typename WriterT>
+  td::Result<std::size_t> serialize_to_impl(WriterT& writer, int mode = 0);
   std::string extract_string() const;
 
   td::Result<long long> deserialize(const td::Slice& data, int max_roots = default_max_roots);
@@ -328,10 +424,13 @@ td::Result<Ref<Cell>> std_boc_deserialize(td::Slice data, bool can_be_empty = fa
 td::Result<td::BufferSlice> std_boc_serialize(Ref<Cell> root, int mode = 0);
 
 td::Result<std::vector<Ref<Cell>>> std_boc_deserialize_multi(td::Slice data,
-                                                             int max_roots = BagOfCells::default_max_roots);
+                                                             int max_roots = BagOfCells::default_max_roots,
+                                                             bool allow_nonzero_level = false);
 td::Result<td::BufferSlice> std_boc_serialize_multi(std::vector<Ref<Cell>> root, int mode = 0);
 
-td::Status std_boc_serialize_to_file_large(std::shared_ptr<CellDbReader> reader, Cell::Hash root_hash,
-                                           td::FileFd& fd, int mode = 0);
+td::Status std_boc_serialize_to_file(Ref<Cell> root, td::FileFd& fd, int mode = 0,
+                                     td::CancellationToken cancellation_token = {});
+td::Status boc_serialize_to_file_large(std::shared_ptr<CellDbReader> reader, Cell::Hash root_hash, td::FileFd& fd,
+                                       int mode = 0, td::CancellationToken cancellation_token = {});
 
 }  // namespace vm

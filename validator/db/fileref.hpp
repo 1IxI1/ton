@@ -18,11 +18,15 @@
 */
 #pragma once
 
-#include "ton/ton-types.h"
+#include "auto/tl/ton_api.h"
+#include "keys/keys.hpp"
 #include "td/actor/actor.h"
-#include "validator/interfaces/shard.h"
 #include "td/db/KeyValue.h"
+#include "tl-utils/common-utils.hpp"
+#include "tl-utils/tl-utils.hpp"
 #include "ton/ton-tl.hpp"
+#include "ton/ton-types.h"
+#include "validator/interfaces/shard.h"
 
 namespace ton {
 
@@ -110,8 +114,77 @@ class ZeroState {
   BlockIdExt block_id;
 };
 
+class SplitAccountState {
+ public:
+  static SplitAccountState create(BlockIdExt block_id, BlockIdExt masterchain_block_id, ShardId effective_shard) {
+    auto hash = create_hash_tl_object<ton_api::db_filedb_key_splitAccountStateFile>(
+        create_tl_block_id(block_id), create_tl_block_id(masterchain_block_id), effective_shard);
+
+    return {
+        .shard_id = block_id.shard_full(),
+        .effective_shard = effective_shard,
+        .masterchain_seqno = masterchain_block_id.seqno(),
+        .hashv = hash,
+    };
+  }
+
+  FileHash hash() const {
+    return hashv;
+  }
+
+  ShardIdFull shard() const {
+    return {shard_id.workchain, effective_shard};
+  }
+
+  std::string filename_short() const;
+
+  ShardIdFull shard_id;
+  ShardId effective_shard;
+  BlockSeqno masterchain_seqno;
+  FileHash hashv;
+};
+
+class SplitPersistentState {
+ public:
+  static SplitPersistentState create(BlockIdExt block_id, BlockIdExt masterchain_block_id) {
+    auto hash = create_hash_tl_object<ton_api::db_filedb_key_splitPersistentStateFile>(
+        create_tl_block_id(block_id), create_tl_block_id(masterchain_block_id));
+
+    return {
+        .shard_id = block_id.shard_full(),
+        .masterchain_seqno = masterchain_block_id.seqno(),
+        .hashv = hash,
+    };
+  }
+
+  FileHash hash() const {
+    return hashv;
+  }
+
+  ShardIdFull shard() const {
+    return shard_id;
+  }
+
+  std::string filename_short() const;
+
+  ShardIdFull shard_id;
+  BlockSeqno masterchain_seqno;
+  FileHash hashv;
+};
+
 class PersistentStateShort {
  public:
+  static PersistentStateShort create(BlockIdExt block_id, BlockIdExt masterchain_block_id) {
+    auto hash = create_hash_tl_object<ton_api::db_filedb_key_persistentStateFile>(
+        create_tl_block_id(block_id), create_tl_block_id(masterchain_block_id));
+
+    return {
+        .shard_id = block_id.shard_full(),
+        .masterchain_seqno = masterchain_block_id.seqno(),
+        .hashv = hash,
+    };
+  }
+
   FileHash hash() const {
     return hashv;
   }
@@ -278,6 +351,38 @@ class Candidate {
   FileHash collated_data_file_hash;
 };
 
+class CandidateRefShort {
+ public:
+  FileHash hash() const {
+    return hashv;
+  }
+  ShardIdFull shard() const {
+    return block_id.shard_full();
+  }
+  std::string filename_short() const;
+
+  BlockId block_id;
+  FileHash hashv;
+};
+
+class CandidateRef {
+ public:
+  tl_object_ptr<ton_api::db_filedb_Key> tl() const {
+    return create_tl_object<ton_api::db_filedb_key_candidateRef>(create_tl_block_id(block_id));
+  }
+  FileHash hash() const {
+    return create_hash_tl_object<ton_api::db_filedb_key_candidateRef>(create_tl_block_id(block_id));
+  }
+  ShardIdFull shard() const {
+    return block_id.shard_full();
+  }
+  CandidateRefShort shortref() const;
+  std::string filename() const;
+  std::string filename_short() const;
+
+  BlockIdExt block_id;
+};
+
 class BlockInfoShort {
  public:
   FileHash hash() const {
@@ -314,9 +419,10 @@ class BlockInfo {
 
 class FileReferenceShort {
  private:
-  td::Variant<fileref::Empty, fileref::BlockShort, fileref::ZeroStateShort, fileref::PersistentStateShort,
-              fileref::ProofShort, fileref::ProofShort, fileref::ProofLinkShort, fileref::SignaturesShort,
-              fileref::CandidateShort, fileref::BlockInfoShort>
+  td::Variant<fileref::Empty, fileref::BlockShort, fileref::ZeroStateShort, fileref::SplitAccountState,
+              fileref::SplitPersistentState, fileref::PersistentStateShort, fileref::ProofShort, fileref::ProofShort,
+              fileref::ProofLinkShort, fileref::SignaturesShort, fileref::CandidateShort, fileref::CandidateRefShort,
+              fileref::BlockInfoShort>
       ref_;
 
  public:
@@ -334,13 +440,16 @@ class FileReferenceShort {
 
   td::Bits256 hash() const;
   ShardIdFull shard() const;
+  BlockSeqno seqno_of_persistent_state() const;
+  bool is_state_like() const;
   std::string filename_short() const;
 };
 
 class FileReference {
  private:
   td::Variant<fileref::Empty, fileref::Block, fileref::ZeroState, fileref::PersistentState, fileref::Proof,
-              fileref::Proof, fileref::ProofLink, fileref::Signatures, fileref::Candidate, fileref::BlockInfo>
+              fileref::Proof, fileref::ProofLink, fileref::Signatures, fileref::Candidate, fileref::CandidateRef,
+              fileref::BlockInfo>
       ref_;
 
  public:
@@ -349,7 +458,6 @@ class FileReference {
   }
   FileReference() : ref_(fileref::Empty{}) {
   }
-  FileReference(tl_object_ptr<ton_api::db_filedb_Key> key);
 
   static td::Result<FileReference> create(std::string filename);
 
@@ -369,4 +477,3 @@ class FileReference {
 }  // namespace validator
 
 }  // namespace ton
-

@@ -16,13 +16,15 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "tl-utils.hpp"
-#include "tl/tl_object_store.h"
-#include "auto/tl/lite_api.hpp"
-#include "td/utils/tl_storers.h"
-#include "td/utils/crypto.h"
-#include "crypto/common/bitstring.h"
 #include <map>
+
+#include "auto/tl/lite_api.hpp"
+#include "crypto/common/bitstring.h"
+#include "td/utils/crypto.h"
+#include "td/utils/tl_storers.h"
+#include "tl/tl_object_store.h"
+
+#include "tl-utils.hpp"
 
 namespace ton {
 
@@ -109,7 +111,7 @@ td::UInt256 get_tl_object_sha256(const lite_api::Object *T) {
   T->store(Y);
 
   td::UInt256 id256;
-  td::sha256(B.as_slice(), id256.as_slice());
+  td::sha256(B.as_slice(), id256.as_mutable_slice());
 
   return id256;
 }
@@ -148,6 +150,7 @@ std::string lite_query_name_by_id(int id) {
       {lite_api::liteServer_getOneTransaction::ID, "getOneTransaction"},
       {lite_api::liteServer_getTransactions::ID, "getTransactions"},
       {lite_api::liteServer_lookupBlock::ID, "lookupBlock"},
+      {lite_api::liteServer_lookupBlockWithProof::ID, "lookupBlockWithProof"},
       {lite_api::liteServer_listBlockTransactions::ID, "listBlockTransactions"},
       {lite_api::liteServer_listBlockTransactionsExt::ID, "listBlockTransactionsExt"},
       {lite_api::liteServer_getBlockProof::ID, "getBlockProof"},
@@ -155,7 +158,13 @@ std::string lite_query_name_by_id(int id) {
       {lite_api::liteServer_getConfigParams::ID, "getConfigParams"},
       {lite_api::liteServer_getValidatorStats::ID, "getValidatorStats"},
       {lite_api::liteServer_getLibraries::ID, "getLibraries"},
-      {lite_api::liteServer_getShardBlockProof::ID, "getShardBlockProof"}};
+      {lite_api::liteServer_getLibrariesWithProof::ID, "getLibrariesWithProof"},
+      {lite_api::liteServer_getShardBlockProof::ID, "getShardBlockProof"},
+      {lite_api::liteServer_getOutMsgQueueSizes::ID, "getOutMsgQueueSizes"},
+      {lite_api::liteServer_getBlockOutMsgQueueSize::ID, "getBlockOutMsgQueueSize"},
+      {lite_api::liteServer_getDispatchQueueInfo::ID, "getDispatchQueueInfo"},
+      {lite_api::liteServer_getDispatchQueueMessages::ID, "getDispatchQueueMessages"},
+  };
   auto it = names.find(id);
   if (it == names.end()) {
     return "unknown";

@@ -18,15 +18,18 @@
 */
 #pragma once
 
+#include <chrono>
+#include <cinttypes>
+
 #include "crypto/common/bitstring.h"
-#include "td/utils/buffer.h"
-#include "td/utils/bits.h"
+#include "td/utils/PersistentTreap.h"
 #include "td/utils/Slice.h"
 #include "td/utils/UInt.h"
+#include "td/utils/Variant.h"
+#include "td/utils/bits.h"
+#include "td/utils/buffer.h"
 #include "td/utils/misc.h"
 #include "td/utils/optional.h"
-
-#include <cinttypes>
 
 namespace ton {
 
@@ -51,13 +54,19 @@ using ValidatorSessionId = td::Bits256;
 constexpr WorkchainId masterchainId = -1, basechainId = 0, workchainInvalid = 0x80000000;
 constexpr ShardId shardIdAll = (1ULL << 63);
 
+constexpr int max_shard_pfx_len = 60;
+
 enum GlobalCapabilities {
   capIhrEnabled = 1,
   capCreateStatsEnabled = 2,
   capBounceMsgBody = 4,
   capReportVersion = 8,
   capSplitMergeTransactions = 16,
-  capShortDequeue = 32
+  capShortDequeue = 32,
+  capStoreOutMsgQueueSize = 64,
+  capMsgMetadata = 128,
+  capDeferMessages = 256,
+  capFullCollatedData = 512
 };
 
 inline int shard_pfx_len(ShardId shard) {
@@ -115,12 +124,32 @@ struct ShardIdFull {
     char buffer[64];
     return std::string{buffer, (unsigned)snprintf(buffer, 63, "(%d,%016llx)", workchain, (unsigned long long)shard)};
   }
+  static td::Result<ShardIdFull> parse(td::Slice s) {
+    // Formats: (0,2000000000000000) (0:2000000000000000) 0,2000000000000000 0:2000000000000000
+    if (s.empty()) {
+      return td::Status::Error("empty string");
+    }
+    if (s[0] == '(' && s.back() == ')') {
+      s = s.substr(1, s.size() - 2);
+    }
+    auto sep = s.find(':');
+    if (sep == td::Slice::npos) {
+      sep = s.find(',');
+    }
+    if (sep == td::Slice::npos || s.size() - sep - 1 != 16) {
+      return td::Status::Error(PSTRING() << "invalid shard " << s);
+    }
+    ShardIdFull shard;
+    TRY_RESULT_ASSIGN(shard.workchain, td::to_integer_safe<td::int32>(s.substr(0, sep)));
+    TRY_RESULT_ASSIGN(shard.shard, td::hex_to_integer_safe<td::uint64>(s.substr(sep + 1)));
+    return shard;
+  }
 };
 
 struct AccountIdPrefixFull {
   WorkchainId workchain;
   AccountIdPrefix account_id_prefix;
-  AccountIdPrefixFull() : workchain(workchainInvalid) {
+  AccountIdPrefixFull() : workchain(workchainInvalid), account_id_prefix(0) {
   }
   AccountIdPrefixFull(WorkchainId workchain, AccountIdPrefix prefix) : workchain(workchain), account_id_prefix(prefix) {
   }
@@ -219,8 +248,8 @@ inline bool operator<(const ShardIdFull& x, const BlockId& y) {
 
 struct BlockIdExt {
   BlockId id;
-  RootHash root_hash;
-  FileHash file_hash;
+  RootHash root_hash{};
+  FileHash file_hash{};
   BlockIdExt(WorkchainId workchain, ShardId shard, BlockSeqno seqno, const RootHash& root_hash,
              const FileHash& file_hash)
       : id{workchain, shard, seqno}, root_hash(root_hash), file_hash(file_hash) {
@@ -229,11 +258,8 @@ struct BlockIdExt {
       : id(id), root_hash(root_hash), file_hash(file_hash) {
   }
   BlockIdExt(BlockId id, const FileHash& file_hash) : id(id), file_hash(file_hash) {
-    root_hash.set_zero();
   }
   explicit BlockIdExt(BlockId id) : id(id) {
-    root_hash.set_zero();
-    file_hash.set_zero();
   }
   BlockIdExt() : id(workchainIdNotYet, 0, 0) {
   }
@@ -341,28 +367,6 @@ struct BlockSignature {
   }
 };
 
-struct ReceivedBlock {
-  BlockIdExt id;
-  td::BufferSlice data;
-};
-
-struct BlockBroadcast {
-  BlockIdExt block_id;
-  std::vector<BlockSignature> signatures;
-  CatchainSeqno catchain_seqno;
-  td::uint32 validator_set_hash;
-  td::BufferSlice data;
-  td::BufferSlice proof;
-
-  BlockBroadcast clone() const {
-    std::vector<BlockSignature> new_signatures;
-    for (const BlockSignature& s : signatures) {
-      new_signatures.emplace_back(s.node, s.signature.clone());
-    }
-    return {block_id, std::move(new_signatures), catchain_seqno, validator_set_hash, data.clone(), proof.clone()};
-  }
-};
-
 struct Ed25519_PrivateKey {
   Bits256 _privkey;
   explicit Ed25519_PrivateKey(const Bits256& x) : _privkey(x) {
@@ -381,6 +385,8 @@ struct Ed25519_PrivateKey {
 
 struct Ed25519_PublicKey {
   Bits256 _pubkey;
+  Ed25519_PublicKey() : _pubkey(td::Bits256::zero()) {
+  }
   explicit Ed25519_PublicKey(const Bits256& x) : _pubkey(x) {
   }
   explicit Ed25519_PublicKey(const td::ConstBitPtr x) : _pubkey(x) {
@@ -399,6 +405,9 @@ struct Ed25519_PublicKey {
   bool operator==(const Ed25519_PublicKey& other) const {
     return _pubkey == other._pubkey;
   }
+  bool operator!=(const Ed25519_PublicKey& other) const {
+    return _pubkey != other._pubkey;
+  }
   bool clear() {
     _pubkey.set_zero();
     return true;
@@ -412,15 +421,37 @@ struct Ed25519_PublicKey {
 };
 
 // represents (the contents of) a block
-struct BlockCandidate {
-  BlockCandidate(Ed25519_PublicKey pubkey, BlockIdExt id, FileHash collated_file_hash, td::BufferSlice data,
-                 td::BufferSlice collated_data)
-      : pubkey(pubkey)
-      , id(id)
-      , collated_file_hash(collated_file_hash)
-      , data(std::move(data))
-      , collated_data(std::move(collated_data)) {
+
+struct OutMsgQueueProofBroadcast : public td::CntObject {
+  OutMsgQueueProofBroadcast(ShardIdFull dst_shard, BlockIdExt block_id, td::int32 max_bytes, td::int32 max_msgs,
+                            td::BufferSlice queue_proof, td::BufferSlice block_state_proof, int msg_count)
+      : dst_shard(std::move(dst_shard))
+      , block_id(block_id)
+      , max_bytes(max_bytes)
+      , max_msgs(max_msgs)
+      , queue_proofs(std::move(queue_proof))
+      , block_state_proofs(std::move(block_state_proof))
+      , msg_count(std::move(msg_count)) {
   }
+  ShardIdFull dst_shard;
+  BlockIdExt block_id;
+
+  // importedMsgQueueLimits
+  td::uint32 max_bytes;
+  td::uint32 max_msgs;
+
+  // outMsgQueueProof
+  td::BufferSlice queue_proofs;
+  td::BufferSlice block_state_proofs;
+  int msg_count;
+
+  OutMsgQueueProofBroadcast* make_copy() const override {
+    return new OutMsgQueueProofBroadcast(dst_shard, block_id, max_bytes, max_msgs, queue_proofs.clone(),
+                                         block_state_proofs.clone(), msg_count);
+  }
+};
+
+struct BlockCandidate {
   Ed25519_PublicKey pubkey;
   BlockIdExt id;
   FileHash collated_file_hash;
@@ -430,6 +461,28 @@ struct BlockCandidate {
   BlockCandidate clone() const {
     return BlockCandidate{pubkey, id, collated_file_hash, data.clone(), collated_data.clone()};
   }
+};
+
+struct GeneratedCandidate {
+  BlockCandidate candidate;
+  // Monotonic completion time captured by the collator.
+  // Zero means an older or synthetic producer did not provide the timestamp.
+  double collated_at_monotonic = 0.0;
+  td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages = {};
+
+  GeneratedCandidate clone() const {
+    return GeneratedCandidate{
+        .candidate = candidate.clone(),
+        .collated_at_monotonic = collated_at_monotonic,
+        .processed_external_messages = processed_external_messages,
+    };
+  }
+};
+
+struct BlockCandidatePriority {
+  td::uint32 round{};
+  td::uint32 first_block_round{};
+  td::int32 priority{};
 };
 
 struct ValidatorDescr {
@@ -450,35 +503,81 @@ struct ValidatorDescr {
   }
 };
 
-struct CatChainOptions {
-  double idle_timeout = 16.0;
-  td::uint32 max_deps = 4;
-  td::uint32 max_serialized_block_size = 16 * 1024;
-  bool block_hash_covers_data = false;
-  // Max block height = max_block_height_coeff * (1 + N / max_deps) / 1000
-  // N - number of participants
-  // 0 - unlimited
-  td::uint64 max_block_height_coeff = 0;
-
-  bool debug_disable_db = false;
-};
-
-struct ValidatorSessionConfig {
-  td::uint32 proto_version = 0;
-
-  CatChainOptions catchain_opts;
-
-  td::uint32 round_candidates = 3;
-  /* double */ double next_candidate_delay = 2.0;
-  td::uint32 round_attempt_duration = 16;
-  td::uint32 max_round_attempts = 4;
-
+struct NewConsensusConfig {
   td::uint32 max_block_size = (4 << 20);
   td::uint32 max_collated_data_size = (4 << 20);
 
-  bool new_catchain_ids = false;
+  td::uint32 protocol_version = 0;
+  td::uint32 slots_per_leader_window = 4;
 
-  static const td::uint32 BLOCK_HASH_COVERS_DATA_FROM_VERSION = 2;
+  bool enable_block_sync() const {
+    return protocol_version == 1;
+  }
+
+  bool use_new_db_names() const {
+    return protocol_version >= 2;
+  }
+
+  bool observers_in_private_overlay() const {
+    return protocol_version >= 2;
+  }
+
+  bool enable_plumtree_broadcast() const {
+    return protocol_version >= 2;
+  }
+
+  // When adding a new noncritical parameters, also add it to consensus.simplex.noncriticalParams TL scheme
+  // clang-format off
+#define ENUMERATE_NONCRITICAL_PARAMS(uint32_fn, double_fn, duration_fn) \
+  duration_fn(0, target_rate, 2'400)                                    \
+  duration_fn(1, first_block_timeout, 1'000)                            \
+  double_fn(2, first_block_timeout_multiplier, 1.2)                     \
+  duration_fn(3, first_block_timeout_cap, 100'000)                      \
+  duration_fn(4, candidate_resolve_timeout, 1'000)                      \
+  double_fn(5, candidate_resolve_timeout_multiplier, 1.2)               \
+  duration_fn(6, candidate_resolve_timeout_cap, 10'000)                 \
+  duration_fn(7, candidate_resolve_cooldown, 10)                        \
+  duration_fn(8, standstill_timeout, 10'000)                            \
+  uint32_fn(9, standstill_max_egress_bytes_per_s, 50 << 17)             \
+  uint32_fn(16, standstill_min_egress_bytes_per_s, 1 << 17)             \
+  uint32_fn(10, max_leader_window_desync, 250)                          \
+  duration_fn(11, bad_signature_ban_duration, 5'000)                    \
+  uint32_fn(12, candidate_resolve_rate_limit, 10)                       \
+  duration_fn(13, min_block_interval, 0)                                \
+  duration_fn(14, no_empty_blocks_on_error_timeout, 15'000)             \
+  uint32_fn(15, certificate_gossip_neighbors, 20)                       \
+  uint32_fn(17, collator_max_future_window, 4)                          \
+  duration_fn(18, collator_max_sync_delay, 10'000)
+  // clang-format on
+
+  struct NoncriticalParams {
+#define DEFINE_UINT32_FIELD(_, name, value) td::uint32 name = value;
+#define DEFINE_DOUBLE_FIELD(_, name, value) double name = value;
+#define DEFINE_DURATION_FIELD(_, name, value) std::chrono::milliseconds name{value};
+    ENUMERATE_NONCRITICAL_PARAMS(DEFINE_UINT32_FIELD, DEFINE_DOUBLE_FIELD, DEFINE_DURATION_FIELD)
+#undef DEFINE_UINT32_FIELD
+#undef DEFINE_DOUBLE_FIELD
+#undef DEFINE_DURATION_FIELD
+
+    bool operator==(const NoncriticalParams&) const = default;
+  };
+
+  NoncriticalParams noncritical_params = {};
+};
+
+struct PersistentStateDescription : public td::CntObject {
+  struct ShardBlock {
+    BlockIdExt block;
+    td::uint32 split_depth;
+  };
+
+  BlockIdExt masterchain_id;
+  std::vector<ShardBlock> shard_blocks;
+  UnixTime start_time, end_time;
+
+  virtual CntObject* make_copy() const {
+    return new PersistentStateDescription(*this);
+  }
 };
 
 }  // namespace ton

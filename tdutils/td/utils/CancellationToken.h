@@ -21,6 +21,8 @@
 #include <atomic>
 #include <memory>
 
+#include "Status.h"
+
 namespace td {
 
 namespace detail {
@@ -37,6 +39,12 @@ class CancellationToken {
       return false;
     }
     return token_->is_cancelled_.load(std::memory_order_acquire);
+  }
+  Status check() const {
+    if (*this) {
+      return Status::Error(653, "cancelled");  // cancelled = 653
+    }
+    return Status::OK();
   }
   CancellationToken() = default;
   explicit CancellationToken(std::shared_ptr<detail::RawCancellationToken> token) : token_(std::move(token)) {

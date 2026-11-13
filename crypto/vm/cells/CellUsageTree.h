@@ -18,12 +18,19 @@
 */
 #pragma once
 
-#include "vm/cells/CellTraits.h"
+#include <functional>
 
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
+#include "vm/cells/CellTraits.h"
 
 namespace vm {
+
+class Cell;
+class DataCell;
+struct LoadedCell;
+class MerkleUpdateLeftStat;
+
 class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
  public:
   using NodeId = td::uint32;
@@ -38,15 +45,20 @@ class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
       return node_id_ == 0 || tree_weak_.expired();
     }
 
-    bool on_load() const;
-    NodePtr create_child(unsigned ref_id) const;
+    bool on_load(const LoadedCell& loaded_cell) const;
+    NodePtr create_child(unsigned ref_id, td::Ref<Cell> cell) const;
     bool mark_path(CellUsageTree* master_tree) const;
     bool is_from_tree(const CellUsageTree* master_tree) const;
+    NodeId node_id() const {
+      return node_id_;
+    }
 
    private:
     std::weak_ptr<CellUsageTree> tree_weak_;
     NodeId node_id_{0};
   };
+
+  explicit CellUsageTree(td::Ref<Cell> root);
 
   NodePtr root_ptr();
   NodeId root_id() const;
@@ -54,22 +66,37 @@ class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
   bool has_mark(NodeId node_id) const;
   void set_mark(NodeId node_id, bool mark = true);
   void mark_path(NodeId node_id);
-  NodeId get_parent(NodeId node_id);
-  NodeId get_child(NodeId node_id, unsigned ref_id);
-  void set_use_mark_for_is_loaded(bool use_mark = true);
-  NodeId create_child(NodeId node_id, unsigned ref_id);
+  void add_path_to_proof_stat(NodeId node_id, MerkleUpdateLeftStat& stat);
+  NodeId get_parent(NodeId node_id) const;
+  NodeId get_child(NodeId node_id, unsigned ref_id) const;
+  NodeId create_child(NodeId node_id, unsigned ref_id, td::Ref<Cell> cell);
+
+  void set_cell_load_callback(std::function<void(const LoadedCell&)> f) {
+    cell_load_callback_ = std::move(f);
+  }
+  void set_ignore_loads(bool value) {
+    if (value) {
+      ++ignore_loads_;
+    } else {
+      --ignore_loads_;
+    }
+  }
 
  private:
   struct Node {
     bool is_loaded{false};
     bool has_mark{false};
+    bool has_stat_mark{false};
     NodeId parent{0};
     std::array<td::uint32, CellTraits::max_refs> children{};
+    td::Ref<Cell> cell;
+    unsigned merkle_depth = 0;
   };
-  bool use_mark_{false};
-  std::vector<Node> nodes_{2};
+  std::vector<Node> nodes_;
+  std::function<void(const LoadedCell&)> cell_load_callback_;
 
-  void on_load(NodeId node_id);
-  NodeId create_node(NodeId parent);
+  void on_load(NodeId node_id, const LoadedCell& loaded_cell);
+  NodeId create_node(NodeId parent_id, td::Ref<Cell> cell);
+  int ignore_loads_ = 0;
 };
 }  // namespace vm

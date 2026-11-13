@@ -16,9 +16,10 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "block-handle.hpp"
 #include "adnl/utils.hpp"
 #include "ton/ton-tl.hpp"
+
+#include "block-handle.hpp"
 
 namespace ton {
 
@@ -32,7 +33,8 @@ void BlockHandleImpl::flush(td::actor::ActorId<ValidatorManagerInterface> manage
 td::BufferSlice BlockHandleImpl::serialize() const {
   while (locked()) {
   }
-  auto flags = flags_.load(std::memory_order_consume) & ~(Flags::dbf_processed | Flags::dbf_moved_handle);
+  auto flags = flags_.load(std::memory_order_consume) &
+               ~(Flags::dbf_processed | Flags::dbf_moved_handle | Flags::dbf_applied_stored);
   return create_serialize_tl_object<ton_api::db_block_info>(
       create_tl_block_id(id_), flags, (flags & dbf_inited_prev_left) ? create_tl_block_id(prev_[0]) : nullptr,
       (flags & dbf_inited_prev_right) ? create_tl_block_id(prev_[1]) : nullptr,
@@ -44,7 +46,7 @@ td::BufferSlice BlockHandleImpl::serialize() const {
 
 BlockHandleImpl::BlockHandleImpl(td::Slice data) {
   auto obj = fetch_tl_object<ton_api::db_block_info>(data, true).move_as_ok();
-  flags_ = obj->flags_ & ~(Flags::dbf_processed | Flags::dbf_moved_handle);
+  flags_ = obj->flags_ & ~(Flags::dbf_processed | Flags::dbf_moved_handle | Flags::dbf_applied_stored);
   id_ = create_block_id(obj->id_);
   prev_[0] = (flags_ & dbf_inited_prev_left) ? create_block_id(obj->prev_left_) : BlockIdExt{};
   prev_[1] = (flags_ & dbf_inited_prev_right) ? create_block_id(obj->prev_right_) : BlockIdExt{};

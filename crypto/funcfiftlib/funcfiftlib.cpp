@@ -25,55 +25,55 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "func/func.h"
-#include "git.h"
-#include "td/utils/JsonBuilder.h"
-#include "fift/utils.h"
-#include "td/utils/base64.h"
-#include "td/utils/Status.h"
-#include <sstream>
 #include <iomanip>
+#include <sstream>
 
-td::Result<std::string> compile_internal(char *config_json) {
+#include "fift/utils.h"
+#include "func/func.h"
+#include "td/utils/JsonBuilder.h"
+#include "td/utils/Status.h"
+#include "td/utils/base64.h"
+#include "vm/boc.h"
+
+#include "git.h"
+
+td::Result<std::string> compile_internal(char* config_json) {
   TRY_RESULT(input_json, td::json_decode(td::MutableSlice(config_json)))
-  auto &obj = input_json.get_object();
+  td::JsonObject& config = input_json.get_object();
 
-  TRY_RESULT(opt_level, td::get_json_object_int_field(obj, "optLevel", false));
-  TRY_RESULT(sources_obj, td::get_json_object_field(obj, "sources", td::JsonValue::Type::Array, false));
+  TRY_RESULT(opt_level, config.get_required_int_field("optLevel"));
+  TRY_RESULT(sources_obj, config.extract_required_field("sources", td::JsonValue::Type::Array));
 
-  auto &sources_arr = sources_obj.get_array();
+  auto& sources_arr = sources_obj.get_array();
 
   std::vector<std::string> sources;
 
-  for (auto &item : sources_arr) {
+  for (auto& item : sources_arr) {
     sources.push_back(item.get_string().str());
   }
 
   funC::opt_level = std::max(0, opt_level);
   funC::program_envelope = true;
+  funC::asm_preamble = true;
   funC::verbosity = 0;
   funC::indent = 1;
 
   std::ostringstream outs, errs;
-  auto compile_res = funC::func_proceed(sources, outs, errs);
-
-  if (compile_res != 0) {
-    return td::Status::Error(std::string("Func compilation error: ") + errs.str());
+  int funC_res = funC::func_proceed(sources, outs, errs);
+  if (funC_res != 0) {
+    return td::Status::Error("FunC compilation error: " + errs.str());
   }
 
-  TRY_RESULT(code_cell, fift::compile_asm(outs.str(), "/fiftlib/", false));
-  TRY_RESULT(boc, vm::std_boc_serialize(code_cell));
+  std::string fift_code = outs.str();
+  TRY_RESULT(fift_res, fift::compile_asm_program(fift_code, "/fiftlib/"));
 
   td::JsonBuilder result_json;
-  auto result_obj = result_json.enter_object();
-  result_obj("status", "ok");
-  result_obj("codeBoc", td::base64_encode(boc));
-  result_obj("fiftCode", outs.str());
-  result_obj("codeHashHex", code_cell->get_hash().to_hex());
-  result_obj.leave();
-
-  outs.clear();
-  errs.clear();
+  auto obj = result_json.enter_object();
+  obj("status", "ok");
+  obj("fiftCode", std::move(fift_code));
+  obj("codeBoc", std::move(fift_res.codeBoc64));
+  obj("codeHashHex", std::move(fift_res.codeHashHex));
+  obj.leave();
 
   return result_json.string_builder().as_cslice().str();
 }
@@ -90,13 +90,12 @@ td::Result<std::string> compile_internal(char *config_json) {
 /// said storage after func_compile returns.
 ///
 /// If the callback is not supported, *o_contents and *o_error must be set to NULL.
-typedef void (*CStyleReadFileCallback)(char const* _kind, char const* _data, char** o_contents, char** o_error);
+typedef void (*CStyleReadFileCallback)(const char* _kind, const char* _data, char** o_contents, char** o_error);
 
-funC::ReadCallback::Callback wrapReadCallback(CStyleReadFileCallback _readCallback)
-{
+funC::ReadCallback::Callback wrapReadCallback(CStyleReadFileCallback _readCallback) {
   funC::ReadCallback::Callback readCallback;
   if (_readCallback) {
-    readCallback = [=](funC::ReadCallback::Kind _kind, char const* _data) -> td::Result<std::string> {
+    readCallback = [=](funC::ReadCallback::Kind _kind, const char* _data) -> td::Result<std::string> {
       char* contents_c = nullptr;
       char* error_c = nullptr;
       _readCallback(funC::ReadCallback::kindString(_kind).data(), _data, &contents_c, &error_c);
@@ -124,7 +123,7 @@ const char* version() {
   return strdup(version_json.string_builder().as_cslice().c_str());
 }
 
-const char *func_compile(char *config_json, CStyleReadFileCallback callback) {
+const char* func_compile(char* config_json, CStyleReadFileCallback callback) {
   if (callback) {
     funC::read_callback = wrapReadCallback(callback);
   } else {

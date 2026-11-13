@@ -1,0 +1,317 @@
+/*
+ * Copyright (c) 2025-2026, TON CORE TECHNOLOGIES CO. L.L.C
+ *
+ * SPDX-License-Identifier: LGPL-2.0-or-later
+ */
+
+#include "auto/tl/ton_api.hpp"
+#include "keys/encryptor.h"
+#include "td/utils/overloaded.h"
+
+#include "bus.h"
+#include "checksum.h"
+#include "payload.h"
+
+namespace ton::validator::consensus {
+
+const PeerValidator& PeerValidatorId::get_using(const Bus& bus) const {
+  return bus.validator_set[idx_];
+}
+
+td::StringBuilder& operator<<(td::StringBuilder& stream, const PeerValidatorId& id) {
+  return stream << "validator " << id.value();
+}
+
+bool check_consensus_signature(const PublicKey& key, ValidatorSessionId session, td::Slice data, td::Slice signature) {
+  auto signed_data = create_serialize_tl_object<tl::dataToSign>(session, td::BufferSlice(data));
+  TD_PERF_COUNTER(check_signature_consensus);
+  auto encryptor = key.create_encryptor();
+  if (encryptor.is_error()) {
+    return false;
+  }
+  return encryptor.move_as_ok()->check_signature(signed_data, signature).is_ok();
+}
+
+bool PeerValidator::check_signature(ValidatorSessionId session, td::Slice data, td::Slice signature) const {
+  return check_consensus_signature(key, session, data, signature);
+}
+
+td::StringBuilder& operator<<(td::StringBuilder& stream, const PeerValidator& peer_validator) {
+  return stream << peer_validator.idx << " (id " << peer_validator.short_id << " adnl " << peer_validator.adnl_id
+                << ")";
+}
+
+CandidateId CandidateId::from_tl(const tl::CandidateIdRef& tl_parent) {
+  return CandidateId{static_cast<td::uint32>(tl_parent->slot_), tl_parent->hash_};
+}
+
+tl::CandidateIdRef CandidateId::to_tl() const {
+  return create_tl_object<tl::candidateId>(slot, hash);
+}
+
+td::StringBuilder& operator<<(td::StringBuilder& stream, const CandidateId& id) {
+  return stream << "{" << id.slot << ", " << id.hash << ", ?}";
+}
+
+td::StringBuilder& operator<<(td::StringBuilder& stream, const ParentId& id) {
+  if (id.has_value()) {
+    return stream << *id;
+  } else {
+    return stream << "consensus genesis";
+  }
+}
+
+tl::CandidateParentRef CandidateId::parent_id_to_tl(ParentId parent) {
+  if (!parent) {
+    return create_tl_object<tl::candidateWithoutParents>();
+  } else {
+    return create_tl_object<tl::candidateParent>(parent->to_tl());
+  }
+}
+
+ParentId CandidateId::tl_to_parent_id(const tl::CandidateParentRef& tl_parent) {
+  ParentId id;
+  auto without_parents_fn = [&](const tl::candidateWithoutParents&) {};
+  auto parent_fn = [&](const tl::candidateParent& parent) { id = CandidateId::from_tl(parent.id_); };
+  ton_api::downcast_call(*tl_parent, td::overloaded(without_parents_fn, parent_fn));
+  return id;
+}
+
+CandidateHashData CandidateHashData::from_tl(tl::CandidateHashData&& data) {
+  CandidateHashData builder;
+
+  auto empty_fn = [&](const tl::candidateHashDataEmpty& empty) {
+    builder = CandidateHashData::create_empty(create_block_id(empty.block_), CandidateId::from_tl(empty.parent_));
+  };
+  auto ordinary_fn = [&](const tl::candidateHashDataOrdinary& full) {
+    FullCandidate candidate{create_block_id(full.block_), full.collated_file_hash_};
+    builder = CandidateHashData::create_full(candidate, CandidateId::tl_to_parent_id(full.parent_));
+  };
+  ton_api::downcast_call(data, td::overloaded(empty_fn, ordinary_fn));
+
+  return builder;
+}
+
+BlockIdExt CandidateHashData::block() const {
+  auto empty_fn = [&](const EmptyCandidate& empty) { return empty.reference; };
+  auto full_fn = [&](const FullCandidate& full) { return full.id; };
+  return std::visit(td::overloaded(empty_fn, full_fn), candidate);
+}
+
+CandidateId CandidateHashData::build_id_with(td::uint32 slot) const {
+  return CandidateId{slot, get_tl_object_sha_bits256(to_tl())};
+}
+
+tl::CandidateHashDataRef CandidateHashData::to_tl() const {
+  auto empty_fn = [&](const EmptyCandidate& empty) -> tl::CandidateHashDataRef {
+    return create_tl_object<tl::candidateHashDataEmpty>(create_tl_block_id(empty.reference), parent->to_tl());
+  };
+  auto full_fn = [&](const FullCandidate& full) -> tl::CandidateHashDataRef {
+    return create_tl_object<tl::candidateHashDataOrdinary>(create_tl_block_id(full.id), full.collated_file_hash,
+                                                           CandidateId::parent_id_to_tl(parent));
+  };
+  return std::visit(td::overloaded(empty_fn, full_fn), candidate);
+}
+
+td::Status check_delegation(const Delegation& delegation, const PeerValidator& leader, td::uint32 slot,
+                            const Bus& bus) {
+  auto collator_id = adnl::AdnlNodeIdShort{delegation.collator_key.compute_short_id()};
+  td::uint32 window_start = slot - slot % bus.config.slots_per_leader_window;
+  auto to_sign = create_serialize_tl_object<tl::delegationToSign>(window_start, collator_id.bits256_value());
+  if (!leader.check_signature(bus.session_id, to_sign, delegation.signature)) {
+    return td::Status::Error("Delegation signature is not valid");
+  }
+  return td::Status::OK();
+}
+
+std::optional<Delegation> Delegation::from_tl(tl::DelegationRef tl_delegation) {
+  if (!tl_delegation) {
+    return std::nullopt;
+  }
+  return Delegation{PublicKey{tl_delegation->collator_key_}, std::move(tl_delegation->signature_)};
+}
+
+tl::DelegationRef Delegation::to_tl() const {
+  return create_tl_object<tl::delegation>(collator_key.tl(), signature.clone());
+}
+
+td::Result<CandidateRef> Candidate::deserialize(td::Slice data, const Bus& bus,
+                                                std::optional<td::uint32> expected_slot) {
+  if (auto maybe_broadcast = fetch_tl_object<tl::CandidateData>(data, true); maybe_broadcast.is_ok()) {
+    return deserialize_data(maybe_broadcast.move_as_ok(), std::nullopt, bus, std::nullopt, expected_slot);
+  }
+  TRY_RESULT(wrapper, fetch_tl_object<tl::candidate>(data, true));
+  return deserialize_data(std::move(wrapper->data_), Delegation::from_tl(std::move(wrapper->delegation_)), bus,
+                          std::nullopt, expected_slot);
+}
+
+td::Result<CandidateRef> Candidate::deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
+                                                               td::uint32 expected_slot) {
+  TRY_RESULT(broadcast, fetch_tl_object<tl::CandidateData>(data, true));
+  auto validator_fn = [&](PeerValidatorId validator) {
+    return deserialize_data(std::move(broadcast), std::nullopt, bus, validator, expected_slot);
+  };
+  auto delegation_fn = [&](Delegation delegation) {
+    return deserialize_data(std::move(broadcast), std::move(delegation), bus, std::nullopt, expected_slot);
+  };
+  return std::visit(td::overloaded(validator_fn, delegation_fn), std::move(signer));
+}
+
+td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadcast,
+                                                     std::optional<Delegation> delegation, const Bus& bus,
+                                                     std::optional<PeerValidatorId> src,
+                                                     std::optional<td::uint32> expected_slot) {
+  struct ExtractedData {
+    td::uint32 slot;
+    ParentId parent_id;
+    std::variant<BlockIdExt, BlockCandidate> block;
+    td::BufferSlice signature;
+    CandidateHashData hash_builder;
+  };
+  td::Result<ExtractedData> maybe_data;
+
+  PeerValidator leader;
+  auto set_check_leader = [&](td::uint32 slot) -> td::Status {
+    if (expected_slot.has_value() && expected_slot != slot) {
+      return td::Status::Error("Candidate broadcast has unexpected slot");
+    }
+    leader = bus.collator_schedule->expected_collator_for(slot).get_using(bus);
+    if (leader.idx != src.value_or(leader.idx)) {
+      return td::Status::Error("Candidate broadcast source does not match expected leader");
+    }
+    return td::Status::OK();
+  };
+
+  auto empty_fn = [&](tl::empty& empty_broadcast) -> td::Result<ExtractedData> {
+    auto slot = static_cast<td::uint32>(empty_broadcast.slot_);
+    TRY_STATUS(set_check_leader(slot));
+
+    auto block = create_block_id(empty_broadcast.block_);
+    auto parent = CandidateId::from_tl(empty_broadcast.parent_);
+    return ExtractedData{
+        .slot = slot,
+        .parent_id = parent,
+        .block = block,
+        .signature = std::move(empty_broadcast.signature_),
+        .hash_builder = CandidateHashData::create_empty(block, parent),
+    };
+  };
+
+  auto ordinary_fn = [&](tl::block& block_broadcast) -> td::Result<ExtractedData> {
+    auto slot = static_cast<td::uint32>(block_broadcast.slot_);
+    TRY_STATUS(set_check_leader(slot));
+
+    TRY_RESULT(candidate, deserialize_payload(block_broadcast.candidate_,
+                                              bus.config.max_block_size + bus.config.max_collated_data_size + 1024));
+
+    if (!candidate->src_.is_zero()) {
+      return td::Status::Error("src field of the candidate broadcast must be null");
+    }
+
+    if (candidate->data_.size() > bus.config.max_block_size ||
+        candidate->collated_data_.size() > bus.config.max_collated_data_size) {
+      return td::Status::Error(PSTRING() << "Too big candidate broadcast with data_size=" << candidate->data_.size()
+                                         << ", collated_data_size=" << candidate->collated_data_.size());
+    }
+
+    BlockIdExt block_id{
+        BlockId{bus.shard, static_cast<BlockSeqno>(candidate->round_)},
+        candidate->root_hash_,
+        td::sha256_bits256(candidate->data_.as_slice()),
+    };
+
+    auto collated_file_hash = td::sha256_bits256(candidate->collated_data_.as_slice());
+
+    Ed25519_PublicKey creator{leader.key.ed25519_value().raw()};
+
+    BlockCandidate block{
+        creator, block_id, collated_file_hash, std::move(candidate->data_), std::move(candidate->collated_data_),
+    };
+
+    auto parent = CandidateId::tl_to_parent_id(block_broadcast.parent_);
+    auto hash_builder = CandidateHashData::create_full(block, parent);
+    return ExtractedData{
+        .slot = slot,
+        .parent_id = parent,
+        .block = std::move(block),
+        .signature = std::move(block_broadcast.signature_),
+        .hash_builder = hash_builder,
+    };
+  };
+
+  ton_api::downcast_call(*broadcast,
+                         [&](auto& broadcast) { maybe_data = td::overloaded(empty_fn, ordinary_fn)(broadcast); });
+  TRY_RESULT(parsed, std::move(maybe_data));
+
+  auto id = parsed.hash_builder.build_id_with(parsed.slot);
+  auto signed_data = serialize_tl_object(id.to_tl(), true);
+
+  if (delegation.has_value()) {
+    TRY_STATUS(check_delegation(*delegation, leader, parsed.slot, bus));
+    if (!check_consensus_signature(delegation->collator_key, bus.session_id, signed_data, parsed.signature)) {
+      return td::Status::Error("Delegated candidate broadcast signature is not valid");
+    }
+  } else if (!leader.check_signature(bus.session_id, signed_data, parsed.signature)) {
+    return td::Status::Error("Candidate broadcast signature is not valid");
+  }
+
+  return td::make_ref<Candidate>(id, parsed.parent_id, leader.idx, std::move(parsed.block), std::move(parsed.signature),
+                                 std::move(delegation));
+}
+
+BlockIdExt Candidate::block_id() const {
+  auto empty_fn = [&](const BlockIdExt& referenced_block) { return referenced_block; };
+  auto full_fn = [&](const BlockCandidate& candidate) { return candidate.id; };
+  return std::visit(td::overloaded(empty_fn, full_fn), block);
+}
+
+CandidateHashData Candidate::hash_data() const {
+  auto empty_fn = [&](const BlockIdExt& referenced_block) {
+    return CandidateHashData::create_empty(referenced_block, parent_id.value());
+  };
+  auto block_fn = [&](const BlockCandidate& candidate) { return CandidateHashData::create_full(candidate, parent_id); };
+  return std::visit(td::overloaded(empty_fn, block_fn), block);
+}
+
+tl::CandidateDataRef Candidate::to_data_tl() const {
+  auto empty_fn = [&](const BlockIdExt& referenced_block) -> tl::CandidateDataRef {
+    return create_tl_object<tl::empty>(id.slot, parent_id->to_tl(), create_tl_block_id(referenced_block),
+                                       signature.clone());
+  };
+  auto block_fn = [&](const BlockCandidate& candidate) -> tl::CandidateDataRef {
+    auto candidate_tl = create_tl_object<ton_api::validatorSession_candidate>(
+        td::Bits256{}, candidate.id.seqno(), candidate.id.root_hash, candidate.data.clone(),
+        candidate.collated_data.clone());
+
+    return create_tl_object<tl::block>(id.slot, CandidateId::parent_id_to_tl(parent_id),
+                                       serialize_payload(candidate_tl).move_as_ok(), signature.clone());
+  };
+  return std::visit(td::overloaded(empty_fn, block_fn), block);
+}
+
+td::BufferSlice Candidate::serialize() const {
+  if (!delegation.has_value()) {
+    return serialize_for_broadcast();
+  }
+  return create_serialize_tl_object<tl::candidate>(1, to_data_tl(), delegation->to_tl());
+}
+
+td::BufferSlice Candidate::serialize_for_broadcast() const {
+  return serialize_tl_object(to_data_tl(), true);
+}
+
+bool Candidate::is_empty() const {
+  return std::holds_alternative<BlockIdExt>(block);
+}
+
+adnl::AdnlNodeIdShort Candidate::collated_by(const Bus& bus) const {
+  if (delegation) {
+    return adnl::AdnlNodeIdShort{delegation->collator_key.compute_short_id()};
+  }
+  return leader.get_using(bus).adnl_id;
+}
+
+stats::Event::Event() : ts_(td::Clocks::system()), monotonic_ts_(td::Timestamp::now().at()) {
+}
+
+}  // namespace ton::validator::consensus

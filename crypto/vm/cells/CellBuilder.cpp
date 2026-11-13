@@ -16,15 +16,12 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "openssl/digest.hpp"
+#include "td/utils/format.h"
+#include "td/utils/misc.h"
 #include "vm/cells/CellBuilder.h"
-
 #include "vm/cells/CellSlice.h"
 #include "vm/cells/DataCell.h"
-
-#include "td/utils/misc.h"
-#include "td/utils/format.h"
-
-#include "openssl/digest.hpp"
 
 namespace vm {
 
@@ -32,9 +29,9 @@ using td::Ref;
 using td::RefAny;
 
 /*
- * 
+ *
  *   CELL BUILDERS
- * 
+ *
  */
 
 CellBuilder::~CellBuilder() {
@@ -45,12 +42,13 @@ CellBuilder::CellBuilder() : bits(0), refs_cnt(0) {
   get_thread_safe_counter().add(+1);
 }
 
-Ref<DataCell> CellBuilder::finalize_copy(bool special) const {
+Ref<DataCell> CellBuilder::finalize_copy(bool special, DataCell::HashHint hash_hint) const {
   auto* vm_state_interface = VmStateInterface::get();
   if (vm_state_interface) {
     vm_state_interface->register_cell_create();
   }
-  auto res = DataCell::create(data, size(), td::span(refs.data(), size_refs()), special);
+  auto res = DataCell::create(td::Slice{data, Cell::max_bytes}, size(), td::span(refs.data(), size_refs()), special,
+                              std::move(hash_hint));
   if (res.is_error()) {
     LOG(DEBUG) << res.error();
     throw CellWriteError{};
@@ -67,14 +65,15 @@ Ref<DataCell> CellBuilder::finalize_copy(bool special) const {
   return cell;
 }
 
-td::Result<Ref<DataCell>> CellBuilder::finalize_novm_nothrow(bool special) {
-  auto res = DataCell::create(data, size(), td::mutable_span(refs.data(), size_refs()), special);
+td::Result<Ref<DataCell>> CellBuilder::finalize_novm_nothrow(bool special, DataCell::HashHint hash_hint) {
+  auto res = DataCell::create(td::Slice{data, Cell::max_bytes}, size(), td::mutable_span(refs.data(), size_refs()),
+                              special, std::move(hash_hint));
   bits = refs_cnt = 0;
   return res;
 }
 
-Ref<DataCell> CellBuilder::finalize_novm(bool special) {
-  auto res = finalize_novm_nothrow(special);
+Ref<DataCell> CellBuilder::finalize_novm(bool special, DataCell::HashHint hash_hint) {
+  auto res = finalize_novm_nothrow(special, std::move(hash_hint));
   if (res.is_error()) {
     LOG(DEBUG) << res.error();
     throw CellWriteError{};
@@ -83,13 +82,13 @@ Ref<DataCell> CellBuilder::finalize_novm(bool special) {
   return res.move_as_ok();
 }
 
-Ref<DataCell> CellBuilder::finalize(bool special) {
+Ref<DataCell> CellBuilder::finalize(bool special, DataCell::HashHint hash_hint) {
   auto* vm_state_interface = VmStateInterface::get();
   if (!vm_state_interface) {
-    return finalize_novm(special);
+    return finalize_novm(special, std::move(hash_hint));
   }
   vm_state_interface->register_cell_create();
-  auto cell = finalize_novm(special);
+  auto cell = finalize_novm(special, std::move(hash_hint));
   vm_state_interface->register_new_cell(cell);
   if (cell.is_null()) {
     LOG(DEBUG) << "cannot register new data cell";
@@ -99,9 +98,10 @@ Ref<DataCell> CellBuilder::finalize(bool special) {
 }
 
 Ref<Cell> CellBuilder::create_pruned_branch(Ref<Cell> cell, td::uint32 new_level, td::uint32 virt_level) {
-  if (cell->is_loaded() && cell->get_level() <= virt_level && cell->get_virtualization() == 0) {
+  if (cell->is_loaded() && cell->get_level() <= virt_level && !cell->is_virtualized()) {
     CellSlice cs(NoVm{}, cell);
-    if (cs.size_refs() == 0) {
+    if (cs.size_refs() == 0 && (cs.size() <= 8 + 16 + 256 || cs.get_cell_level() > 0)) {
+      // Return original cell if it has no refs and has no more bits than pruned branch
       return cell;
     }
   }
@@ -312,7 +312,7 @@ bool CellBuilder::store_long_bool(long long val, unsigned val_bits) {
 }
 
 bool CellBuilder::store_long_rchk_bool(long long val, unsigned val_bits) {
-  if (val_bits > 64 || !can_extend_by(val_bits)) {
+  if (val_bits == 0 || val_bits > 64 || !can_extend_by(val_bits)) {
     return false;
   }
   if (val_bits < 64 && (val < static_cast<long long>(std::numeric_limits<td::uint64>::max() << (val_bits - 1)) ||
@@ -617,7 +617,7 @@ std::string CellBuilder::to_hex() const {
   int len = serialize(buff, sizeof(buff));
   char hex_buff[Cell::max_serialized_bytes * 2 + 1];
   for (int i = 0; i < len; i++) {
-    sprintf(hex_buff + 2 * i, "%02x", buff[i]);
+    snprintf(hex_buff + 2 * i, sizeof(hex_buff) - 2 * i, "%02x", buff[i]);
   }
   return hex_buff;
 }

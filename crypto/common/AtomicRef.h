@@ -18,10 +18,11 @@
 */
 #pragma once
 
-#include "td/utils/SpinLock.h"
-#include "common/refcnt.hpp"
-
+#include <limits>
 #include <type_traits>
+
+#include "common/refcnt.hpp"
+#include "td/utils/SpinLock.h"
 
 namespace td {
 template <class T>
@@ -168,6 +169,11 @@ class AtomicRefLockfree {
     if (ptr.ptr()) {
       Ref<T>::release_shared(ptr.ptr(), ptr.ref_cnt() + 1);
     }
+  }
+
+  void store(const Ref<T>& ref) {
+    Ref<T> copy = ref;
+    store(std::move(copy));
   }
 
  private:

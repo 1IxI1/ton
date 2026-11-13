@@ -17,18 +17,18 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include <vector>
-#include <string>
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <ostream>
 #include <sstream>
-#include <cassert>
-#include "common/bitstring.h"
+#include <string>
+#include <vector>
 
-#include "td/utils/bits.h"
+#include "common/bitstring.h"
 #include "td/utils/Span.h"
+#include "td/utils/bits.h"
 #include "td/utils/uint128.h"
 
 /**************************************
@@ -2294,11 +2294,11 @@ std::string AnyIntView<Tr>::to_dec_string_destroy_any() {
     stack.push_back(divmod_short_any(Tr::max_pow10));
   } while (sgn());
   char slice[word_bits * 97879 / 325147 + 2];
-  std::sprintf(slice, "%lld", stack.back());
+  std::snprintf(slice, sizeof(slice), "%lld", stack.back());
   s += slice;
   stack.pop_back();
   while (stack.size()) {
-    std::sprintf(slice, "%018lld", stack.back());
+    std::snprintf(slice, sizeof(slice), "%018lld", stack.back());
     s += slice;
     stack.pop_back();
   }

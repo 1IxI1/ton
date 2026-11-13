@@ -17,12 +17,13 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include "common/refcnt.hpp"
-#include <utility>
 #include <array>
-#include <string>
-#include <ostream>
 #include <cstdlib>
+#include <ostream>
+#include <string>
+#include <utility>
+
+#include "common/refcnt.hpp"
 #include "td/utils/bits.h"
 
 namespace td {
@@ -58,7 +59,7 @@ unsigned long long bits_load_long_top(ConstBitPtr from, unsigned top_bits);
 long long bits_load_long(ConstBitPtr from, unsigned bits);
 unsigned long long bits_load_ulong(ConstBitPtr from, unsigned bits);
 long parse_bitstring_hex_literal(unsigned char* buff, std::size_t buff_size, const char* str, const char* str_end);
-long parse_bitstring_binary_literal(BitPtr buff, std::size_t buff_size, const char* str, const char* str_end);
+long parse_bitstring_binary_literal(BitPtr buff, std::size_t buff_size_bits, const char* str, const char* str_end);
 
 void bits_sha256(BitPtr to, ConstBitPtr from, std::size_t size);
 
@@ -284,7 +285,7 @@ class BitSliceGen {
     ensure_throw(set_size_bool(bits));
     return *this;
   }
-  BitSliceGen subslice(unsigned from, unsigned bits) const & {
+  BitSliceGen subslice(unsigned from, unsigned bits) const& {
     return BitSliceGen(*this, from, bits);
   }
   BitSliceGen subslice(unsigned from, unsigned bits) && {
@@ -554,11 +555,7 @@ class BitArray {
     set_same(0);
   }
   void set_zero_s() {
-    volatile uint8* p = data();
-    auto x = m;
-    while (x--) {
-      *p++ = 0;
-    }
+    as_slice().fill_zero_secure();
   }
   void set_ones() {
     set_same(1);

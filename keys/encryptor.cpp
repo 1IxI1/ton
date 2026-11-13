@@ -16,40 +16,17 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "auto/tl/ton_api.hpp"
+#include "common/errorcode.h"
+#include "common/status.h"
 #include "td/utils/crypto.h"
 #include "td/utils/overloaded.h"
 
 #include "encryptor.h"
 #include "encryptor.hpp"
-#include "auto/tl/ton_api.hpp"
-
-#include "common/status.h"
-#include "common/errorcode.h"
 #include "keys.hpp"
 
 namespace ton {
-
-td::Result<std::unique_ptr<Encryptor>> Encryptor::create(const ton_api::PublicKey *id) {
-  td::Result<std::unique_ptr<Encryptor>> res;
-  ton_api::downcast_call(
-      *const_cast<ton_api::PublicKey *>(id),
-      td::overloaded([&](const ton_api::pub_unenc &obj) { res = std::make_unique<EncryptorNone>(); },
-                     [&](const ton_api::pub_ed25519 &obj) { res = std::make_unique<EncryptorEd25519>(obj.key_); },
-                     [&](const ton_api::pub_overlay &obj) { res = std::make_unique<EncryptorOverlay>(); },
-                     [&](const ton_api::pub_aes &obj) { res = std::make_unique<EncryptorAES>(obj.key_); }));
-  return res;
-}
-
-td::Result<std::unique_ptr<Decryptor>> Decryptor::create(const ton_api::PrivateKey *id) {
-  td::Result<std::unique_ptr<Decryptor>> res;
-  ton_api::downcast_call(
-      *const_cast<ton_api::PrivateKey *>(id),
-      td::overloaded([&](const ton_api::pk_unenc &obj) { res = std::make_unique<DecryptorNone>(); },
-                     [&](const ton_api::pk_ed25519 &obj) { res = std::make_unique<DecryptorEd25519>(obj.key_); },
-                     [&](const ton_api::pk_overlay &obj) { res = std::make_unique<DecryptorFail>(); },
-                     [&](const ton_api::pk_aes &obj) { res = std::make_unique<DecryptorAES>(obj.key_); }));
-  return res;
-}
 
 td::Result<td::BufferSlice> EncryptorEd25519::encrypt(td::Slice data) {
   TRY_RESULT_PREFIX(pk, td::Ed25519::generate_private_key(), "failed to generate private key: ");
@@ -124,7 +101,7 @@ td::Result<td::BufferSlice> DecryptorEd25519::decrypt(td::Slice data) {
   ctr.encrypt(data, res.as_slice());
 
   td::UInt256 real_digest;
-  td::sha256(res.as_slice(), as_slice(real_digest));
+  td::sha256(res.as_slice(), as_mutable_slice(real_digest));
 
   if (as_slice(real_digest) != digest) {
     return td::Status::Error(ErrorCode::protoviolation, "sha256 mismatch after decryption");
@@ -184,7 +161,7 @@ td::Result<td::BufferSlice> DecryptorAES::decrypt(td::Slice data) {
   ctr.encrypt(data, res.as_slice());
 
   td::UInt256 real_digest;
-  td::sha256(res.as_slice(), as_slice(real_digest));
+  td::sha256(res.as_slice(), as_mutable_slice(real_digest));
 
   if (as_slice(real_digest) != digest) {
     return td::Status::Error(ErrorCode::protoviolation, "sha256 mismatch after decryption");

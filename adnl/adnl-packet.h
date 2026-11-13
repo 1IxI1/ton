@@ -18,37 +18,37 @@
 */
 #pragma once
 
-#include "adnl/adnl.h"
 #include "adnl/adnl-message.h"
+#include "adnl/adnl.h"
 
 namespace ton {
 
 namespace adnl {
 
 /*
-  from:flags.0?PublicKey 
+  from:flags.0?PublicKey
   from_short:flags.1?adnl.id.short
-  message:flags.2?adnl.Message 
+  message:flags.2?adnl.Message
   messages:flags.3?(vector adnl.Message)
-  address:flags.4?adnl.addressList 
+  address:flags.4?adnl.addressList
   priority_address:flags.5?adnl.addressList
-  seqno:flags.6?long 
-  confirm_seqno:flags.7?long 
+  seqno:flags.6?long
+  confirm_seqno:flags.7?long
   recv_addr_list_version:flags.8?int
   recv_priority_addr_list_version:flags.9?int
-  reinit_date:flags.10?int 
+  reinit_date:flags.10?int
   dst_reinit_date:flags.10?int
-  signature:flags.11?bytes 
+  signature:flags.11?bytes
   */
 
 // total packet length:
 //   for full packet:
-//     32 (dst) + 64 (encryption overhead) + 4 (magic) + 36 (pubkey) + 4 + M (sum of messages) +
+//     32 (dst) + 64 (encryption overhead) + 4 (magic) + 4 (flags) + 36 (pubkey) + 4 + M (sum of messages) +
 //              + A1 + A2 + 8 + 8 + 4 + 4 + 4 + 4 + 68 (signature) + 16 (r1) + 16 (r2) =
-//              = 272 + M + A1 + A2
+//              = 276 + M + A1 + A2
 //   for channel:
-//     32 (channel id) + 32 (encryption overhead) + 4 (magic) + 4 + M (sum of messages) +
-//              + A1 + A2 + 8 + 8 + 4 + 4 + 16(r1) + 16(r2) = 128 + M + A1 + A2
+//     32 (channel id) + 32 (encryption overhead) + 4 (magic) + 4 (flags) + 4 + M (sum of messages) +
+//              + A1 + A2 + 8 + 8 + 4 + 4 + 16(r1) + 16(r2) = 132 + M + A1 + A2
 
 class AdnlPacket {
  private:

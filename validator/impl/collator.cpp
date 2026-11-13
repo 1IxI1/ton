@@ -16,85 +16,113 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "collator-impl.h"
-#include "vm/boc.h"
-#include "td/db/utils/BlobView.h"
-#include "vm/db/StaticBagOfCellsDb.h"
-#include "block/mc-config.h"
-#include "block/block.h"
-#include "block/block-parse.h"
-#include "block/block-auto.h"
-#include "vm/dict.h"
-#include "crypto/openssl/rand.hpp"
-#include "ton/ton-shard.h"
-#include "adnl/utils.hpp"
-#include <cassert>
 #include <algorithm>
-#include "fabric.h"
-#include "validator-set.hpp"
-#include "top-shard-descr.hpp"
+#include <cassert>
 #include <ctime>
+
+#include "adnl/utils.hpp"
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+#include "block/block.h"
+#include "block/mc-config.h"
+#include "block/validator-set.h"
+#include "crypto/openssl/rand.hpp"
+#include "td/actor/SharedFuture.h"
+#include "td/db/utils/BlobView.h"
 #include "td/utils/Random.h"
+#include "ton/ton-io.hpp"
+#include "ton/ton-shard.h"
+#include "vm/boc.h"
+#include "vm/db/StaticBagOfCellsDb.h"
+#include "vm/dict.h"
+
+#include "collator-impl.h"
+#include "fabric.h"
+#include "storage-stat-cache.hpp"
+#include "top-shard-descr.hpp"
+
+#define FAIL_UNLESS_MSG(condition, msg) \
+  if (!(condition)) {                   \
+    fatal_error(msg);                   \
+    return {};                          \
+  }
+#define FAIL_UNLESS(condition) \
+  FAIL_UNLESS_MSG(condition, PSTRING() << "Check failed at line " << __LINE__ << ": " << #condition)
+
+#define FAIL_UNLESS_ERRCODE_MSG(condition, err, msg) \
+  if (!(condition)) {                                \
+    fatal_error(msg);                                \
+    return (err);                                    \
+  }
+#define FAIL_UNLESS_ERRCODE(condition, err) \
+  FAIL_UNLESS_ERRCODE_MSG(condition, err, PSTRING() << "Check failed at line " << __LINE__ << ": " << #condition)
+
+#define FAIL_UNLESS_MSG_VOID(condition, msg) \
+  if (!(condition)) {                        \
+    fatal_error(msg);                        \
+    return;                                  \
+  }
+#define FAIL_UNLESS_VOID(condition) \
+  FAIL_UNLESS_MSG_VOID(condition, PSTRING() << "Check failed at line " << __LINE__ << ": " << #condition)
 
 namespace ton {
-
-int collator_settings = 0;
 
 namespace validator {
 using td::Ref;
 using namespace std::literals::string_literals;
 
 // Don't increase MERGE_MAX_QUEUE_LIMIT too much: merging requires cleaning the whole queue in out_msg_queue_cleanup
-static const td::uint32 FORCE_SPLIT_QUEUE_SIZE = 4096;
-static const td::uint32 SPLIT_MAX_QUEUE_SIZE = 100000;
-static const td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
-static const td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
+static constexpr td::uint32 FORCE_SPLIT_QUEUE_SIZE = 4096;
+static constexpr td::uint32 SPLIT_MAX_QUEUE_SIZE = 100000;
+static constexpr td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
+static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
+static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
 
-#define DBG(__n) dbg(__n)&&
-#define DSTART int __dcnt = 0;
-#define DEB DBG(++__dcnt)
-
-static inline bool dbg(int c) TD_UNUSED;
-static inline bool dbg(int c) {
-  std::cerr << '[' << (char)('0' + c / 10) << (char)('0' + c % 10) << ']';
-  return true;
-}
+static constexpr int MAX_ATTEMPTS = 5;
 
 /**
  * Constructs a Collator object.
  *
- * @param shard The shard of the new block.
- * @param is_hardfork A boolean indicating whether the new block is a hardfork.
- * @param min_ts The minimum UnixTime for the new block.
- * @param min_masterchain_block_id The the minimum reference masterchain block.
- * @param prev A vector of BlockIdExt representing the previous blocks.
- * @param validator_set A reference to the ValidatorSet.
- * @param collator_id The public key of the block creator.
+ * @param params Collator parameters
  * @param manager The ActorId of the ValidatorManager.
- * @param timeout The timeout for the collator.
+ * @param cancellation_token Token to cancel collation.
  * @param promise The promise to return the result.
  */
-Collator::Collator(ShardIdFull shard, bool is_hardfork, UnixTime min_ts, BlockIdExt min_masterchain_block_id,
-                   std::vector<BlockIdExt> prev, td::Ref<ValidatorSet> validator_set, Ed25519_PublicKey collator_id,
-                   td::actor::ActorId<ValidatorManager> manager, td::Timestamp timeout,
-                   td::Promise<BlockCandidate> promise)
-    : shard_(shard)
-    , is_hardfork_(is_hardfork)
-    , min_ts(min_ts)
-    , min_mc_block_id{min_masterchain_block_id}
-    , prev_blocks(std::move(prev))
-    , created_by_(collator_id)
-    , validator_set_(std::move(validator_set))
+Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> manager,
+                   td::CancellationToken cancellation_token, td::Promise<GeneratedCandidate> promise)
+    : params_(std::move(params))
+    , shard_(params_.shard)
+    , prev_blocks(params_.prev)
     , manager(manager)
-    , timeout(timeout)
+    , timeout_(params_.hard_timeout)
     // default timeout is 10 seconds, declared in validator/validator-group.cpp:generate_block_candidate:run_collate_query
-    , queue_cleanup_timeout_(td::Timestamp::at(timeout.at() - 5.0))
-    , soft_timeout_(td::Timestamp::at(timeout.at() - 3.0))
-    , medium_timeout_(td::Timestamp::at(timeout.at() - 1.5))
     , main_promise(std::move(promise))
-    , perf_timer_("collate", 0.1, [manager](double duration) {
-      send_closure(manager, &ValidatorManager::add_perf_timer_stat, "collate", duration);
-    }) {
+    , perf_timer_("collate", 0.1,
+                  [manager](double duration) {
+                    send_closure(manager, &ValidatorManager::add_perf_timer_stat, "collate", duration);
+                  })
+    , cancellation_token_(std::move(cancellation_token)) {
+  stats_.shard = shard_;
+  if (params_.collator_opts.is_null()) {
+    params_.collator_opts = Ref<CollatorOptions>{true};
+  }
+  if (params_.rand_seed) {
+    rand_seed_ = params_.rand_seed.value();
+  }
+  if (!params_.soft_timeout) {
+    params_.soft_timeout = params_.hard_timeout;
+  }
+  if (params_.wait_externals_until) {
+    queue_cleanup_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
+    internal_msg_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
+    external_msg_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
+  } else {
+    double t = params_.soft_timeout.in();
+    queue_cleanup_timeout_ = td::Timestamp::in(t * 0.25);
+    internal_msg_timeout_ = td::Timestamp::in(t * 0.5);
+    external_msg_timeout_ = td::Timestamp::in(t * 0.75);
+  }
+  processed_external_messages_ = params_.processed_external_messages;
 }
 
 /**
@@ -106,12 +134,16 @@ Collator::Collator(ShardIdFull shard, bool is_hardfork, UnixTime min_ts, BlockId
  * The results of these queries are handled by corresponding callback functions.
  */
 void Collator::start_up() {
-  LOG(WARNING) << "Collator for shard " << shard_.to_str() << " started";
-  LOG(DEBUG) << "Previous block #1 is " << prev_blocks.at(0).to_str();
-  if (prev_blocks.size() > 1) {
-    LOG(DEBUG) << "Previous block #2 is " << prev_blocks.at(1).to_str();
+  LOG(WARNING) << "Collator for shard " << shard_ << " started"
+               << (params_.attempt_idx ? PSTRING() << " (attempt #" << params_.attempt_idx << ")" : "");
+  if (!check_cancelled()) {
+    return;
   }
-  if (is_hardfork_ && workchain() == masterchainId) {
+  LOG(DEBUG) << "Previous block #1 is " << prev_blocks.at(0);
+  if (prev_blocks.size() > 1) {
+    LOG(DEBUG) << "Previous block #2 is " << prev_blocks.at(1);
+  }
+  if (params_.is_hardfork && workchain() == masterchainId) {
     is_key_block_ = true;
   }
   // 1. check validity of parameters, especially prev_blocks, shard and min_mc_block_id
@@ -136,7 +168,7 @@ void Collator::start_up() {
     fatal_error(-666, "sub-shards cannot exist in the masterchain");
     return;
   }
-  if (!ShardIdFull(min_mc_block_id).is_masterchain_ext()) {
+  if (!ShardIdFull(params_.min_masterchain_block_id).is_masterchain_ext()) {
     fatal_error(-666, "requested minimal masterchain block id does not belong to masterchain");
     return;
   }
@@ -166,9 +198,9 @@ void Collator::start_up() {
       }
     }
     after_merge_ = true;
-    LOG(INFO) << "AFTER_MERGE set for the new block of " << shard_.to_str();
+    LOG(INFO) << "AFTER_MERGE set for the new block of " << shard_;
   } else {
-    CHECK(prev_blocks.size() == 1);
+    FAIL_UNLESS_VOID(prev_blocks.size() == 1);
     // creating next block
     if (!ShardIdFull(prev_blocks[0]).is_valid_ext()) {
       fatal_error(-666, "previous block does not have a valid id");
@@ -177,7 +209,7 @@ void Collator::start_up() {
     if (ShardIdFull(prev_blocks[0]) != shard_) {
       after_split_ = true;
       right_child_ = ton::is_right_child(shard_);
-      LOG(INFO) << "AFTER_SPLIT set for the new block of " << shard_.to_str() << " (generating "
+      LOG(INFO) << "AFTER_SPLIT set for the new block of " << shard_ << " (generating "
                 << (right_child_ ? "right" : "left") << " child)";
       if (!shard_is_parent(ShardIdFull(prev_blocks[0]), shard_)) {
         fatal_error(-666, "previous block does not belong to the shard we are generating a new block for");
@@ -188,7 +220,7 @@ void Collator::start_up() {
         return;
       }
     }
-    if (is_masterchain() && min_mc_block_id.seqno() > prev_blocks[0].seqno()) {
+    if (is_masterchain() && params_.min_masterchain_block_id.seqno() > prev_blocks[0].seqno()) {
       fatal_error(-666,
                   "cannot refer to specified masterchain block because it is later than the immediately preceding "
                   "masterchain block");
@@ -197,85 +229,99 @@ void Collator::start_up() {
   }
   busy_ = true;
   step = 1;
-  if (!is_masterchain()) {
-    // 2. learn latest masterchain state and block id
-    LOG(DEBUG) << "sending get_top_masterchain_state_block() to Manager";
-    ++pending;
-    if (!is_hardfork_) {
-      td::actor::send_closure_later(manager, &ValidatorManager::get_top_masterchain_state_block,
-                                    [self = get_self()](td::Result<std::pair<Ref<MasterchainState>, BlockIdExt>> res) {
-                                      LOG(DEBUG) << "got answer to get_top_masterchain_state_block";
-                                      td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state,
-                                                                    std::move(res));
-                                    });
-    } else {
-      td::actor::send_closure_later(
-          manager, &ValidatorManager::get_shard_state_from_db_short, min_mc_block_id,
-          [self = get_self(), block_id = min_mc_block_id](td::Result<Ref<ShardState>> res) {
-            LOG(DEBUG) << "got answer to get_top_masterchain_state_block";
-            if (res.is_error()) {
-              td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state, res.move_as_error());
-            } else {
-              td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state,
-                                            std::make_pair(Ref<MasterchainState>(res.move_as_ok()), block_id));
-            }
-          });
-    }
-  }
-  // 3. load previous block(s) and corresponding state(s)
+  // 2. load previous block(s) and corresponding state(s)
   prev_states.resize(prev_blocks.size());
   prev_block_data.resize(prev_blocks.size());
-  for (int i = 0; (unsigned)i < prev_blocks.size(); i++) {
-    // 3.1. load state
-    LOG(DEBUG) << "sending wait_block_state() query #" << i << " for " << prev_blocks[i].to_str() << " to Manager";
-    ++pending;
-    td::actor::send_closure_later(manager, &ValidatorManager::wait_block_state_short, prev_blocks[i], priority(),
-                                  timeout, [self = get_self(), i](td::Result<Ref<ShardState>> res) {
-                                    LOG(DEBUG) << "got answer to wait_block_state query #" << i;
-                                    td::actor::send_closure_later(std::move(self), &Collator::after_get_shard_state, i,
-                                                                  std::move(res));
-                                  });
-    if (prev_blocks[i].seqno()) {
-      // 3.2. load block
-      // NB: we need the block itself only for extracting start_lt and end_lt to create correct prev_blk:ExtBlkRef and related Merkle proofs
-      LOG(DEBUG) << "sending wait_block_data() query #" << i << " for " << prev_blocks[i].to_str() << " to Manager";
-      ++pending;
-      td::actor::send_closure_later(manager, &ValidatorManager::wait_block_data_short, prev_blocks[i], priority(),
-                                    timeout, [self = get_self(), i](td::Result<Ref<BlockData>> res) {
-                                      LOG(DEBUG) << "got answer to wait_block_data query #" << i;
-                                      td::actor::send_closure_later(std::move(self), &Collator::after_get_block_data, i,
-                                                                    std::move(res));
-                                    });
-    }
-  }
-  if (is_hardfork_) {
+  load_prev_states_blocks();
+  if (params_.is_hardfork) {
     LOG(WARNING) << "generating a hardfork block";
   }
-  // 4. load external messages
-  if (!is_hardfork_) {
-    LOG(DEBUG) << "sending get_external_messages() query to Manager";
+  // 3. install external message queue
+  if (!params_.is_hardfork) {
+    LOG(DEBUG) << "installing external message queue";
+    ext_msg_queue_ = ExtMsgQueue("ext_msg_queue", 500);
+    auto callback = std::make_unique<ExtMsgCallback>();
+    callback->shard = shard_;
+    callback->cancellation_token = ext_msg_cancellation_.get_cancellation_token();
+    callback->timeout = params_.wait_externals_until ? params_.wait_externals_until : td::Timestamp::now();
+    callback->sync_only = !params_.wait_externals_until;
+    callback->queue = ext_msg_queue_;
+    td::actor::send_closure_later(manager, &ValidatorManager::get_external_messages, shard_, std::move(callback));
+  }
+  if (is_masterchain() && !params_.is_hardfork) {
+    // 4. load shard block info messages
+    LOG(DEBUG) << "sending get_shard_blocks_for_collator() query to Manager";
     ++pending;
-    td::actor::send_closure_later(manager, &ValidatorManager::get_external_messages, shard_,
-                                  [self = get_self()](td::Result<std::vector<Ref<ExtMessage>>> res) -> void {
-                                    LOG(DEBUG) << "got answer to get_external_messages() query";
-                                    td::actor::send_closure_later(
-                                        std::move(self), &Collator::after_get_external_messages, std::move(res));
+    auto token = perf_log_.start_action("get_shard_blocks_for_collator");
+    td::actor::send_closure_later(manager, &ValidatorManager::get_shard_blocks_for_collator, prev_blocks[0],
+                                  [self = get_self(), token = std::move(token)](
+                                      td::Result<std::vector<Ref<ShardTopBlockDescription>>> res) mutable -> void {
+                                    LOG(DEBUG) << "got answer to get_shard_blocks_for_collator() query";
+                                    td::actor::send_closure_later(std::move(self), &Collator::after_get_shard_blocks,
+                                                                  std::move(res), std::move(token));
                                   });
   }
-  if (is_masterchain() && !is_hardfork_) {
-    // 5. load shard block info messages
-    LOG(DEBUG) << "sending get_shard_blocks() query to Manager";
-    ++pending;
-    td::actor::send_closure_later(
-        manager, &ValidatorManager::get_shard_blocks, prev_blocks[0],
-        [self = get_self()](td::Result<std::vector<Ref<ShardTopBlockDescription>>> res) -> void {
-          LOG(DEBUG) << "got answer to get_shard_blocks() query";
-          td::actor::send_closure_later(std::move(self), &Collator::after_get_shard_blocks, std::move(res));
-        });
-  }
+  // 5. get storage stat cache
+  ++pending;
+  LOG(DEBUG) << "sending get_storage_stat_cache() query to Manager";
+  td::actor::send_closure_later(manager, &ValidatorManager::get_storage_stat_cache,
+                                [self = get_self(), token = perf_log_.start_action("get_storage_stat_cache")](
+                                    td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res) mutable {
+                                  LOG(DEBUG) << "got answer to get_storage_stat_cache() query";
+                                  td::actor::send_closure_later(std::move(self),
+                                                                &Collator::after_get_storage_stat_cache, std::move(res),
+                                                                std::move(token));
+                                });
   // 6. set timeout
-  alarm_timestamp() = timeout;
-  CHECK(pending);
+  alarm_timestamp() = timeout_;
+  FAIL_UNLESS_VOID(pending);
+}
+
+/**
+ * Load previous states and blocks from DB
+ */
+void Collator::load_prev_states_blocks() {
+  FAIL_UNLESS_VOID(params_.prev_block_data.empty() || params_.prev_block_data.size() == prev_blocks.size());
+  FAIL_UNLESS_VOID(params_.prev_block_state_roots.empty() ||
+                   params_.prev_block_state_roots.size() == prev_blocks.size());
+  for (int i = 0; (unsigned)i < prev_blocks.size(); i++) {
+    // 3.1. load state
+    ++pending;
+    ++pending_prev_states_;
+    if (params_.prev_block_state_roots.empty()) {
+      LOG(DEBUG) << "sending wait_block_state() query #" << i << " for " << prev_blocks[i] << " to Manager";
+      auto token = perf_log_.start_action(PSTRING() << "wait_block_state #" << i);
+      td::actor::send_closure_later(
+          manager, &ValidatorManager::wait_block_state_short, prev_blocks[i], priority(), timeout_, false,
+          [self = get_self(), i, token = std::move(token)](td::Result<Ref<ShardState>> res) mutable {
+            LOG(DEBUG) << "got answer to wait_block_state query #" << i;
+            td::actor::send_closure_later(std::move(self), &Collator::after_get_shard_state, i, std::move(res),
+                                          std::move(token));
+          });
+    } else {
+      td::actor::send_closure_later(actor_id(this), &Collator::after_get_shard_state, i,
+                                    validator::create_shard_state(prev_blocks[i], params_.prev_block_state_roots[i]),
+                                    td::PerfLogAction{});
+    }
+    if (prev_blocks[i].seqno()) {
+      // 3.2. load block
+      ++pending;
+      if (params_.prev_block_data.empty()) {
+        LOG(DEBUG) << "sending wait_block_data() query #" << i << " for " << prev_blocks[i] << " to Manager";
+        auto token = perf_log_.start_action(PSTRING() << "wait_block_data #" << i);
+        td::actor::send_closure_later(
+            manager, &ValidatorManager::wait_block_data_short, prev_blocks[i], priority(), timeout_,
+            [self = get_self(), i, token = std::move(token)](td::Result<Ref<BlockData>> res) mutable {
+              LOG(DEBUG) << "got answer to wait_block_data query #" << i;
+              td::actor::send_closure_later(std::move(self), &Collator::after_get_block_data, i, std::move(res),
+                                            std::move(token));
+            });
+      } else {
+        td::actor::send_closure_later(actor_id(this), &Collator::after_get_block_data, i, params_.prev_block_data[i],
+                                      td::PerfLogAction{});
+      }
+    }
+  }
 }
 
 /**
@@ -340,7 +386,18 @@ bool Collator::fatal_error(td::Status error) {
   error.ensure_error();
   LOG(ERROR) << "cannot generate block candidate for " << show_shard(shard_) << " : " << error.to_string();
   if (busy_) {
-    main_promise(std::move(error));
+    failed_with_ = error.clone();
+    if (allow_repeat_collation_ && error.code() != ErrorCode::cancelled && params_.attempt_idx + 1 < MAX_ATTEMPTS &&
+        !params_.is_hardfork && !timeout_.is_in_past()) {
+      CollateParams new_params = params_;
+      ++new_params.attempt_idx;
+      LOG(WARNING) << "Repeating collation (attempt #" << new_params.attempt_idx << ")";
+      run_collate_query(std::move(new_params), manager, std::move(cancellation_token_), std::move(main_promise));
+    } else {
+      LOG(INFO) << "collation failed in " << perf_timer_.elapsed() << " s " << error;
+      LOG(INFO) << perf_log_;
+      main_promise.set_error(std::move(error));
+    }
     busy_ = false;
   }
   stop();
@@ -372,6 +429,28 @@ bool Collator::fatal_error(std::string err_msg, int err_code) {
 }
 
 /**
+ * Releases external message resources and reports a failed attempt, if there was one.
+ *
+ * A failed attempt is reported from here rather than from fatal_error() because fatal_error() is
+ * frequently called from inside ScopedRealCpuTimer scopes, which only fold into stats_ once they
+ * unwind; by tear_down() time the whole handler stack is gone, so the failing phase is included.
+ * A retry is a complete failed attempt for observability purposes, and reporting the whole query
+ * preserves its elapsed/real/CPU time, detailed phases and external-message outcomes -- the older
+ * external-only retry report discarded exactly the expensive attempt operators need to diagnose
+ * overload. log_collate_query_stats owns external accounting too, so there is no separate report.
+ */
+void Collator::tear_down() {
+  ext_msg_cancellation_.cancel();
+  ext_msg_queue_.close();
+  if (!failed_with_) {
+    return;
+  }
+  finalize_stats();
+  stats_.status = failed_with_->clone();
+  td::actor::send_closure(manager, &ValidatorManager::log_collate_query_stats, std::move(stats_));
+}
+
+/**
  * Checks if there are any pending tasks.
  *
  * If there are no pending tasks, it continues collation.
@@ -382,13 +461,16 @@ bool Collator::fatal_error(std::string err_msg, int err_code) {
  */
 void Collator::check_pending() {
   // LOG(DEBUG) << "pending = " << pending;
+  if (!check_cancelled()) {
+    return;
+  }
   if (!pending) {
     step = 2;
     try {
       if (!try_collate()) {
         fatal_error("cannot create new block");
       }
-    } catch (vm::VmError vme) {
+    } catch (vm::VmError& vme) {
       fatal_error(td::Status::Error(PSLICE() << vme.get_msg()));
     }
   }
@@ -453,15 +535,17 @@ bool Collator::request_aux_mc_state(BlockSeqno seqno, Ref<MasterchainStateQ>& st
     return fatal_error(PSTRING() << "cannot find masterchain block with seqno " << seqno
                                  << " to load corresponding state as required");
   }
-  CHECK(blkid.is_valid_ext() && blkid.is_masterchain());
-  LOG(DEBUG) << "sending auxiliary wait_block_state() query for " << blkid.to_str() << " to Manager";
+  FAIL_UNLESS(blkid.is_valid_ext() && blkid.is_masterchain());
+  LOG(DEBUG) << "sending auxiliary wait_block_state() query for " << blkid << " to Manager";
   ++pending;
-  td::actor::send_closure_later(manager, &ValidatorManager::wait_block_state_short, blkid, priority(), timeout,
-                                [self = get_self(), blkid](td::Result<Ref<ShardState>> res) {
-                                  LOG(DEBUG) << "got answer to wait_block_state query for " << blkid.to_str();
-                                  td::actor::send_closure_later(std::move(self), &Collator::after_get_aux_shard_state,
-                                                                blkid, std::move(res));
-                                });
+  auto token = perf_log_.start_action(PSTRING() << "auxiliary wait_block_state " << blkid.seqno());
+  td::actor::send_closure_later(
+      manager, &ValidatorManager::wait_block_state_short, blkid, priority(), timeout_, false,
+      [self = get_self(), blkid, token = std::move(token)](td::Result<Ref<ShardState>> res) mutable {
+        LOG(DEBUG) << "got answer to wait_block_state query for " << blkid;
+        td::actor::send_closure_later(std::move(self), &Collator::after_get_aux_shard_state, blkid, std::move(res),
+                                      std::move(token));
+      });
   state.clear();
   return true;
 }
@@ -489,9 +573,11 @@ Ref<MasterchainStateQ> Collator::get_aux_mc_state(BlockSeqno seqno) const {
  * @param blkid The BlockIdExt of the shard state.
  * @param res The result of retrieving the shard state.
  */
-void Collator::after_get_aux_shard_state(ton::BlockIdExt blkid, td::Result<Ref<ShardState>> res) {
-  LOG(DEBUG) << "in Collator::after_get_aux_shard_state(" << blkid.to_str() << ")";
+void Collator::after_get_aux_shard_state(ton::BlockIdExt blkid, td::Result<Ref<ShardState>> res,
+                                         td::PerfLogAction token) {
+  LOG(DEBUG) << "in Collator::after_get_aux_shard_state(" << blkid << ")";
   --pending;
+  token.finish(res);
   if (res.is_error()) {
     fatal_error("cannot load auxiliary masterchain state for "s + blkid.to_str() + " : " +
                 res.move_as_error().to_string());
@@ -530,7 +616,7 @@ bool Collator::preprocess_prev_mc_state() {
   if (!ShardIdFull(mc_block_id_).is_masterchain_ext()) {
     return fatal_error(-666, "invalid last masterchain block id");
   }
-  if (mc_block_id_.seqno() < min_mc_block_id.seqno()) {
+  if (mc_block_id_.seqno() < params_.min_masterchain_block_id.seqno()) {
     return fatal_error(-666, "requested to create a block referring to a non-existent future masterchain block");
   }
   if (mc_block_id_ != mc_state_->get_block_id()) {
@@ -551,11 +637,13 @@ bool Collator::preprocess_prev_mc_state() {
 /**
  * Callback function called after retrieving the Masterchain state.
  *
- * @param res The retreived masterchain state.
+ * @param res The retrieved masterchain state.
  */
-void Collator::after_get_mc_state(td::Result<std::pair<Ref<MasterchainState>, BlockIdExt>> res) {
+void Collator::after_get_mc_state(td::Result<std::pair<Ref<MasterchainState>, BlockIdExt>> res,
+                                  td::PerfLogAction token) {
   LOG(WARNING) << "in Collator::after_get_mc_state()";
   --pending;
+  token.finish(res);
   if (res.is_error()) {
     fatal_error(res.move_as_error());
     return;
@@ -570,14 +658,16 @@ void Collator::after_get_mc_state(td::Result<std::pair<Ref<MasterchainState>, Bl
   if (mc_block_id_.seqno()) {
     // load most recent masterchain block itself
     // NB. it is needed only for creating a correct ExtBlkRef reference to it, which requires start_lt and end_lt
-    LOG(DEBUG) << "sending wait_block_data() query #-1 for " << mc_block_id_.to_str() << " to Manager";
+    LOG(DEBUG) << "sending wait_block_data() query #-1 for " << mc_block_id_ << " to Manager";
     ++pending;
-    td::actor::send_closure_later(manager, &ValidatorManager::wait_block_data_short, mc_block_id_, priority(), timeout,
-                                  [self = get_self()](td::Result<Ref<BlockData>> res) {
-                                    LOG(DEBUG) << "got answer to wait_block_data query #-1";
-                                    td::actor::send_closure_later(std::move(self), &Collator::after_get_block_data, -1,
-                                                                  std::move(res));
-                                  });
+    auto token = perf_log_.start_action("wait_block_data #-1");
+    td::actor::send_closure_later(
+        manager, &ValidatorManager::wait_block_data_short, mc_block_id_, priority(), timeout_,
+        [self = get_self(), token = std::move(token)](td::Result<Ref<BlockData>> res) mutable {
+          LOG(DEBUG) << "got answer to wait_block_data query #-1";
+          td::actor::send_closure_later(std::move(self), &Collator::after_get_block_data, -1, std::move(res),
+                                        std::move(token));
+        });
   }
   check_pending();
 }
@@ -588,42 +678,119 @@ void Collator::after_get_mc_state(td::Result<std::pair<Ref<MasterchainState>, Bl
  * @param idx The index of the previous shard block (0 or 1).
  * @param res The retrieved shard state.
  */
-void Collator::after_get_shard_state(int idx, td::Result<Ref<ShardState>> res) {
+void Collator::after_get_shard_state(int idx, td::Result<Ref<ShardState>> res, td::PerfLogAction token) {
   LOG(WARNING) << "in Collator::after_get_shard_state(" << idx << ")";
   --pending;
+  --pending_prev_states_;
+  token.finish(res);
   if (res.is_error()) {
     fatal_error(res.move_as_error());
     return;
   }
   // got state of previous block #i
-  CHECK((unsigned)idx < prev_blocks.size());
+  FAIL_UNLESS_VOID((unsigned)idx < prev_blocks.size());
   prev_states.at(idx) = res.move_as_ok();
-  CHECK(prev_states[idx].not_null());
-  CHECK(prev_states[idx]->get_shard() == ShardIdFull(prev_blocks[idx]));
-  CHECK(prev_states[idx]->root_cell().not_null());
+  FAIL_UNLESS_VOID(prev_states[idx].not_null());
+  FAIL_UNLESS_VOID(prev_states[idx]->get_shard() == ShardIdFull(prev_blocks[idx]));
+  FAIL_UNLESS_VOID(prev_states[idx]->root_cell().not_null());
   if (is_masterchain()) {
-    CHECK(!idx);
+    FAIL_UNLESS_VOID(!idx);
     mc_block_id_ = prev_blocks[0];
     prev_mc_block_seqno = mc_block_id_.seqno();
-    CHECK(ShardIdFull(mc_block_id_).is_masterchain_ext());
+    FAIL_UNLESS_VOID(ShardIdFull(mc_block_id_).is_masterchain_ext());
     mc_state_ = static_cast<Ref<MasterchainStateQ>>(prev_states[0]);
     mc_state_root = mc_state_->root_cell();
     if (!preprocess_prev_mc_state()) {
       return;
     }
+  } else if (pending_prev_states_ == 0) {
+    BlockIdExt prev_mc_ref;
+    for (size_t i = 0; i < prev_states.size(); ++i) {
+      auto block_id = prev_states[i]->get_master_ref();
+      if (block_id && (!prev_mc_ref.is_masterchain() || prev_mc_ref.seqno() < block_id.value().seqno())) {
+        prev_mc_ref = block_id.value();
+      }
+    }
+    request_top_masterchain_state(prev_mc_ref);
   }
   check_pending();
+}
+
+/**
+ * Request top masterchain block from manager.
+ * Make sure that it is not earlier than parent's mc ref and min_mc_block_id.
+ *
+ * @param prev_mc_ref Masterchain block referenced from the previous block.
+ */
+void Collator::request_top_masterchain_state(BlockIdExt prev_mc_ref) {
+  FAIL_UNLESS_VOID(!is_masterchain());
+  LOG(DEBUG) << "sending get_top_masterchain_state_block() to Manager";
+  ++pending;
+  auto token = perf_log_.start_action("get_top_masterchain_state_block");
+  if (params_.is_hardfork) {
+    td::actor::send_closure_later(
+        manager, &ValidatorManager::get_shard_state_from_db_short, params_.min_masterchain_block_id,
+        [self = get_self(), block_id = params_.min_masterchain_block_id,
+         token = std::move(token)](td::Result<Ref<ShardState>> res) mutable {
+          LOG(DEBUG) << "got answer to get_top_masterchain_state_block";
+          if (res.is_error()) {
+            td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state, res.move_as_error(),
+                                          std::move(token));
+          } else {
+            td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state,
+                                          std::make_pair(Ref<MasterchainState>(res.move_as_ok()), block_id),
+                                          std::move(token));
+          }
+        });
+    return;
+  }
+
+  BlockIdExt min_block_id = params_.min_masterchain_block_id;
+  if (prev_mc_ref.is_masterchain() && prev_mc_ref.seqno() > min_block_id.seqno()) {
+    min_block_id = prev_mc_ref;
+  }
+  td::actor::send_closure_later(
+      manager, &ValidatorManager::wait_block_state_short, min_block_id, priority(), timeout_, false,
+      [self = get_self(), manager = manager, token = std::move(token)](td::Result<Ref<ShardState>> res) mutable {
+        if (res.is_error()) {
+          td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state, res.move_as_error(),
+                                        std::move(token));
+          return;
+        }
+
+        td::Ref<MasterchainState> ref_state{res.move_as_ok()};
+
+        td::actor::send_closure_later(
+            manager, &ValidatorManager::get_top_masterchain_state,
+            [self, token = std::move(token),
+             ref_state = std::move(ref_state)](td::Result<Ref<MasterchainState>> res) mutable {
+              LOG(DEBUG) << "got answer to get_top_masterchain_state_block";
+              if (res.is_error()) {
+                td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state, res.move_as_error(),
+                                              std::move(token));
+                return;
+              }
+
+              auto top_state = res.move_as_ok();
+              if (ref_state->get_seqno() > top_state->get_seqno()) {
+                top_state = ref_state;
+              }
+              td::actor::send_closure_later(std::move(self), &Collator::after_get_mc_state,
+                                            std::pair{top_state, top_state->get_block_id()}, std::move(token));
+            });
+      });
 }
 
 /**
  * Callback function called after retrieving block data for a previous block.
  *
  * @param idx The index of the previous block (0 or 1).
- * @param res The retreived block data.
+ * @param res The retrieved block data.
  */
-void Collator::after_get_block_data(int idx, td::Result<Ref<BlockData>> res) {
+void Collator::after_get_block_data(int idx, td::Result<Ref<BlockData>> res, td::PerfLogAction token) {
   LOG(DEBUG) << "in Collator::after_get_block_data(" << idx << ")";
   --pending;
+  token.finish(res);
   if (res.is_error()) {
     fatal_error(res.move_as_error());
     return;
@@ -631,22 +798,30 @@ void Collator::after_get_block_data(int idx, td::Result<Ref<BlockData>> res) {
   if (idx == -1) {
     // loaded last masterchain block
     prev_mc_block = res.move_as_ok();
-    CHECK(prev_mc_block.not_null());
-    CHECK(prev_mc_block->block_id() == mc_block_id_);
+    FAIL_UNLESS_VOID(prev_mc_block.not_null());
+    FAIL_UNLESS_VOID(prev_mc_block->block_id() == mc_block_id_);
     mc_block_root = prev_mc_block->root_cell();
-    CHECK(mc_block_root.not_null());
-    CHECK(!is_masterchain());
+    FAIL_UNLESS_VOID(mc_block_root.not_null());
+    FAIL_UNLESS_VOID(!is_masterchain());
   } else {
     // got previous block #i
-    CHECK((unsigned)idx < prev_blocks.size());
+    FAIL_UNLESS_VOID((unsigned)idx < prev_blocks.size());
     prev_block_data.at(idx) = res.move_as_ok();
-    CHECK(prev_block_data[idx].not_null());
-    CHECK(prev_block_data[idx]->block_id() == prev_blocks[idx]);
-    CHECK(prev_block_data[idx]->root_cell().not_null());
+    FAIL_UNLESS_VOID(prev_block_data[idx].not_null());
+    FAIL_UNLESS_VOID(prev_block_data[idx]->block_id() == prev_blocks[idx]);
+    FAIL_UNLESS_VOID(prev_block_data[idx]->root_cell().not_null());
     if (is_masterchain()) {
-      CHECK(!idx);
+      FAIL_UNLESS_VOID(!idx);
       prev_mc_block = prev_block_data[0];
       mc_block_root = prev_mc_block->root_cell();
+    } else {
+      Ref<vm::Cell> root = prev_block_data[idx]->root_cell();
+      auto proof = create_block_state_proof(root);
+      if (proof.is_error()) {
+        fatal_error(proof.move_as_error());
+        return;
+      }
+      block_state_proofs_.emplace(root->get_hash().bits(), proof.move_as_ok());
     }
   }
   check_pending();
@@ -657,8 +832,10 @@ void Collator::after_get_block_data(int idx, td::Result<Ref<BlockData>> res) {
  *
  * @param res The retrieved shard block descriptions.
  */
-void Collator::after_get_shard_blocks(td::Result<std::vector<Ref<ShardTopBlockDescription>>> res) {
+void Collator::after_get_shard_blocks(td::Result<std::vector<Ref<ShardTopBlockDescription>>> res,
+                                      td::PerfLogAction token) {
   --pending;
+  token.finish(res);
   if (res.is_error()) {
     fatal_error(res.move_as_error());
     return;
@@ -670,13 +847,31 @@ void Collator::after_get_shard_blocks(td::Result<std::vector<Ref<ShardTopBlockDe
 }
 
 /**
+ * Callback function called after retrieving storage stat cache.
+ *
+ * @param res The retrieved storage stat cache.
+ */
+void Collator::after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res,
+                                            td::PerfLogAction token) {
+  --pending;
+  token.finish(res);
+  if (res.is_error()) {
+    LOG(INFO) << "after_get_storage_stat_cache : " << res.error();
+  } else {
+    LOG(DEBUG) << "after_get_storage_stat_cache : OK";
+    storage_stat_cache_ = res.move_as_ok();
+  }
+  check_pending();
+}
+
+/**
  * Unpacks the last masterchain state and initializes the Collator object with the extracted configuration.
  *
  * @returns True if the unpacking and initialization is successful, false otherwise.
  */
 bool Collator::unpack_last_mc_state() {
   auto res = block::ConfigInfo::extract_config(
-      mc_state_root,
+      mc_state_root, mc_block_id_,
       block::ConfigInfo::needShardHashes | block::ConfigInfo::needLibraries | block::ConfigInfo::needValidatorSet |
           block::ConfigInfo::needWorkchainInfo | block::ConfigInfo::needCapabilities |
           block::ConfigInfo::needPrevBlocks |
@@ -687,13 +882,20 @@ bool Collator::unpack_last_mc_state() {
     return fatal_error(std::move(err));
   }
   config_ = res.move_as_ok();
-  CHECK(config_);
-  config_->set_block_id_ext(mc_block_id_);
+  FAIL_UNLESS(config_);
   global_id_ = config_->get_global_blockchain_id();
+  global_version_ = config_->get_global_version();
   ihr_enabled_ = config_->ihr_enabled();
   create_stats_enabled_ = config_->create_stats_enabled();
   report_version_ = config_->has_capability(ton::capReportVersion);
   short_dequeue_records_ = config_->has_capability(ton::capShortDequeue);
+  store_out_msg_queue_size_ = config_->has_capability(ton::capStoreOutMsgQueueSize);
+  msg_metadata_enabled_ = config_->has_capability(ton::capMsgMetadata);
+  deferring_messages_enabled_ = config_->has_capability(ton::capDeferMessages);
+  allow_same_timestamp_ = global_version_ >= 13;
+  store_dispatch_queue_balance_ = global_version_ >= 16;
+  full_collated_data_ = config_->has_capability(capFullCollatedData) || params_.collator_opts->force_full_collated_data;
+  LOG(DEBUG) << "full_collated_data is " << full_collated_data_;
   shard_conf_ = std::make_unique<block::ShardConfig>(*config_);
   prev_key_block_exists_ = config_->get_last_key_block(prev_key_block_, prev_key_block_lt_);
   if (prev_key_block_exists_) {
@@ -701,18 +903,48 @@ bool Collator::unpack_last_mc_state() {
   } else {
     prev_key_block_seqno_ = 0;
   }
-  LOG(DEBUG) << "previous key block is " << prev_key_block_.to_str() << " (exists=" << prev_key_block_exists_ << ")";
-  vert_seqno_ = config_->get_vert_seqno() + (is_hardfork_ ? 1 : 0);
+  LOG(DEBUG) << "previous key block is " << prev_key_block_ << " (exists=" << prev_key_block_exists_ << ")";
+  vert_seqno_ = config_->get_vert_seqno() + (params_.is_hardfork ? 1 : 0);
   LOG(DEBUG) << "vertical seqno (vert_seqno) is " << vert_seqno_;
   auto limits = config_->get_block_limits(is_masterchain());
   if (limits.is_error()) {
     return fatal_error(limits.move_as_error());
   }
   block_limits_ = limits.move_as_ok();
+  if (params_.collator_opts->block_limits_bytes) {
+    block_limits_->bytes = *params_.collator_opts->block_limits_bytes;
+  }
+  if (params_.collator_opts->block_limits_gas) {
+    block_limits_->gas = *params_.collator_opts->block_limits_gas;
+  }
+  if (params_.collator_opts->block_limits_lt_delta) {
+    block_limits_->lt_delta = *params_.collator_opts->block_limits_lt_delta;
+  }
+  if (params_.collator_opts->block_limits_collated_data) {
+    block_limits_->collated_data = *params_.collator_opts->block_limits_collated_data;
+  }
+  if (params_.attempt_idx == 3) {
+    LOG(INFO) << "Attempt #3: bytes, gas limits /= 2";
+    block_limits_->bytes.multiply_by(0.5);
+    block_limits_->gas.multiply_by(0.5);
+    block_limits_->collated_data.multiply_by(0.5);
+  } else if (params_.attempt_idx == 4) {
+    LOG(INFO) << "Attempt #4: bytes, gas limits /= 4";
+    block_limits_->bytes.multiply_by(0.25);
+    block_limits_->gas.multiply_by(0.25);
+    block_limits_->collated_data.multiply_by(0.25);
+  }
+  if (params_.collator_opts->ignore_collated_data_limits) {
+    block_limits_->collated_data = block::ParamLimits{1 << 30, 1 << 30, 1 << 30};
+  }
   LOG(DEBUG) << "block limits: bytes [" << block_limits_->bytes.underload() << ", " << block_limits_->bytes.soft()
              << ", " << block_limits_->bytes.hard() << "]";
   LOG(DEBUG) << "block limits: gas [" << block_limits_->gas.underload() << ", " << block_limits_->gas.soft() << ", "
              << block_limits_->gas.hard() << "]";
+  LOG(DEBUG) << "block limits: lt_delta [" << block_limits_->lt_delta.underload() << ", "
+             << block_limits_->lt_delta.soft() << ", " << block_limits_->lt_delta.hard() << "]";
+  LOG(DEBUG) << "block limits: collated_data_bytes [" << block_limits_->collated_data.underload() << ", "
+             << block_limits_->collated_data.soft() << ", " << block_limits_->collated_data.hard() << "]";
   if (config_->has_capabilities() && (config_->get_capabilities() & ~supported_capabilities())) {
     LOG(ERROR) << "block generation capabilities " << config_->get_capabilities()
                << " have been enabled in global configuration, but we support only " << supported_capabilities()
@@ -724,8 +956,6 @@ bool Collator::unpack_last_mc_state() {
                << " (upgrade validator software?)";
   }
   // TODO: extract start_lt and end_lt from prev_mc_block as well
-  // std::cerr << "  block::gen::ShardState::print_ref(mc_state_root) = ";
-  // block::gen::t_ShardState.print_ref(std::cerr, mc_state_root, 2);
   return true;
 }
 
@@ -735,22 +965,23 @@ bool Collator::unpack_last_mc_state() {
  * @returns True if the current validator set is valid, false otherwise.
  */
 bool Collator::check_cur_validator_set() {
-  if (is_hardfork_) {
+  if (params_.is_hardfork) {
     return true;
   }
   CatchainSeqno cc_seqno = 0;
-  auto nodes = config_->compute_validator_set_cc(shard_, now_, &cc_seqno);
+  auto nodes = config_->compute_validator_set_cc(shard_, &cc_seqno);
   if (nodes.empty()) {
     return fatal_error("cannot compute validator set for shard "s + shard_.to_str() + " from old masterchain state");
   }
   std::vector<ValidatorDescr> export_nodes;
-  if (validator_set_.not_null()) {
-    if (validator_set_->get_catchain_seqno() != cc_seqno) {
+  if (params_.validator_set.not_null()) {
+    if (params_.validator_set->get_catchain_seqno() != cc_seqno) {
       return fatal_error(PSTRING() << "current validator set catchain seqno mismatch: this validator set has cc_seqno="
-                                   << validator_set_->get_catchain_seqno() << ", only validator set with cc_seqno="
-                                   << cc_seqno << " is entitled to create block in shardchain " << shard_.to_str());
+                                   << params_.validator_set->get_catchain_seqno()
+                                   << ", only validator set with cc_seqno=" << cc_seqno
+                                   << " is entitled to create block in shardchain " << shard_);
     }
-    export_nodes = validator_set_->export_vector();
+    export_nodes = params_.validator_set->export_vector();
   }
   if (export_nodes != nodes /* && !is_fake_ */) {
     return fatal_error(
@@ -768,8 +999,11 @@ bool Collator::check_cur_validator_set() {
 bool Collator::request_neighbor_msg_queues() {
   assert(config_ && shard_conf_);
   auto neighbor_list = shard_conf_->get_neighbor_shard_hash_ids(shard_);
-  LOG(DEBUG) << "got a preliminary list of " << neighbor_list.size() << " neighbors for " << shard_.to_str();
+  LOG(DEBUG) << "got a preliminary list of " << neighbor_list.size() << " neighbors for " << shard_;
   for (ton::BlockId blk_id : neighbor_list) {
+    if (blk_id.seqno == 0 && blk_id.shard_full() != shard_) {
+      continue;
+    }
     auto shard_ptr = shard_conf_->get_shard_hash(ton::ShardIdFull(blk_id));
     if (shard_ptr.is_null()) {
       return fatal_error(-667, "cannot obtain shard hash for neighbor "s + blk_id.to_str());
@@ -780,33 +1014,42 @@ bool Collator::request_neighbor_msg_queues() {
     }
     neighbors_.emplace_back(*shard_ptr);
   }
-  int i = 0;
+  std::vector<BlockIdExt> top_blocks;
+  unsigned i = 0;
   for (block::McShardDescr& descr : neighbors_) {
-    LOG(DEBUG) << "neighbor #" << i << " : " << descr.blk_.to_str();
-    ++pending;
-    send_closure_later(manager, &ValidatorManager::wait_block_message_queue_short, descr.blk_, priority(), timeout,
-                       [self = get_self(), i](td::Result<Ref<MessageQueue>> res) {
-                         td::actor::send_closure(std::move(self), &Collator::got_neighbor_out_queue, i, std::move(res));
-                       });
+    LOG(DEBUG) << "neighbor #" << i << " : " << descr.blk_;
+    if (prev_block_idx(descr.blk_) == -1) {
+      top_blocks.push_back(descr.blk_);
+    }
     ++i;
   }
+  ++pending;
+  auto token = perf_log_.start_action("neighbor_msg_queues");
+  td::actor::send_closure_later(
+      manager, &ValidatorManager::wait_neighbor_msg_queue_proofs, shard_, std::move(top_blocks), timeout_,
+      [self = get_self(),
+       token = std::move(token)](td::Result<std::map<BlockIdExt, Ref<OutMsgQueueProof>>> res) mutable {
+        td::actor::send_closure_later(std::move(self), &Collator::got_neighbor_msg_queues, std::move(res),
+                                      std::move(token));
+      });
   return true;
 }
 
 /**
- * Requests the size of the outbound message queue from the previous state(s).
+ * Requests the size of the outbound message queue from the previous state(s) if needed.
  *
 * @returns True if the request was successful, false otherwise.
  */
 bool Collator::request_out_msg_queue_size() {
-  if (after_split_) {
-    // If block is after split, the size is calculated during split (see Collator::split_last_state)
+  if (have_out_msg_queue_size_in_state_) {
+    // if after_split then have_out_msg_queue_size_in_state_ is always true, since the size is calculated during split
     return true;
   }
+  out_msg_queue_size_ = 0;
   for (size_t i = 0; i < prev_blocks.size(); ++i) {
     ++pending;
     send_closure_later(manager, &ValidatorManager::get_out_msg_queue_size, prev_blocks[i],
-                       [self = get_self(), i](td::Result<td::uint32> res) {
+                       [self = get_self(), i](td::Result<td::uint64> res) {
                          td::actor::send_closure(std::move(self), &Collator::got_out_queue_size, i, std::move(res));
                        });
   }
@@ -814,22 +1057,99 @@ bool Collator::request_out_msg_queue_size() {
 }
 
 /**
+ * Requests global balance of the previous masterchain state.
+ *
+* @returns True if the request was successful, false otherwise.
+ */
+bool Collator::request_prev_global_balance() {
+  if (params_.is_hardfork || params_.is_fake) {
+    calculated_prev_global_balance_ = old_global_balance_.grams;
+    LOG(INFO) << "Previous global balance = " << calculated_prev_global_balance_;
+    return true;
+  }
+  ++pending;
+  auto token = perf_log_.start_action("get_global_balance");
+  send_closure_later(manager, &ValidatorManager::get_global_balance, prev_blocks[0], timeout_,
+                     [self = get_self(), token = std::move(token)](td::Result<td::RefInt256> res) mutable {
+                       td::actor::send_closure(std::move(self), &Collator::got_prev_global_balance, std::move(res),
+                                               std::move(token));
+                     });
+  return true;
+}
+
+/**
  * Handles the result of obtaining the outbound queue for a neighbor.
  *
- * @param i The index of the neighbor.
- * @param res The obtained outbound queue.
+ * @param R The result of retrieving neighbor message queues (top block id -> queue).
  */
-void Collator::got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res) {
+void Collator::got_neighbor_msg_queues(td::Result<std::map<BlockIdExt, Ref<OutMsgQueueProof>>> R,
+                                       td::PerfLogAction token) {
   --pending;
-  if (res.is_error()) {
-    fatal_error(res.move_as_error());
+  double duration = token.finish(R);
+  if (R.is_error()) {
+    fatal_error(R.move_as_error_prefix("failed to get neighbor msg queues: "));
     return;
   }
-  Ref<MessageQueue> outq_descr = res.move_as_ok();
+  LOG(INFO) << "neighbor output queues fetched, took " << duration << "s";
+  auto res = R.move_as_ok();
+  unsigned i = 0;
+  stats_.neighbors.resize(neighbors_.size());
+  for (block::McShardDescr& descr : neighbors_) {
+    LOG(DEBUG) << "neighbor #" << i << " : " << descr.blk_;
+    if (int prev_idx = prev_block_idx(descr.blk_); prev_idx >= 0) {
+      got_neighbor_msg_queue(
+          i, Ref<OutMsgQueueProof>{true, descr.blk_, prev_states[prev_idx]->root_cell(), td::Ref<vm::Cell>{}, true});
+    } else {
+      auto it = res.find(descr.blk_);
+      if (it == res.end()) {
+        fatal_error(PSTRING() << "no msg queue from neighbor #" << i);
+        return;
+      }
+      got_neighbor_msg_queue(i, it->second);
+    }
+    ++i;
+  }
+  check_pending();
+}
+
+void Collator::got_neighbor_msg_queue(unsigned i, Ref<OutMsgQueueProof> res) {
+  BlockIdExt block_id = neighbors_.at(i).blk_;
+  if (res->block_state_proof_.not_null() && !block_id.is_masterchain()) {
+    block_state_proofs_.emplace(block_id.root_hash, res->block_state_proof_);
+  }
+
+  auto& neighbor_stats = stats_.neighbors.at(i);
+  neighbor_stats.shard = block_id.shard_full();
+  neighbor_stats.is_trivial = shard_intersects(block_id.shard_full(), shard_);
+  neighbor_stats.is_local = res->is_local_;
+  neighbor_stats.msg_limit = res->msg_count_;
+
+  Ref<vm::Cell> state_root;
+  if (block_id.is_masterchain()) {
+    state_root = res->state_root_;
+  } else {
+    neighbor_proof_builders_.emplace_back(block_id, vm::MerkleProofBuilder{res->state_root_});
+    state_root = neighbor_proof_builders_.back().second.root();
+    if (full_collated_data_ && !block_id.is_masterchain()) {
+      neighbor_proof_builders_.back().second.set_cell_load_callback(
+          [&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
+    }
+  }
+  auto state = ShardStateQ::fetch(block_id, {}, state_root);
+  if (state.is_error()) {
+    fatal_error(state.move_as_error());
+    return;
+  }
+  auto outq_descr_res = state.move_as_ok()->message_queue();
+  if (outq_descr_res.is_error()) {
+    fatal_error(outq_descr_res.move_as_error());
+    return;
+  }
+  Ref<MessageQueue> outq_descr = outq_descr_res.move_as_ok();
   block::McShardDescr& descr = neighbors_.at(i);
-  LOG(WARNING) << "obtained outbound queue for neighbor #" << i << " : " << descr.shard().to_str();
+  LOG(WARNING) << "obtained outbound queue for neighbor #" << i << "(" << descr.shard() << ")";
   if (outq_descr->get_block_id() != descr.blk_) {
-    LOG(DEBUG) << "outq_descr->id = " << outq_descr->get_block_id().to_str() << " ; descr.id = " << descr.blk_.to_str();
+    LOG(DEBUG) << "outq_descr->id = " << outq_descr->get_block_id() << " ; descr.id = " << descr.blk_;
     fatal_error(
         -667, "invalid outbound queue information returned for "s + descr.shard().to_str() + " : id or hash mismatch");
     return;
@@ -843,15 +1163,19 @@ void Collator::got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res) 
     fatal_error("cannot unpack neighbor output queue info");
     return;
   }
-  descr.set_queue_root(qinfo.out_queue->prefetch_ref(0));
-  // comment the next two lines in the future when the output queues become huge
-  //  CHECK(block::gen::t_OutMsgQueueInfo.validate_ref(1000000, outq_descr->root_cell()));
-  //  CHECK(block::tlb::t_OutMsgQueueInfo.validate_ref(1000000, outq_descr->root_cell()));
+  auto queue_root = qinfo.out_queue->prefetch_ref(0);
+  descr.set_queue_root(queue_root);
+  if (res->msg_count_ != -1) {
+    LOG(INFO) << "neighbor " << descr.shard() << " has msg_limit=" << res->msg_count_;
+    neighbor_msg_queues_limits_[block_id.shard_full()] = res->msg_count_;
+  }
   // unpack ProcessedUpto
-  LOG(DEBUG) << "unpacking ProcessedUpto of neighbor " << descr.blk_.to_str();
+  LOG(DEBUG) << "unpacking ProcessedUpto of neighbor " << descr.blk_;
   if (verbosity >= 2) {
-    block::gen::t_ProcessedInfo.print(std::cerr, qinfo.proc_info);
-    qinfo.proc_info->print_rec(std::cerr);
+    FLOG(INFO) {
+      block::gen::t_ProcessedInfo.print(sb, qinfo.proc_info);
+      qinfo.proc_info->print_rec(sb);
+    };
   }
   descr.processed_upto = block::MsgProcessedUptoCollection::unpack(descr.shard(), qinfo.proc_info);
   if (!descr.processed_upto) {
@@ -859,22 +1183,16 @@ void Collator::got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res) 
     return;
   }
   outq_descr.clear();
-  do {
-    // require masterchain blocks referred to in ProcessedUpto
-    // TODO: perform this only if there are messages for this shard in our output queue
-    // .. (have to check the above condition and perform a `break` here) ..
-    // ..
-    for (const auto& entry : descr.processed_upto->list) {
-      Ref<MasterchainStateQ> state;
-      if (!request_aux_mc_state(entry.mc_seqno, state)) {
-        return;
-      }
+  // require masterchain blocks referred to in ProcessedUpto
+  // TODO: perform this only if there are messages for this shard in our output queue
+  // .. (have to check the above condition and perform a `break` here) ..
+  // ..
+  for (const auto& entry : descr.processed_upto->list) {
+    Ref<MasterchainStateQ> state;
+    if (!request_aux_mc_state(entry.mc_seqno, state)) {
+      return;
     }
-  } while (false);
-  if (!pending) {
-    LOG(INFO) << "all neighbor output queues fetched";
   }
-  check_pending();
 }
 
 /**
@@ -885,37 +1203,58 @@ void Collator::got_neighbor_out_queue(int i, td::Result<Ref<MessageQueue>> res) 
  * @param i The index of the previous block (0 or 1).
  * @param res The result object containing the size of the queue.
  */
-void Collator::got_out_queue_size(size_t i, td::Result<td::uint32> res) {
+void Collator::got_out_queue_size(size_t i, td::Result<td::uint64> res) {
   --pending;
   if (res.is_error()) {
     fatal_error(
         res.move_as_error_prefix(PSTRING() << "failed to get message queue size from prev block #" << i << ": "));
     return;
   }
-  td::uint32 size = res.move_as_ok();
+  td::uint64 size = res.move_as_ok();
   LOG(WARNING) << "got outbound queue size from prev block #" << i << ": " << size;
   out_msg_queue_size_ += size;
   check_pending();
 }
 
 /**
+ * Handles the result of obtaining global balance of the previous state.
+ *
+ * @param res The resulting balance.
+ */
+void Collator::got_prev_global_balance(td::Result<td::RefInt256> res, td::PerfLogAction token) {
+  FAIL_UNLESS_VOID(is_masterchain());
+  token.finish(res);
+  if (res.is_error()) {
+    fatal_error(res.move_as_error_prefix("failed to get global balance of the previous state: "));
+    return;
+  }
+  --pending;
+  calculated_prev_global_balance_ = res.move_as_ok();
+  LOG(INFO) << "Previous global balance = " << calculated_prev_global_balance_;
+  check_pending();
+}
+
+/**
  * Unpacks and merges the states of two previous blocks.
  * Used if the block is after_merge.
- * 
+ *
  * @returns True if the unpacking and merging was successful, false otherwise.
  */
 bool Collator::unpack_merge_last_state() {
   LOG(DEBUG) << "unpack/merge last states";
   // 0. mechanically merge two ShardStateUnsplit into split_state constructor
-  CHECK(prev_states.size() == 2);
-  CHECK(prev_states.at(0).not_null() && prev_states.at(1).not_null());
+  FAIL_UNLESS(prev_states.size() == 2);
+  FAIL_UNLESS(prev_states.at(0).not_null() && prev_states.at(1).not_null());
   // create a virtual split_state ... = ShardState
   if (!block::gen::t_ShardState.cell_pack_split_state(prev_state_root_pure_, prev_states[0]->root_cell(),
                                                       prev_states[1]->root_cell())) {
     return fatal_error(-667, "cannot construct a virtual split_state after a merge");
   }
   // 1. prepare for creating a MerkleUpdate based on previous state
-  state_usage_tree_ = std::make_shared<vm::CellUsageTree>();
+  state_usage_tree_ = std::make_shared<vm::CellUsageTree>(prev_state_root_pure_);
+  if (full_collated_data_ && !is_masterchain()) {
+    state_usage_tree_->set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
+  }
   prev_state_root_ = vm::UsageCell::create(prev_state_root_pure_, state_usage_tree_->root_ptr());
   // 2. extract back slightly virtualized roots of the two original states
   Ref<vm::Cell> root0, root1;
@@ -955,11 +1294,14 @@ bool Collator::unpack_last_state() {
     }
     return true;
   }
-  CHECK(prev_states.size() == 1);
-  CHECK(prev_states.at(0).not_null());
+  FAIL_UNLESS(prev_states.size() == 1);
+  FAIL_UNLESS(prev_states.at(0).not_null());
   prev_state_root_pure_ = prev_states.at(0)->root_cell();
   // prepare for creating a MerkleUpdate based on previous state
-  state_usage_tree_ = std::make_shared<vm::CellUsageTree>();
+  state_usage_tree_ = std::make_shared<vm::CellUsageTree>(prev_state_root_pure_);
+  if (full_collated_data_ && !is_masterchain()) {
+    state_usage_tree_->set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
+  }
   prev_state_root_ = vm::UsageCell::create(prev_state_root_pure_, state_usage_tree_->root_ptr());
   // unpack previous state
   block::ShardState ss;
@@ -989,7 +1331,7 @@ bool Collator::unpack_one_last_state(block::ShardState& ss, BlockIdExt blkid, Re
     return fatal_error(
         PSTRING() << "cannot create new block with vertical seqno " << vert_seqno_
                   << " prescribed by the current masterchain configuration because the previous state of shard "
-                  << ss.id_.to_str() << " has larger vertical seqno " << ss.vert_seqno_);
+                  << ss.id_ << " has larger vertical seqno " << ss.vert_seqno_);
   }
   return true;
 }
@@ -1003,8 +1345,8 @@ bool Collator::unpack_one_last_state(block::ShardState& ss, BlockIdExt blkid, Re
  * @returns True if the split operation is successful, false otherwise.
  */
 bool Collator::split_last_state(block::ShardState& ss) {
-  LOG(INFO) << "Splitting previous state " << ss.id_.to_str() << " to subshard " << shard_.to_str();
-  CHECK(after_split_);
+  LOG(INFO) << "Splitting previous state " << ss.id_ << " to subshard " << shard_;
+  FAIL_UNLESS(after_split_);
   auto sib_shard = ton::shard_sibling(shard_);
   auto res1 = ss.compute_split_out_msg_queue(sib_shard);
   if (res1.is_error()) {
@@ -1016,7 +1358,7 @@ bool Collator::split_last_state(block::ShardState& ss) {
     return fatal_error(res2.move_as_error());
   }
   sibling_processed_upto_ = res2.move_as_ok();
-  auto res3 = ss.split(shard_, &out_msg_queue_size_);
+  auto res3 = ss.split(shard_);
   if (res3.is_error()) {
     return fatal_error(std::move(res3));
   }
@@ -1025,8 +1367,8 @@ bool Collator::split_last_state(block::ShardState& ss) {
 
 /**
  * Imports the shard state data into the Collator object.
- * 
- * SETS: account_dict, shard_libraries_, mc_state_extra
+ *
+ * SETS: account_dict = account_dict_estimator_, shard_libraries_, mc_state_extra
  *    total_balance_ = old_total_balance_, total_validator_fees_
  * SETS: overload_history_, underload_history_
  * SETS: prev_state_utime_, prev_state_lt_, prev_vert_seqno_
@@ -1038,6 +1380,9 @@ bool Collator::split_last_state(block::ShardState& ss) {
  */
 bool Collator::import_shard_state_data(block::ShardState& ss) {
   account_dict = std::move(ss.account_dict_);
+  old_account_dict =
+      std::make_unique<vm::AugmentedDictionary>(account_dict->get_root(), 256, block::tlb::aug_ShardAccounts);
+  account_dict_estimator_ = std::make_unique<vm::AugmentedDictionary>(*account_dict);
   shard_libraries_ = std::move(ss.shard_libraries_);
   mc_state_extra_ = std::move(ss.mc_state_extra_);
   overload_history_ = ss.overload_history_;
@@ -1050,9 +1395,16 @@ bool Collator::import_shard_state_data(block::ShardState& ss) {
   total_validator_fees_ = std::move(ss.total_validator_fees_);
   old_global_balance_ = std::move(ss.global_balance_);
   out_msg_queue_ = std::move(ss.out_msg_queue_);
+  old_out_msg_queue_ = std::make_unique<vm::AugmentedDictionary>(*out_msg_queue_);
   processed_upto_ = std::move(ss.processed_upto_);
   ihr_pending = std::move(ss.ihr_pending_);
+  dispatch_queue_ = std::move(ss.dispatch_queue_);
+  old_dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(*dispatch_queue_);
   block_create_stats_ = std::move(ss.block_create_stats_);
+  if (ss.out_msg_queue_size_) {
+    have_out_msg_queue_size_in_state_ = true;
+    out_msg_queue_size_ = ss.out_msg_queue_size_.value();
+  }
   return true;
 }
 
@@ -1064,14 +1416,14 @@ bool Collator::import_shard_state_data(block::ShardState& ss) {
  */
 bool Collator::add_trivial_neighbor_after_merge() {
   LOG(DEBUG) << "in add_trivial_neighbor_after_merge()";
-  CHECK(prev_blocks.size() == 2);
+  FAIL_UNLESS(prev_blocks.size() == 2);
   int found = 0;
   std::size_t n = neighbors_.size();
   for (std::size_t i = 0; i < n; i++) {
     auto& nb = neighbors_.at(i);
     if (ton::shard_intersects(nb.shard(), shard_)) {
       ++found;
-      LOG(DEBUG) << "neighbor #" << i << " : " << nb.blk_.to_str() << " intersects our shard " << shard_.to_str();
+      LOG(DEBUG) << "neighbor #" << i << " : " << nb.blk_ << " intersects our shard " << shard_;
       if (!ton::shard_is_parent(shard_, nb.shard()) || found > 2) {
         return fatal_error("impossible shard configuration in add_trivial_neighbor_after_merge()");
       }
@@ -1084,15 +1436,16 @@ bool Collator::add_trivial_neighbor_after_merge() {
         nb.set_queue_root(out_msg_queue_->get_root_cell());
         nb.processed_upto = processed_upto_;
         nb.blk_.id.shard = get_shard();
-        LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_.to_str()
+        stats_.neighbors[i].shard = nb.blk_.shard_full();
+        LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_
                    << " with shard expansion (immediate after-merge adjustment)";
       } else {
-        LOG(DEBUG) << "disabling neighbor #" << i << " : " << nb.blk_.to_str() << " (immediate after-merge adjustment)";
+        LOG(DEBUG) << "disabling neighbor #" << i << " : " << nb.blk_ << " (immediate after-merge adjustment)";
         nb.disable();
       }
     }
   }
-  CHECK(found == 2);
+  FAIL_UNLESS(found == 2);
   return true;
 }
 
@@ -1107,20 +1460,20 @@ bool Collator::add_trivial_neighbor() {
   if (after_merge_) {
     return add_trivial_neighbor_after_merge();
   }
-  CHECK(prev_blocks.size() == 1);
+  FAIL_UNLESS(prev_blocks.size() == 1);
   if (!prev_blocks[0].seqno()) {
     // skipping
     LOG(DEBUG) << "no trivial neighbor because previous block has zero seqno";
     return true;
   }
-  CHECK(prev_block_root.not_null());
-  CHECK(prev_state_root_pure_.not_null());
+  FAIL_UNLESS(prev_block_root.not_null());
+  FAIL_UNLESS(prev_state_root_pure_.not_null());
   auto descr_ref = block::McShardDescr::from_block(prev_block_root, prev_state_root_pure_, prev_blocks[0].file_hash);
   if (descr_ref.is_null()) {
     return fatal_error("cannot deserialize header of previous state");
   }
-  CHECK(descr_ref->blk_ == prev_blocks[0]);
-  CHECK(out_msg_queue_);
+  FAIL_UNLESS(descr_ref->blk_ == prev_blocks[0]);
+  FAIL_UNLESS(out_msg_queue_);
   ton::ShardIdFull prev_shard = descr_ref->shard();
   // Possible cases are:
   // 1. prev_shard = shard = one of neighbors
@@ -1142,34 +1495,37 @@ bool Collator::add_trivial_neighbor() {
     auto& nb = neighbors_.at(i);
     if (ton::shard_intersects(nb.shard(), shard_)) {
       ++found;
-      LOG(DEBUG) << "neighbor #" << i << " : " << nb.blk_.to_str() << " intersects our shard " << shard_.to_str();
+      LOG(DEBUG) << "neighbor #" << i << " : " << nb.blk_ << " intersects our shard " << shard_;
       if (nb.shard() == prev_shard) {
         if (prev_shard == shard_) {
           // case 1. Normal.
-          CHECK(found == 1);
+          FAIL_UNLESS(found == 1);
           nb = *descr_ref;
           nb.set_queue_root(out_msg_queue_->get_root_cell());
           nb.processed_upto = processed_upto_;
-          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_.to_str() << " (simple replacement)";
+          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_ << " (simple replacement)";
           cs = 1;
         } else if (ton::shard_is_parent(nb.shard(), shard_)) {
           // case 2. Immediate after-split.
-          CHECK(found == 1);
-          CHECK(after_split_);
-          CHECK(sibling_out_msg_queue_);
-          CHECK(sibling_processed_upto_);
+          FAIL_UNLESS(found == 1);
+          FAIL_UNLESS(after_split_);
+          FAIL_UNLESS(sibling_out_msg_queue_);
+          FAIL_UNLESS(sibling_processed_upto_);
           neighbors_.emplace_back(*descr_ref);
+          stats_.neighbors.push_back(CollationStats::NeighborStats{
+              .shard = descr_ref->shard(), .is_trivial = true, .is_local = true, .msg_limit = -1});
           auto& nb2 = neighbors_.at(i);
           nb2.set_queue_root(sibling_out_msg_queue_->get_root_cell());
           nb2.processed_upto = sibling_processed_upto_;
           nb2.blk_.id.shard = ton::shard_sibling(get_shard());
-          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb2.blk_.to_str()
+          stats_.neighbors[i].shard = nb2.blk_.shard_full();
+          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb2.blk_
                      << " with shard shrinking to our sibling (immediate after-split adjustment)";
           auto& nb1 = neighbors_.at(n);
           nb1.set_queue_root(out_msg_queue_->get_root_cell());
           nb1.processed_upto = processed_upto_;
           nb1.blk_.id.shard = get_shard();
-          LOG(DEBUG) << "created neighbor #" << n << " : " << nb1.blk_.to_str()
+          LOG(DEBUG) << "created neighbor #" << n << " : " << nb1.blk_
                      << " with shard shrinking to our (immediate after-split adjustment)";
           cs = 2;
         } else {
@@ -1177,11 +1533,13 @@ bool Collator::add_trivial_neighbor() {
         }
       } else if (ton::shard_is_parent(nb.shard(), shard_) && shard_ == prev_shard) {
         // case 3. Continued after-split
-        CHECK(found == 1);
-        CHECK(!after_split_);
-        CHECK(!sibling_out_msg_queue_);
-        CHECK(!sibling_processed_upto_);
+        FAIL_UNLESS(found == 1);
+        FAIL_UNLESS(!after_split_);
+        FAIL_UNLESS(!sibling_out_msg_queue_);
+        FAIL_UNLESS(!sibling_processed_upto_);
         neighbors_.emplace_back(*descr_ref);
+        stats_.neighbors.push_back(CollationStats::NeighborStats{
+            .shard = descr_ref->shard(), .is_trivial = true, .is_local = true, .msg_limit = -1});
         auto& nb2 = neighbors_.at(i);
         auto sib_shard = ton::shard_sibling(shard_);
         // compute the part of virtual sibling's OutMsgQueue with destinations in our shard
@@ -1191,7 +1549,7 @@ bool Collator::add_trivial_neighbor() {
         pfx.bits().store_int(workchain(), 32);
         (pfx.bits() + 32).store_uint(get_shard(), 64);
         int l = ton::shard_prefix_length(shard_);
-        CHECK(sibling_out_msg_queue_->cut_prefix_subdict(pfx.bits(), 32 + l));
+        FAIL_UNLESS(sibling_out_msg_queue_->cut_prefix_subdict(pfx.bits(), 32 + l));
         int res2 = block::filter_out_msg_queue(*sibling_out_msg_queue_, nb2.shard(), sib_shard);
         if (res2 < 0) {
           return fatal_error("cannot filter virtual sibling's OutMsgQueue from that of the last common ancestor");
@@ -1201,12 +1559,13 @@ bool Collator::add_trivial_neighbor() {
           return fatal_error("error splitting ProcessedUpto for our virtual sibling");
         }
         nb2.blk_.id.shard = ton::shard_sibling(get_shard());
-        LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb2.blk_.to_str()
+        stats_.neighbors[i].shard = nb2.blk_.shard_full();
+        LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb2.blk_
                    << " with shard shrinking to our sibling (continued after-split adjustment)";
         auto& nb1 = neighbors_.at(n);
         nb1.set_queue_root(out_msg_queue_->get_root_cell());
         nb1.processed_upto = processed_upto_;
-        LOG(DEBUG) << "created neighbor #" << n << " : " << nb1.blk_.to_str()
+        LOG(DEBUG) << "created neighbor #" << n << " : " << nb1.blk_
                    << " from our preceding state (continued after-split adjustment)";
         cs = 3;
       } else if (ton::shard_is_parent(shard_, nb.shard()) && shard_ == prev_shard) {
@@ -1214,17 +1573,16 @@ bool Collator::add_trivial_neighbor() {
         if (found == 1) {
           cs = 4;
         }
-        CHECK(cs == 4);
-        CHECK(found <= 2);
+        FAIL_UNLESS(cs == 4);
+        FAIL_UNLESS(found <= 2);
         if (found == 1) {
           nb = *descr_ref;
           nb.set_queue_root(out_msg_queue_->get_root_cell());
           nb.processed_upto = processed_upto_;
-          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_.to_str()
+          LOG(DEBUG) << "adjusted neighbor #" << i << " : " << nb.blk_
                      << " with shard expansion (continued after-merge adjustment)";
         } else {
-          LOG(DEBUG) << "disabling neighbor #" << i << " : " << nb.blk_.to_str()
-                     << " (continued after-merge adjustment)";
+          LOG(DEBUG) << "disabling neighbor #" << i << " : " << nb.blk_ << " (continued after-merge adjustment)";
           nb.disable();
         }
       } else {
@@ -1232,8 +1590,8 @@ bool Collator::add_trivial_neighbor() {
       }
     }
   }
-  CHECK(found && cs);
-  CHECK(found == (1 + (cs == 4)));
+  FAIL_UNLESS(found && cs);
+  FAIL_UNLESS(found == (1 + (cs == 4)));
   return true;
 }
 
@@ -1248,19 +1606,18 @@ bool Collator::add_trivial_neighbor() {
  */
 bool Collator::check_prev_block(const BlockIdExt& listed, const BlockIdExt& prev, bool chk_chain_len) {
   if (listed.seqno() > prev.seqno()) {
-    return fatal_error(PSTRING() << "cannot generate a shardchain block after previous block " << prev.to_str()
-                                 << " because masterchain configuration already contains a newer block "
-                                 << listed.to_str());
+    return fatal_error(PSTRING() << "cannot generate a shardchain block after previous block " << prev
+                                 << " because masterchain configuration already contains a newer block " << listed);
   }
   if (listed.seqno() == prev.seqno() && listed != prev) {
-    return fatal_error(PSTRING() << "cannot generate a shardchain block after previous block " << prev.to_str()
-                                 << " because masterchain configuration lists another block " << listed.to_str()
+    return fatal_error(PSTRING() << "cannot generate a shardchain block after previous block " << prev
+                                 << " because masterchain configuration lists another block " << listed
                                  << " of the same height");
   }
   if (chk_chain_len && prev.seqno() >= listed.seqno() + 8) {
-    return fatal_error(PSTRING() << "cannot generate next block after " << prev.to_str()
-                                 << " because this would lead to an unregistered chain of length > 8 (only "
-                                 << listed.to_str() << " is registered in the masterchain)");
+    return fatal_error(PSTRING() << "cannot generate next block after " << prev
+                                 << " because this would lead to an unregistered chain of length > 8 (only " << listed
+                                 << " is registered in the masterchain)");
   }
   return true;
 }
@@ -1275,17 +1632,16 @@ bool Collator::check_prev_block(const BlockIdExt& listed, const BlockIdExt& prev
  */
 bool Collator::check_prev_block_exact(const BlockIdExt& listed, const BlockIdExt& prev) {
   if (listed != prev) {
-    return fatal_error(PSTRING() << "cannot generate shardchain block for shard " << shard_.to_str()
-                                 << " after previous block " << prev.to_str()
-                                 << " because masterchain configuration expects another previous block "
-                                 << listed.to_str() << " and we are immediately after a split/merge event");
+    return fatal_error(PSTRING() << "cannot generate shardchain block for shard " << shard_ << " after previous block "
+                                 << prev << " because masterchain configuration expects another previous block "
+                                 << listed << " and we are immediately after a split/merge event");
   }
   return true;
 }
 
 /**
  * Checks the validity of the shard configuration of the current shard.
- * 
+ *
  * @returns True if the shard configuration is valid, false otherwise.
  */
 bool Collator::check_this_shard_mc_info() {
@@ -1318,63 +1674,60 @@ bool Collator::check_this_shard_mc_info() {
   }
   auto left = config_->get_shard_hash(shard_ - 1, false);
   if (left.is_null()) {
-    return fatal_error(PSTRING() << "cannot create new block for shard " << shard_.to_str()
+    return fatal_error(PSTRING() << "cannot create new block for shard " << shard_
                                  << " because there is no similar shard in existing masterchain configuration");
   }
   if (left->shard() == shard_) {
     // no split/merge
     if (after_merge_ || after_split_) {
       return fatal_error(
-          PSTRING() << "cannot generate new shardchain block for " << shard_.to_str()
+          PSTRING() << "cannot generate new shardchain block for " << shard_
                     << " after a supposed split or merge event because this event is not reflected in the masterchain");
     }
     if (!check_prev_block(left->blk_, prev_blocks[0])) {
       return false;
     }
     if (left->before_split_) {
-      return fatal_error(PSTRING() << "cannot generate new unsplit shardchain block for " << shard_.to_str()
-                                   << " after previous block " << left->blk_.to_str() << " with before_split set");
+      return fatal_error(PSTRING() << "cannot generate new unsplit shardchain block for " << shard_
+                                   << " after previous block " << left->blk_ << " with before_split set");
     }
     auto sib = config_->get_shard_hash(shard_sibling(shard_));
     if (left->before_merge_ && sib->before_merge_) {
-      return fatal_error(PSTRING() << "cannot generate new unmerged shardchain block for " << shard_.to_str()
-                                   << " after both " << left->blk_.to_str() << " and " << sib->blk_.to_str()
-                                   << " set before_merge flags");
+      return fatal_error(PSTRING() << "cannot generate new unmerged shardchain block for " << shard_ << " after both "
+                                   << left->blk_ << " and " << sib->blk_ << " set before_merge flags");
     }
     if (left->is_fsm_split()) {
       auto tmp_now = std::max<td::uint32>(config_->utime, (unsigned)std::time(nullptr));
       if (shard_splitting_enabled && tmp_now >= left->fsm_utime() && tmp_now + 13 < left->fsm_utime_end()) {
         now_upper_limit_ = left->fsm_utime_end() - 11;  // ultimate value of now_ must be at most now_upper_limit_
         before_split_ = true;
-        LOG(INFO) << "BEFORE_SPLIT set for the new block of shard " << shard_.to_str();
+        LOG(INFO) << "BEFORE_SPLIT set for the new block of shard " << shard_;
       }
     }
   } else if (shard_is_parent(shard_, left->shard())) {
     // after merge
     if (!left->before_merge_) {
-      return fatal_error(PSTRING() << "cannot create new merged block for shard " << shard_.to_str()
-                                   << " because its left ancestor " << left->blk_.to_str()
-                                   << " has no before_merge flag");
+      return fatal_error(PSTRING() << "cannot create new merged block for shard " << shard_
+                                   << " because its left ancestor " << left->blk_ << " has no before_merge flag");
     }
     auto right = config_->get_shard_hash(shard_ + 1, false);
     if (right.is_null()) {
       return fatal_error(
           PSTRING()
-          << "cannot create new block for shard " << shard_.to_str()
+          << "cannot create new block for shard " << shard_
           << " after a preceding merge because there is no right ancestor shard in existing masterchain configuration");
     }
     if (!shard_is_parent(shard_, right->shard())) {
-      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_.to_str()
+      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_
                                    << " after a preceding merge because its right ancestor appears to be "
-                                   << right->blk_.to_str());
+                                   << right->blk_);
     }
     if (!right->before_merge_) {
-      return fatal_error(PSTRING() << "cannot create new merged block for shard " << shard_.to_str()
-                                   << " because its right ancestor " << right->blk_.to_str()
-                                   << " has no before_merge flag");
+      return fatal_error(PSTRING() << "cannot create new merged block for shard " << shard_
+                                   << " because its right ancestor " << right->blk_ << " has no before_merge flag");
     }
     if (after_split_) {
-      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_.to_str()
+      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_
                                    << " after a purported split because existing shard configuration suggests a merge");
     } else if (after_merge_) {
       if (!(check_prev_block_exact(left->blk_, prev_blocks[0]) &&
@@ -1384,27 +1737,25 @@ bool Collator::check_this_shard_mc_info() {
     } else {
       auto cseqno = std::max(left->seqno(), right->seqno());
       if (prev_blocks[0].seqno() <= cseqno) {
-        return fatal_error(PSTRING() << "cannot create new block for shard " << shard_.to_str()
-                                     << " after previous block " << prev_blocks[0].to_str()
-                                     << " because masterchain contains newer possible ancestors " << left->blk_.to_str()
-                                     << " and " << right->blk_.to_str());
+        return fatal_error(PSTRING() << "cannot create new block for shard " << shard_ << " after previous block "
+                                     << prev_blocks[0] << " because masterchain contains newer possible ancestors "
+                                     << left->blk_ << " and " << right->blk_);
       }
       if (prev_blocks[0].seqno() >= cseqno + 8) {
         return fatal_error(
-            PSTRING() << "cannot create new block for shard " << shard_.to_str() << " after previous block "
-                      << prev_blocks[0].to_str()
+            PSTRING() << "cannot create new block for shard " << shard_ << " after previous block " << prev_blocks[0]
                       << " because this would lead to an unregistered chain of length > 8 (masterchain contains only "
-                      << left->blk_.to_str() << " and " << right->blk_.to_str() << ")");
+                      << left->blk_ << " and " << right->blk_ << ")");
       }
     }
   } else if (shard_is_parent(left->shard(), shard_)) {
     // after split
     if (!left->before_split_) {
-      return fatal_error(PSTRING() << "cannot generate new split shardchain block for " << shard_.to_str()
-                                   << " after previous block " << left->blk_.to_str() << " without before_split");
+      return fatal_error(PSTRING() << "cannot generate new split shardchain block for " << shard_
+                                   << " after previous block " << left->blk_ << " without before_split");
     }
     if (after_merge_) {
-      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_.to_str()
+      return fatal_error(PSTRING() << "cannot create new block for shard " << shard_
                                    << " after a purported merge because existing shard configuration suggests a split");
     } else if (after_split_) {
       if (!(check_prev_block_exact(left->blk_, prev_blocks[0]))) {
@@ -1416,8 +1767,8 @@ bool Collator::check_this_shard_mc_info() {
       }
     }
   } else {
-    return fatal_error(PSTRING() << "masterchain configuration contains only block " << left->blk_.to_str()
-                                 << " which belongs to a different shard from ours " << shard_.to_str());
+    return fatal_error(PSTRING() << "masterchain configuration contains only block " << left->blk_
+                                 << " which belongs to a different shard from ours " << shard_);
   }
   return true;
 }
@@ -1428,13 +1779,14 @@ bool Collator::check_this_shard_mc_info() {
  * @returns True if the block limits were successfully initialized, false otherwise.
  */
 bool Collator::init_block_limits() {
-  CHECK(block_limits_);
-  CHECK(state_usage_tree_);
+  FAIL_UNLESS(block_limits_);
+  FAIL_UNLESS(state_usage_tree_);
   if (now_ > prev_now_ + 15 && block_limits_->lt_delta.hard() > 200) {
     block_limits_->lt_delta = {20, 180, 200};
   }
   block_limits_->usage_tree = state_usage_tree_.get();
   block_limit_status_ = std::make_unique<block::BlockLimitStatus>(*block_limits_);
+  block_limit_status_->collated_data_size_estimate = collated_data_stat.estimate_proof_size();
   return true;
 }
 
@@ -1444,26 +1796,26 @@ bool Collator::init_block_limits() {
  * @returns True if pre-initialization is successful, false otherwise.
  */
 bool Collator::do_preinit() {
-  CHECK(prev_blocks.size() == 1U + after_merge_);
+  FAIL_UNLESS(prev_blocks.size() == 1U + after_merge_);
   last_block_seqno = prev_blocks[0].seqno();
   if (prev_block_data[0].not_null()) {
-    CHECK(last_block_seqno);
+    FAIL_UNLESS(last_block_seqno);
     prev_block_root = prev_block_data[0]->root_cell();
   } else {
-    CHECK(!last_block_seqno);
+    FAIL_UNLESS(!last_block_seqno);
   }
   if (after_merge_ && prev_blocks[1].seqno() > last_block_seqno) {
     last_block_seqno = prev_blocks[1].seqno();
   }
   new_block_seqno = last_block_seqno + 1;
   new_id = ton::BlockId{shard_, new_block_seqno};
-  CHECK(!config_);
-  CHECK(mc_state_root.not_null());
+  FAIL_UNLESS(!config_);
+  FAIL_UNLESS(mc_state_root.not_null());
   LOG(INFO) << "unpacking most recent masterchain state";
   if (!unpack_last_mc_state()) {
     return false;
   }
-  CHECK(config_);
+  FAIL_UNLESS(config_);
   if (config_->block_id.seqno() != prev_mc_block_seqno) {
     return fatal_error("loaded masterchain configuration has incorrect seqno");
   }
@@ -1473,11 +1825,11 @@ bool Collator::do_preinit() {
   if (!check_cur_validator_set()) {
     return fatal_error("this validator set is not entitled to create a block for this shardchain");
   }
-  CHECK(!prev_mc_block_seqno || mc_block_root.not_null());
+  FAIL_UNLESS(!prev_mc_block_seqno || mc_block_root.not_null());
   if (!unpack_last_state()) {
     return fatal_error("cannot unpack previous state of current shardchain");
   }
-  CHECK(account_dict);
+  FAIL_UNLESS(account_dict);
   if (!init_utime()) {
     return fatal_error("cannot initialize unix time");
   }
@@ -1499,6 +1851,9 @@ bool Collator::do_preinit() {
   if (!request_out_msg_queue_size()) {
     return false;
   }
+  if (is_masterchain() && global_version_ >= 17 && !request_prev_global_balance()) {
+    return false;
+  }
   return true;
 }
 
@@ -1509,7 +1864,7 @@ bool Collator::do_preinit() {
  * @returns True if the shard configuration was successfully adjusted, false otherwise.
  */
 bool Collator::adjust_shard_config() {
-  CHECK(is_masterchain() && config_ && shard_conf_);
+  FAIL_UNLESS(is_masterchain() && config_ && shard_conf_);
   const block::WorkchainSet& wset = config_->get_workchain_list();
   LOG(DEBUG) << "adjust_shard_config() started";
   fees_import_dict_ = std::make_unique<vm::AugmentedDictionary>(96, block::tlb::aug_ShardFees);
@@ -1526,7 +1881,7 @@ bool Collator::adjust_shard_config() {
         if (!shard_conf_->new_workchain(wc, new_block_seqno, winfo->zerostate_root_hash, winfo->zerostate_file_hash)) {
           return fatal_error(PSTRING() << "cannot add new workchain " << wc << " to shard configuration");
         }
-        CHECK(store_shard_fees(ShardIdFull{wc}, block::CurrencyCollection{0}, block::CurrencyCollection{0}));
+        FAIL_UNLESS(store_shard_fees(ShardIdFull{wc}, block::CurrencyCollection{0}, block::CurrencyCollection{0}));
       }
     }
   }
@@ -1584,10 +1939,10 @@ bool Collator::store_shard_fees(ShardIdFull shard, const block::CurrencyCollecti
  * @returns True if the shard fees and funds created were successfully stored, false otherwise.
  */
 bool Collator::store_shard_fees(Ref<block::McShardHash> descr) {
-  CHECK(descr.not_null());
-  CHECK(descr->fees_collected_.is_valid());
-  CHECK(descr->funds_created_.is_valid());
-  CHECK(store_shard_fees(descr->shard(), descr->fees_collected_, descr->funds_created_));
+  FAIL_UNLESS(descr.not_null());
+  FAIL_UNLESS(descr->fees_collected_.is_valid());
+  FAIL_UNLESS(descr->funds_created_.is_valid());
+  FAIL_UNLESS(store_shard_fees(descr->shard(), descr->fees_collected_, descr->funds_created_));
   return true;
 }
 
@@ -1612,57 +1967,56 @@ bool Collator::import_new_shard_top_blocks() {
   int prev_chain_len = 0;
   for (auto entry : shard_block_descr_) {
     auto sh_bd = Ref<ShardTopBlockDescrQ>(entry);
-    CHECK(sh_bd.not_null());
+    FAIL_UNLESS(sh_bd.not_null());
     int res_flags = 0;
     auto chk_res = sh_bd->prevalidate(mc_block_id_, mc_state_,
                                       ShardTopBlockDescrQ::fail_new | ShardTopBlockDescrQ::fail_too_new, res_flags);
     if (chk_res.is_error()) {
-      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id().to_str() << " skipped: res_flags=" << res_flags
-                 << " " << chk_res.move_as_error().to_string();
+      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: res_flags=" << res_flags << " "
+                 << chk_res.move_as_error().to_string();
       continue;
     }
     int chain_len = chk_res.move_as_ok();
     if (chain_len <= 0 || chain_len > 8) {
-      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id().to_str() << " skipped: its chain length is "
-                 << chain_len;
+      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: its chain length is " << chain_len;
       continue;
     }
-    if (sh_bd->generated_at() >= now_) {
-      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id().to_str() << " skipped: it claims to be generated at "
+    if (allow_same_timestamp_ ? sh_bd->generated_at() > now_ : sh_bd->generated_at() >= now_) {
+      LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: it claims to be generated at "
                  << sh_bd->generated_at() << " while it is still " << now_;
       continue;
     }
     Ref<block::McShardHash> descr = sh_bd->get_top_descr(chain_len);
-    CHECK(descr.not_null());
-    CHECK(descr->top_block_id() == sh_bd->block_id());
+    FAIL_UNLESS(descr.not_null());
+    FAIL_UNLESS(descr->top_block_id() == sh_bd->block_id());
     ShardIdFull shard = ShardIdFull(descr->top_block_id());
     auto start_blks = sh_bd->get_prev_at(chain_len);
     auto res = shard_conf_->may_update_shard_block_info(descr, start_blks, lt_limit);
     if (res.is_error()) {
-      LOG(DEBUG) << "cannot add new top shard block " << sh_bd->block_id().to_str()
+      LOG(DEBUG) << "cannot add new top shard block " << sh_bd->block_id()
                  << " to shard configuration: " << res.move_as_error().to_string();
       continue;
     }
     if (!res.move_as_ok()) {
-      CHECK(start_blks.size() == 1);
+      FAIL_UNLESS(start_blks.size() == 1);
       if (shard_is_sibling(prev_shard, shard)) {
         auto start_blks2 = prev_bd->get_prev_at(prev_chain_len);
-        CHECK(start_blks.size() == 1);
-        CHECK(start_blks2.size() == 1);
-        CHECK(start_blks == start_blks2);
+        FAIL_UNLESS(start_blks.size() == 1);
+        FAIL_UNLESS(start_blks2.size() == 1);
+        FAIL_UNLESS(start_blks == start_blks2);
         prev_descr.write().set_reg_mc_seqno(new_block_seqno);
         descr.write().set_reg_mc_seqno(new_block_seqno);
         auto end_lt = std::max(prev_descr->end_lt_, descr->end_lt_);
         auto ures = shard_conf_->update_shard_block_info2(prev_descr, descr, std::move(start_blks2));
         if (ures.is_error()) {
-          LOG(DEBUG) << "cannot add new split top shard blocks " << sh_bd->block_id().to_str() << " and "
-                     << prev_bd->block_id().to_str() << " to shard configuration: " << ures.move_as_error().to_string();
+          LOG(DEBUG) << "cannot add new split top shard blocks " << sh_bd->block_id() << " and " << prev_bd->block_id()
+                     << " to shard configuration: " << ures.move_as_error().to_string();
           prev_descr.clear();
           descr.clear();
         } else {
-          LOG(INFO) << "updated top shard block information with " << sh_bd->block_id().to_str() << " and "
-                    << prev_bd->block_id().to_str();
-          CHECK(ures.move_as_ok());
+          LOG(DEBUG) << "updated top shard block information with " << sh_bd->block_id() << " and "
+                     << prev_bd->block_id();
+          FAIL_UNLESS(ures.move_as_ok());
           store_shard_fees(std::move(prev_descr));
           store_shard_fees(std::move(descr));
           register_shard_block_creators(prev_bd->get_creator_list(prev_chain_len));
@@ -1676,9 +2030,9 @@ bool Collator::import_new_shard_top_blocks() {
           shards_max_end_lt_ = std::max(shards_max_end_lt_, end_lt);
         }
       } else if (shard == prev_shard) {
-        LOG(DEBUG) << "skip postponing new top shard block " << sh_bd->block_id().to_str();
+        LOG(DEBUG) << "skip postponing new top shard block " << sh_bd->block_id();
       } else {
-        LOG(DEBUG) << "postpone adding new top shard block " << sh_bd->block_id().to_str();
+        LOG(DEBUG) << "postpone adding new top shard block " << sh_bd->block_id();
         prev_bd = std::move(sh_bd);
         prev_descr = std::move(descr);
         prev_shard = shard;
@@ -1695,7 +2049,7 @@ bool Collator::import_new_shard_top_blocks() {
     auto end_lt = descr->end_lt_;
     auto ures = shard_conf_->update_shard_block_info(descr, std::move(start_blks));
     if (ures.is_error()) {
-      LOG(DEBUG) << "cannot add new top shard block " << sh_bd->block_id().to_str()
+      LOG(DEBUG) << "cannot add new top shard block " << sh_bd->block_id()
                  << " to shard configuration: " << ures.move_as_error().to_string();
       descr.clear();
       continue;
@@ -1703,8 +2057,8 @@ bool Collator::import_new_shard_top_blocks() {
     store_shard_fees(std::move(descr));
     register_shard_block_creators(sh_bd->get_creator_list(chain_len));
     shards_max_end_lt_ = std::max(shards_max_end_lt_, end_lt);
-    LOG(INFO) << "updated top shard block information with " << sh_bd->block_id().to_str();
-    CHECK(ures.move_as_ok());
+    LOG(DEBUG) << "updated top shard block information with " << sh_bd->block_id();
+    FAIL_UNLESS(ures.move_as_ok());
     ++tb_act;
     used_shard_block_descr_.emplace_back(sh_bd);
   }
@@ -1712,9 +2066,11 @@ bool Collator::import_new_shard_top_blocks() {
     shard_conf_adjusted_ = true;
   }
   if (tb_act && verbosity >= 0) {  // DEBUG
-    LOG(INFO) << "updated shard block configuration to ";
-    auto csr = shard_conf_->get_root_csr();
-    block::gen::t_ShardHashes.print(std::cerr, csr.write());
+    FLOG(INFO) {
+      sb << "updated shard block configuration to ";
+      auto csr = shard_conf_->get_root_csr();
+      block::gen::t_ShardHashes.print(sb, csr);
+    };
   }
   block::gen::ShardFeeCreated::Record fc;
   if (!(tlb::csr_unpack(fees_import_dict_->get_root_extra(),
@@ -1761,6 +2117,8 @@ bool Collator::register_shard_block_creators(std::vector<td::Bits256> creator_li
  * @returns True if collation is successful, false otherwise.
  */
 bool Collator::try_collate() {
+  td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.preinit};
   if (!preinit_complete) {
     LOG(WARNING) << "running do_preinit()";
     if (!do_preinit()) {
@@ -1771,11 +2129,12 @@ bool Collator::try_collate() {
   if (pending) {
     return true;
   }
-  CHECK(config_);
+  FAIL_UNLESS(config_);
   last_proc_int_msg_.first = 0;
   last_proc_int_msg_.second.set_zero();
   first_unproc_int_msg_.first = ~0ULL;
   first_unproc_int_msg_.second.set_ones();
+  stats_.old_out_msg_queue_size = old_out_msg_queue_size_ = out_msg_queue_size_;
   if (is_masterchain()) {
     LOG(DEBUG) << "getting the list of special smart contracts";
     auto res = config_->get_special_smartcontracts();
@@ -1788,22 +2147,10 @@ bool Collator::try_collate() {
       LOG(DEBUG) << "special smart contract " << addr.to_hex();
     }
   }
-  if (is_masterchain()) {
-    LOG(DEBUG) << "getting the list of special tick-tock smart contracts";
-    auto res = config_->get_special_ticktock_smartcontracts(3);
-    if (res.is_error()) {
-      return fatal_error(res.move_as_error());
-    }
-    ticktock_smcs = res.move_as_ok();
-    LOG(DEBUG) << "have " << ticktock_smcs.size() << " tick-tock smart contracts";
-    for (auto addr : ticktock_smcs) {
-      LOG(DEBUG) << "special smart contract " << addr.first.to_hex() << " with ticktock=" << addr.second;
-    }
-  }
   if (is_masterchain() && prev_mc_block_seqno != last_block_seqno) {
     return fatal_error("Cannot generate new masterchain block unless most recent masterchain state is computed");
   }
-  CHECK(processed_upto_);
+  FAIL_UNLESS(processed_upto_);
   if (!fix_processed_upto(*processed_upto_)) {
     return fatal_error("Cannot adjust ProcessedUpto of our shard state");
   }
@@ -1811,12 +2158,13 @@ bool Collator::try_collate() {
     return fatal_error("Cannot adjust ProcessedUpto of the shard state of our virtual sibling");
   }
   for (auto& descr : neighbors_) {
-    CHECK(descr.processed_upto);
+    FAIL_UNLESS(descr.processed_upto);
     if (!fix_processed_upto(*descr.processed_upto)) {
       return fatal_error(std::string{"Cannot adjust ProcessedUpto of neighbor "} + descr.blk_.to_str());
     }
   }
-  return do_collate();
+  do_collate().start().detach();
+  return true;
 }
 
 /**
@@ -1834,10 +2182,10 @@ bool Collator::fix_one_processed_upto(block::MsgProcessedUpto& proc, const ton::
   auto seqno = std::min(proc.mc_seqno, prev_mc_block_seqno);
   auto state = get_aux_mc_state(seqno);
   if (state.is_null()) {
-    return fatal_error(
-        -666, PSTRING() << "cannot obtain masterchain state with seqno " << seqno << " (originally required "
-                        << proc.mc_seqno << ") in a MsgProcessedUpto record for "
-                        << ton::ShardIdFull{owner.workchain, proc.shard}.to_str() << " owned by " << owner.to_str());
+    return fatal_error(-666, PSTRING() << "cannot obtain masterchain state with seqno " << seqno
+                                       << " (originally required " << proc.mc_seqno
+                                       << ") in a MsgProcessedUpto record for "
+                                       << ton::ShardIdFull{owner.workchain, proc.shard} << " owned by " << owner);
   }
   proc.compute_shard_end_lt = state->get_config()->get_compute_shard_end_lt_func();
   return (bool)proc.compute_shard_end_lt;
@@ -1861,25 +2209,27 @@ bool Collator::fix_processed_upto(block::MsgProcessedUptoCollection& upto) {
 
 /**
  * Initializes the unix time for the new block.
- * 
+ *
  * Unix time is set based on the current time, and the timestamps of the previous blocks.
  * If the previous block has a timestamp too far in the past then skipping importing external messages and new shard blocks is allowed.
  *
  * @returns True if the initialization is successful, false otherwise.
  */
 bool Collator::init_utime() {
-  CHECK(config_);
+  FAIL_UNLESS(config_);
   // consider unixtime and lt from previous block(s) of the same shardchain
   prev_now_ = prev_state_utime_;
   // Extend collator timeout if previous block is too old
   td::Timestamp new_timeout = td::Timestamp::in(std::min(30.0, (td::Clocks::system() - (double)prev_now_) / 2));
-  if (timeout < new_timeout) {
-    timeout = new_timeout;
-    alarm_timestamp() = timeout;
+  if (timeout_ < new_timeout) {
+    timeout_ = new_timeout;
+    alarm_timestamp() = timeout_;
   }
 
   auto prev = std::max<td::uint32>(config_->utime, prev_now_);
-  now_ = std::max<td::uint32>(prev + 1, (unsigned)std::time(nullptr));
+  double now = params_.utime ? params_.utime.value() : td::Clocks::system();
+  now_ms_ = std::max((td::uint64)(prev + (allow_same_timestamp_ ? 0 : 1)) * 1000, (td::uint64)(now * 1000));
+  now_ = (UnixTime)(now_ms_ / 1000);
   if (now_ > now_upper_limit_) {
     return fatal_error(
         "error initializing unix time for the new block: failed to observe end of fsm_split time interval for this "
@@ -1923,7 +2273,7 @@ bool Collator::init_utime() {
  * Initializes the logical time of the new block.
  */
 bool Collator::init_lt() {
-  CHECK(config_);
+  FAIL_UNLESS(config_);
   start_lt = config_->lt;
   if (!is_masterchain()) {
     start_lt = std::max(start_lt, prev_state_lt_);
@@ -1950,16 +2300,20 @@ bool Collator::init_lt() {
  * @returns True if the configuration parameters were successfully fetched and initialized, false otherwise.
  */
 bool Collator::fetch_config_params() {
-  auto res = block::FetchConfigParams::fetch_config_params(*config_,
-                                      &old_mparams_, &storage_prices_, &storage_phase_cfg_,
-                                      &rand_seed_, &compute_phase_cfg_, &action_phase_cfg_,
-                                      &masterchain_create_fee_, &basechain_create_fee_,
-                                      workchain(), now_
-                                     );
+  auto res = block::FetchConfigParams::fetch_config_params(
+      *config_, &old_mparams_, &storage_prices_, &storage_phase_cfg_, &rand_seed_, &compute_phase_cfg_,
+      &action_phase_cfg_, &serialize_cfg_, &masterchain_create_fee_, &basechain_create_fee_, workchain(), now_);
   if (res.is_error()) {
     return fatal_error(res.move_as_error());
   }
   compute_phase_cfg_.libraries = std::make_unique<vm::Dictionary>(config_->get_libraries_root(), 256);
+  defer_out_queue_size_limit_ = std::max<td::uint64>(params_.collator_opts->defer_out_queue_size_limit,
+                                                     compute_phase_cfg_.size_limits.defer_out_queue_size_limit);
+  // This one is checked in validate-query
+  hard_defer_out_queue_size_limit_ = compute_phase_cfg_.size_limits.defer_out_queue_size_limit;
+  if (global_version_ >= 16) {
+    out_msg_queue_size_hard_limit_ = compute_phase_cfg_.size_limits.out_msg_queue_size_hard_limit;
+  }
   return true;
 }
 
@@ -1984,8 +2338,8 @@ bool Collator::compute_minted_amount(block::CurrencyCollection& to_mint) {
     return true;
   }
   vm::Dictionary dict{vm::load_cell_slice(cell).prefetch_ref(), 32}, dict2{old_global_balance_.extra, 32}, dict3{32};
-  if (!dict.check_for_each([this, &dict2, &dict3](Ref<vm::CellSlice> value, td::ConstBitPtr key, int key_len) {
-        CHECK(key_len == 32);
+  if (!dict.check_for_each([this, &dict2, &dict3](Ref<vm::CellSlice> value, td::ConstBitPtr key, int key_len) -> bool {
+        FAIL_UNLESS(key_len == 32);
         int curr_id = (int)key.get_int(32);
         auto amount = block::tlb::t_VarUInteger_32.as_integer(value);
         if (amount.is_null() || !amount->is_valid()) {
@@ -2017,6 +2371,17 @@ bool Collator::compute_minted_amount(block::CurrencyCollection& to_mint) {
   if (!to_mint.is_zero()) {
     LOG(INFO) << "new currencies to be minted: " << to_mint.to_str();
   }
+  return true;
+}
+
+bool Collator::create_output_queue_merger() {
+  std::vector<block::OutputQueueMerger::Neighbor> neighbor_queues;
+  for (const auto& descr : neighbors_) {
+    auto it = neighbor_msg_queues_limits_.find(descr.shard());
+    td::int32 msg_limit = it == neighbor_msg_queues_limits_.end() ? -1 : it->second;
+    neighbor_queues.emplace_back(descr.top_block_id(), descr.outmsg_root, descr.disabled_, msg_limit);
+  }
+  nb_out_msgs_ = std::make_unique<block::OutputQueueMerger>(shard_, neighbor_queues);
   return true;
 }
 
@@ -2058,68 +2423,84 @@ bool Collator::init_value_create() {
 /**
  * Performs the collation of the new block.
  */
-bool Collator::do_collate() {
-  // After do_collate started it will not be interrupted by timeout
-  alarm_timestamp() = td::Timestamp::never();
+td::actor::Task<> Collator::do_collate() {
+  auto token = perf_log_.start_action("do_collate");
+  auto result = co_await do_collate_inner().wrap();
+  if (result.is_error()) {
+    fatal_error(result.error().clone());
+  }
+  token.finish(result.move_as_status());
+  co_return {};
+}
 
+td::actor::Task<> Collator::do_collate_inner() {
+  do_collate_started_at_ = td::Timestamp::now();
+  td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
   LOG(WARNING) << "do_collate() : start";
   if (!fetch_config_params()) {
-    return fatal_error("cannot fetch required configuration parameters from masterchain state");
+    co_return td::Status::Error("cannot fetch required configuration parameters from masterchain state");
   }
   LOG(DEBUG) << "config parameters fetched, creating message dictionaries";
-  in_msg_dict = std::make_unique<vm::AugmentedDictionary>(256, block::tlb::aug_InMsgDescr);
-  out_msg_dict = std::make_unique<vm::AugmentedDictionary>(256, block::tlb::aug_OutMsgDescr);
+  aug_InMsgDescr.global_version = aug_OutMsgDescr.global_version = global_version_;
+  in_msg_dict = std::make_unique<vm::AugmentedDictionary>(256, aug_InMsgDescr);
+  out_msg_dict = std::make_unique<vm::AugmentedDictionary>(256, aug_OutMsgDescr);
   LOG(DEBUG) << "message dictionaries created";
   if (max_lt == start_lt) {
     ++max_lt;
   }
+  allow_repeat_collation_ = true;
   // NB: interchanged 1.2 and 1.1 (is this always correct?)
   // 1.1. re-adjust neighbors' out_msg_queues (for oneself)
   if (!add_trivial_neighbor()) {
-    return fatal_error("cannot add previous block as a trivial neighbor");
+    co_return td::Status::Error("cannot add previous block as a trivial neighbor");
   }
   // 1.2. delete delivered messages from output queue
-  if (!out_msg_queue_cleanup()) {
-    return fatal_error("cannot scan OutMsgQueue and remove already delivered messages");
+  {
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.queue_cleanup};
+    if (!out_msg_queue_cleanup()) {
+      co_return td::Status::Error("cannot scan OutMsgQueue and remove already delivered messages");
+    }
   }
   // 1.3. create OutputQueueMerger from adjusted neighbors
-  CHECK(!nb_out_msgs_);
+  CO_TRY_BOOL(!nb_out_msgs_);
   LOG(DEBUG) << "creating OutputQueueMerger";
-  nb_out_msgs_ = std::make_unique<block::OutputQueueMerger>(shard_, neighbors_);
+  if (!create_output_queue_merger()) {
+    co_return td::Status::Error("cannot compute the value to be created / minted / recovered");
+  }
   // 1.4. compute created / minted / recovered
   if (!init_value_create()) {
-    return fatal_error("cannot compute the value to be created / minted / recovered");
+    co_return td::Status::Error("cannot compute the value to be created / minted / recovered");
   }
   // 2. tick transactions
   LOG(INFO) << "create tick transactions";
   if (!create_ticktock_transactions(2)) {
-    return fatal_error("cannot generate tick transactions");
+    co_return td::Status::Error("cannot generate tick transactions");
   }
   if (is_masterchain() && !create_special_transactions()) {
-    return fatal_error("cannot generate special transactions");
+    co_return td::Status::Error("cannot generate special transactions");
   }
-  if (after_merge_) {
-    // 3. merge prepare / merge install
-    LOG(DEBUG) << "create merge prepare/install transactions (NOT IMPLEMENTED YET)";
-    // TODO: implement merge prepare/install transactions for "large" smart contracts
-    // ...
+  {
+    // 3. take messages from dispatch queue
+    LOG(INFO) << "process dispatch queue";
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.dispatch_queue};
+    if (!process_dispatch_queue()) {
+      co_return td::Status::Error("cannot process dispatch queue");
+    }
   }
-  // 4. import inbound internal messages, process or transit
-  LOG(INFO) << "process inbound internal messages";
-  if (!process_inbound_internal_messages()) {
-    return fatal_error("cannot process inbound internal messages");
+  {
+    // 4. import inbound internal messages, process or transit
+    LOG(INFO) << "process inbound internal messages";
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.import_internals};
+    if (!process_inbound_internal_messages()) {
+      co_return td::Status::Error("cannot process inbound internal messages");
+    }
   }
-  // 5. import inbound external messages (if space&gas left)
-  LOG(INFO) << "process inbound external messages";
-  if (!process_inbound_external_messages()) {
-    return fatal_error("cannot process inbound external messages");
+  {
+    td::ScopedRealCpuTimer::Guard timer{work_timer_total_, nullptr};
+    // 5-6. import inbound external messages and process newly created messages (if space&gas left)
+    co_await process_external_and_new_messages();
   }
-  // 6. process newly-generated messages (if space&gas left)
-  //    (if we were unable to process all inbound messages, all new messages must be queued)
-  LOG(INFO) << "process newly-generated messages";
-  if (!process_new_messages(!inbound_queues_empty_)) {
-    return fatal_error("cannot process newly-generated outbound messages");
-  }
+  auto post_ext_token = perf_log_.start_action("post_ext_processing");
   if (before_split_) {
     // 7. split prepare / split install
     LOG(DEBUG) << "create split prepare/install transactions (NOT IMPLEMENTED YET)";
@@ -2129,56 +2510,80 @@ bool Collator::do_collate() {
   // 8. tock transactions
   LOG(INFO) << "create tock transactions";
   if (!create_ticktock_transactions(1)) {
-    return fatal_error("cannot generate tock transactions");
+    co_return td::Status::Error("cannot generate tock transactions");
   }
-  // 9. process newly-generated messages (only by including them into output queue)
-  LOG(INFO) << "enqueue newly-generated messages";
-  if (!process_new_messages(true)) {
-    return fatal_error("cannot process newly-generated outbound messages");
+  {
+    // 9. process newly-generated messages (only by including them into output queue)
+    LOG(INFO) << "enqueue newly-generated messages";
+    bool enqueue_only = true;
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.enqueue_new_messages};
+    if (!process_new_messages(enqueue_only)) {
+      co_return td::Status::Error("cannot process newly-generated outbound messages");
+    }
   }
   // 10. check block overload/underload
   LOG(DEBUG) << "check block overload/underload";
   if (!check_block_overload()) {
-    return fatal_error("cannot check block overload/underload");
+    co_return td::Status::Error("cannot check block overload/underload");
   }
   // 11. update public libraries
   if (is_masterchain()) {
     LOG(DEBUG) << "update public libraries";
     if (!update_public_libraries()) {
-      return fatal_error("cannot update public libraries");
+      co_return td::Status::Error("cannot update public libraries");
     }
   }
   // serialize everything
-  // A. serialize ShardAccountBlocks and new ShardAccounts
-  LOG(DEBUG) << "serialize account states and blocks";
-  if (!combine_account_transactions()) {
-    return fatal_error("cannot combine separate Account transactions into a new ShardAccountBlocks");
+  {
+    // A. serialize ShardAccountBlocks and new ShardAccounts
+    LOG(DEBUG) << "serialize account states and blocks";
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.combine_account_transactions};
+    if (!combine_account_transactions()) {
+      co_return td::Status::Error("cannot combine separate Account transactions into a new ShardAccountBlocks");
+    }
   }
-  // B. serialize McStateExtra
-  LOG(DEBUG) << "serialize McStateExtra";
-  if (!create_mc_state_extra()) {
-    return fatal_error("cannot create new McStateExtra");
+  {
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_shard_state};
+    // B-. compute total balance of the shardchain
+    if (!compute_total_balance()) {
+      co_return td::Status::Error("failed to compute total balance of the shardchain");
+    }
+    // B. serialize McStateExtra
+    LOG(DEBUG) << "serialize McStateExtra";
+    if (!create_mc_state_extra()) {
+      co_return td::Status::Error("cannot create new McStateExtra");
+    }
+    // C. serialize ShardState
+    LOG(DEBUG) << "serialize ShardState";
+    if (!create_shard_state()) {
+      co_return td::Status::Error("cannot create new ShardState");
+    }
   }
-  // C. serialize ShardState
-  LOG(DEBUG) << "serialize ShardState";
-  if (!create_shard_state()) {
-    return fatal_error("cannot create new ShardState");
+  {
+    // D. serialize Block
+    LOG(DEBUG) << "serialize Block";
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_block};
+    if (!create_block()) {
+      co_return td::Status::Error("cannot create new Block");
+    }
   }
-  // D. serialize Block
-  LOG(DEBUG) << "serialize Block";
-  if (!create_block()) {
-    return fatal_error("cannot create new Block");
+  {
+    // E. create collated data
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_collated_data};
+    if (!create_collated_data()) {
+      co_return td::Status::Error("cannot create collated data for new Block candidate");
+    }
   }
-  // E. create collated data
-  if (!create_collated_data()) {
-    return fatal_error("cannot create collated data for new Block candidate");
+  {
+    // F. create a block candidate
+    LOG(DEBUG) << "create a Block candidate";
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_block_candidate};
+    if (!create_block_candidate()) {
+      co_return td::Status::Error("cannot serialize a new Block candidate");
+    }
   }
-  // F. create a block candidate
-  LOG(DEBUG) << "create a Block candidate";
-  if (!create_block_candidate()) {
-    return fatal_error("cannot serialize a new Block candidate");
-  }
-  return true;
+  post_ext_token.finish(td::Result<td::Unit>(td::Unit()));
+  co_return {};
 }
 
 /**
@@ -2210,18 +2615,23 @@ bool Collator::dequeue_message(Ref<vm::Cell> msg_envelope, ton::LogicalTime deli
 
 /**
  * Cleans up the outbound message queue by removing messages that have already been imported by neighbors.
- * 
+ *
  * Cleanup may be interrupted early if it takes too long.
  *
  * @returns True if the cleanup operation was successful, false otherwise.
  */
 bool Collator::out_msg_queue_cleanup() {
+  SCOPE_EXIT {
+    stats_.load_fraction_queue_cleanup = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
+  };
   LOG(INFO) << "cleaning outbound queue from messages already imported by neighbors";
   if (verbosity >= 2) {
-    auto rt = out_msg_queue_->get_root();
-    std::cerr << "old out_msg_queue is ";
-    block::gen::t_OutMsgQueue.print(std::cerr, *rt);
-    rt->print_rec(std::cerr);
+    FLOG(INFO) {
+      auto rt = out_msg_queue_->get_root();
+      sb << "old out_msg_queue is ";
+      block::gen::t_OutMsgQueue.print(sb, rt);
+      rt->print_rec(sb);
+    };
   }
 
   if (after_merge_) {
@@ -2229,12 +2639,13 @@ bool Collator::out_msg_queue_cleanup() {
     // Queue is not too big, see const MERGE_MAX_QUEUE_SIZE
     for (const auto& nb : neighbors_) {
       if (!nb.is_disabled() && (!nb.processed_upto || !nb.processed_upto->can_check_processed())) {
-        return fatal_error(-667, PSTRING() << "internal error: no info for checking processed messages from neighbor "
-                                           << nb.blk_.to_str());
+        return fatal_error(
+            -667, PSTRING() << "internal error: no info for checking processed messages from neighbor " << nb.blk_);
       }
     }
     td::uint32 deleted = 0;
-    auto res = out_msg_queue_->filter([&](vm::CellSlice& cs, td::ConstBitPtr key, int n) -> int {
+    bool ok = out_msg_queue_->check_for_each([&](Ref<vm::CellSlice> value, td::ConstBitPtr key, int n) -> bool {
+      vm::CellSlice& cs = value.write();
       assert(n == 352);
       block::EnqueuedMsgDescr enq_msg_descr;
       unsigned long long created_lt;
@@ -2243,7 +2654,7 @@ bool Collator::out_msg_queue_cleanup() {
             && enq_msg_descr.check_key(key)      // check key
             && enq_msg_descr.lt_ == created_lt)) {
         LOG(ERROR) << "cannot unpack EnqueuedMsg with key " << key.to_hex(n);
-        return -1;
+        return false;
       }
       LOG(DEBUG) << "scanning outbound message with (lt,hash)=(" << enq_msg_descr.lt_ << ","
                  << enq_msg_descr.hash_.to_hex() << ") enqueued_lt=" << enq_msg_descr.enqueued_lt_;
@@ -2260,25 +2671,29 @@ bool Collator::out_msg_queue_cleanup() {
       }
       if (delivered) {
         ++deleted;
-        CHECK(out_msg_queue_size_ > 0);
+        FAIL_UNLESS(out_msg_queue_size_ > 0);
         --out_msg_queue_size_;
         LOG(DEBUG) << "outbound message with (lt,hash)=(" << enq_msg_descr.lt_ << "," << enq_msg_descr.hash_.to_hex()
                    << ") enqueued_lt=" << enq_msg_descr.enqueued_lt_ << " has been already delivered, dequeueing";
+        out_msg_queue_->lookup_delete(key, n);
+
         if (!dequeue_message(std::move(enq_msg_descr.msg_env_), deliver_lt)) {
           fatal_error(PSTRING() << "cannot dequeue outbound message with (lt,hash)=(" << enq_msg_descr.lt_ << ","
                                 << enq_msg_descr.hash_.to_hex() << ") by inserting a msg_export_deq record");
-          return -1;
+          return false;
         }
         register_out_msg_queue_op();
         if (!block_limit_status_->fits(block::ParamLimits::cl_normal)) {
           block_full_ = true;
+          block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
         }
       }
-      return !delivered;
+      return true;
     });
+    stats_.msg_queue_cleaned = deleted;
     LOG(WARNING) << "deleted " << deleted << " messages from out_msg_queue after merge, remaining queue size is "
                  << out_msg_queue_size_;
-    if (res < 0) {
+    if (!ok) {
       return fatal_error("error scanning/updating OutMsgQueue");
     }
   } else {
@@ -2291,8 +2706,8 @@ bool Collator::out_msg_queue_cleanup() {
         continue;
       }
       if (!nb.processed_upto || !nb.processed_upto->can_check_processed()) {
-        return fatal_error(-667, PSTRING() << "internal error: no info for checking processed messages from neighbor "
-                                           << nb.blk_.to_str());
+        return fatal_error(
+            -667, PSTRING() << "internal error: no info for checking processed messages from neighbor " << nb.blk_);
       }
       queue_parts.emplace_back(block::OutputQueueMerger{nb.shard(), {this_queue}}, &nb);
     }
@@ -2307,6 +2722,9 @@ bool Collator::out_msg_queue_cleanup() {
       if (queue_cleanup_timeout_.is_in_past(td::Timestamp::now())) {
         LOG(WARNING) << "cleaning up outbound queue takes too long, ending";
         break;
+      }
+      if (!check_cancelled()) {
+        return false;
       }
       if (i == queue_parts.size()) {
         i = 0;
@@ -2327,7 +2745,7 @@ bool Collator::out_msg_queue_cleanup() {
                      << enq_msg_descr.hash_.to_hex() << ") enqueued_lt=" << enq_msg_descr.enqueued_lt_
                      << ": message has been already delivered, dequeueing";
           ++deleted;
-          CHECK(out_msg_queue_size_ > 0);
+          FAIL_UNLESS(out_msg_queue_size_ > 0);
           --out_msg_queue_size_;
           out_msg_queue_->lookup_delete_with_extra(kv->key.cbits(), kv->key_len);
           if (!dequeue_message(std::move(enq_msg_descr.msg_env_), nb->end_lt())) {
@@ -2338,6 +2756,7 @@ bool Collator::out_msg_queue_cleanup() {
           register_out_msg_queue_op();
           if (!block_limit_status_->fits(block::ParamLimits::cl_normal)) {
             block_full_ = true;
+            block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
           }
           queue.next();
           ++i;
@@ -2348,18 +2767,21 @@ bool Collator::out_msg_queue_cleanup() {
                      << ": message has not been delivered";
         }
       }
-      LOG(DEBUG) << "no more unprocessed messages to shard " << nb->shard().to_str();
+      LOG(DEBUG) << "no more unprocessed messages to shard " << nb->shard();
       std::swap(queue_parts[i], queue_parts.back());
       queue_parts.pop_back();
     }
+    stats_.msg_queue_cleaned = deleted;
     LOG(WARNING) << "deleted " << deleted << " messages from out_msg_queue, remaining queue size is "
                  << out_msg_queue_size_;
   }
   if (verbosity >= 2) {
-    auto rt = out_msg_queue_->get_root();
-    std::cerr << "new out_msg_queue is ";
-    block::gen::t_OutMsgQueue.print(std::cerr, *rt);
-    rt->print_rec(std::cerr);
+    FLOG(INFO) {
+      auto rt = out_msg_queue_->get_root();
+      sb << "new out_msg_queue is ";
+      block::gen::t_OutMsgQueue.print(sb, rt);
+      rt->print_rec(sb);
+    };
   }
   return register_out_msg_queue_op(true);
 }
@@ -2387,7 +2809,84 @@ std::unique_ptr<block::Account> Collator::make_account_from(td::ConstBitPtr addr
     return nullptr;
   }
   ptr->block_lt = start_lt;
+  if (!init_account_storage_dict(*ptr)) {
+    return nullptr;
+  }
   return ptr;
+}
+
+/**
+ * If full collated data is enabled, initialize account storage dict and prepare MerkleProofBuilder for it
+ *
+ * @param account Account to initialize storage dict for
+ * @return True on success, False on failure
+ */
+bool Collator::init_account_storage_dict(block::Account& account) {
+  if (!account.storage_dict_hash || account.storage.is_null()) {
+    return true;
+  }
+  td::Bits256 storage_dict_hash = account.storage_dict_hash.value();
+  if (storage_dict_hash.is_zero()) {
+    return true;
+  }
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.prelim_storage_stat};
+  td::Ref<vm::Cell> cached_dict_root =
+      storage_stat_cache_ ? storage_stat_cache_(storage_dict_hash) : td::Ref<vm::Cell>{};
+  if (cached_dict_root.not_null()) {
+    FAIL_UNLESS(td::Bits256{cached_dict_root->get_hash().bits()} == storage_dict_hash);
+    LOG(DEBUG) << "Inited storage stat from cache for account " << account.addr.to_hex() << " ("
+               << account.storage_used.cells << " cells)";
+    storage_stat_cache_update_.emplace_back(cached_dict_root, account.storage_used.cells);
+    stats_.storage_stat_cache.hit_cnt++;
+    stats_.storage_stat_cache.hit_cells += account.storage_used.cells;
+  } else if (account.storage_used.cells >= StorageStatCache::MIN_ACCOUNT_CELLS) {
+    stats_.storage_stat_cache.miss_cnt++;
+    stats_.storage_stat_cache.miss_cells += account.storage_used.cells;
+  } else {
+    stats_.storage_stat_cache.small_cnt++;
+    stats_.storage_stat_cache.small_cells += account.storage_used.cells;
+  }
+  if (!full_collated_data_ || is_masterchain()) {
+    if (cached_dict_root.not_null()) {
+      auto S = account.init_account_storage_stat(cached_dict_root);
+      if (S.is_error()) {
+        return fatal_error(S.move_as_error_prefix(PSTRING() << "failed to init storage stat from cache for account "
+                                                            << account.addr.to_hex() << ": "));
+      }
+    }
+    return true;
+  }
+
+  AccountStorageDict& dict = account_storage_dicts_[storage_dict_hash];
+  if (!dict.inited) {
+    dict.inited = true;
+    td::Ref<vm::Cell> dict_root;
+    if (cached_dict_root.not_null()) {
+      dict_root = cached_dict_root;
+    } else {
+      // don't mark cells in account state as loaded during compute_account_storage_dict
+      state_usage_tree_->set_ignore_loads(true);
+      auto res = account.compute_account_storage_dict();
+      state_usage_tree_->set_ignore_loads(false);
+      if (res.is_error()) {
+        return fatal_error(res.move_as_error_prefix(PSTRING() << "Failed to init account storage dict for "
+                                                              << account.addr.to_hex() << ": "));
+      }
+      dict_root = res.move_as_ok();
+      if (dict_root.is_null()) {  // Impossible if storage_dict_hash is not zero
+        return fatal_error(PSTRING() << "Failed to init account storage dict for " << account.addr.to_hex()
+                                     << ": dict is empty");
+      }
+    }
+    dict.mpb = vm::MerkleProofBuilder(std::move(dict_root));
+    dict.mpb.set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
+  }
+  auto S = account.init_account_storage_stat(dict.mpb.root());
+  if (S.is_error()) {
+    return fatal_error(S.move_as_error_prefix(PSTRING() << "Failed to init account storage dict for "
+                                                        << account.addr.to_hex() << ": "));
+  }
+  return true;
 }
 
 /**
@@ -2429,7 +2928,7 @@ td::Result<block::Account*> Collator::make_account(td::ConstBitPtr addr, bool fo
   }
   if (!new_acc->belongs_to_shard(shard_)) {
     return td::Status::Error(PSTRING() << "account " << addr.to_hex(256) << " does not really belong to current shard "
-                                       << shard_.to_str());
+                                       << shard_);
   }
   auto ins = accounts.emplace(addr, std::move(new_acc));
   if (!ins.second) {
@@ -2437,6 +2936,186 @@ td::Result<block::Account*> Collator::make_account(td::ConstBitPtr addr, bool fo
                                        << "into account collection");
   }
   return ins.first->second.get();
+}
+
+/**
+ * Removes UsageCell's from new_root's subtree, replacing them with regular DataCell's
+ *
+ * @param old_root Original root (not wrapped in UsageCell)
+ * @param new_root Cell to remove UsageCell's from
+ * @param usage_tree CellUsageTree for old_root
+ *
+ * @returns new_root without UsageCell's
+ */
+static td::Result<td::Ref<vm::Cell>> clean_usage_cells(td::Ref<vm::Cell> old_root, td::Ref<vm::Cell> new_root,
+                                                       const vm::CellUsageTree& usage_tree) {
+  if (new_root.is_null()) {
+    return td::Ref<vm::Cell>{};
+  }
+
+  td::HashMap<vm::CellHash, td::Ref<vm::Cell>> visited_cells;
+  std::function<void(td::Ref<vm::Cell>, vm::CellUsageTree::NodeId)> dfs_old = [&](td::Ref<vm::Cell> cell,
+                                                                                  vm::CellUsageTree::NodeId node_id) {
+    visited_cells[cell->get_hash()] = cell;
+    if (!usage_tree.is_loaded(node_id)) {
+      return;
+    }
+    vm::CellSlice cs{vm::NoVm(), cell};
+    for (unsigned i = 0; i < cs.size_refs(); i++) {
+      dfs_old(cs.prefetch_ref(i), usage_tree.get_child(node_id, i));
+    }
+  };
+  if (old_root.not_null()) {
+    dfs_old(old_root, usage_tree.root_id());
+  }
+
+  std::function<td::Result<td::Ref<vm::Cell>>(td::Ref<vm::Cell>)> dfs =
+      [&](td::Ref<vm::Cell> cell) -> td::Result<td::Ref<vm::Cell>> {
+    auto it = visited_cells.find(cell->get_hash());
+    if (it != visited_cells.end()) {
+      return it->second;
+    }
+    auto loaded_cell = cell->load_cell().move_as_ok();
+    TRY_BOOL(loaded_cell.effective_level >= loaded_cell.data_cell->get_level());
+    td::Ref<vm::DataCell> data_cell = std::move(loaded_cell.data_cell);
+    td::Ref<vm::Cell> children[vm::Cell::max_refs];
+    bool changed = false;
+    for (unsigned i = 0; i < data_cell->size_refs(); ++i) {
+      td::Ref<vm::Cell> child = data_cell->get_ref(i);
+      TRY_RESULT_ASSIGN(children[i], dfs(child));
+      if (children[i] != child) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      data_cell = vm::DataCell::create(td::Slice{data_cell->get_data(), (data_cell->size() + 7) / 8}, data_cell->size(),
+                                       {children, data_cell->size_refs()}, data_cell->is_special())
+                      .move_as_ok();
+      TRY_BOOL(data_cell->get_hash() == cell->get_hash());
+    }
+    return visited_cells[cell->get_hash()] = data_cell;
+  };
+  return dfs(new_root);
+}
+
+/**
+ * Decides whether to include storage dict proof to collated data for this account or not.
+ *
+ * @param account Account object
+ *
+ * @returns True if the operation is successful, false otherwise.
+ */
+bool Collator::process_account_storage_dict(block::Account& account) {
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.final_storage_stat};
+  bool store_dict_to_cache = account.storage_dict_hash && account.account_storage_stat &&
+                             account.account_storage_stat.value().is_dict_ready() &&
+                             account.storage_used.cells >= StorageStatCache::MIN_ACCOUNT_CELLS;
+  if (!account.orig_storage_dict_hash) {
+    if (store_dict_to_cache) {
+      td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
+      storage_stat_cache_update_.emplace_back(dict_root, account.storage_used.cells);
+    }
+    return true;
+  }
+  td::Bits256 storage_dict_hash = account.orig_storage_dict_hash.value();
+  auto it = account_storage_dicts_.find(storage_dict_hash);
+  if (it == account_storage_dicts_.end()) {
+    if (store_dict_to_cache) {
+      td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
+      storage_stat_cache_update_.emplace_back(dict_root, account.storage_used.cells);
+    }
+    return true;
+  }
+  FAIL_UNLESS(full_collated_data_ && !is_masterchain());
+  AccountStorageDict& dict = it->second;
+  td::Ref<vm::Cell> original_dict_root = dict.mpb.original_root();
+  if (store_dict_to_cache) {
+    td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
+    auto r_dict_root = clean_usage_cells(original_dict_root, dict_root, dict.mpb.get_usage_tree());
+    if (r_dict_root.is_error()) {
+      return fatal_error(r_dict_root.move_as_error());
+    }
+    dict_root = r_dict_root.move_as_ok();
+    storage_stat_cache_update_.emplace_back(dict_root, account.storage_used.cells);
+  }
+  if (dict.add_to_collated_data) {
+    LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex() << " : already included";
+    return true;
+  }
+  if (dict.storage_stat_updates.empty()) {
+    LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex() << " : not required (no storage updates)";
+    return true;
+  }
+
+  td::HashSet<vm::CellHash> visited;
+  bool calculate_proof_size_diff = true;
+  td::int64 proof_size_diff = 0;
+  vm::Dictionary original_dict{original_dict_root, 256};
+  std::function<bool(const Ref<vm::Cell>&)> dfs = [&](const Ref<vm::Cell>& cell) -> bool {
+    if (cell.is_null() || !visited.emplace(cell->get_hash()).second) {
+      return true;
+    }
+    auto loaded_cell = cell->load_cell().move_as_ok();
+    if (original_dict.lookup(cell->get_hash().bits(), 256).not_null()) {
+      if (calculate_proof_size_diff) {
+        switch (collated_data_stat.get_cell_status(cell->get_hash())) {
+          case vm::ProofStorageStat::c_none:
+            proof_size_diff += vm::ProofStorageStat::estimate_serialized_size(loaded_cell.data_cell);
+            break;
+          case vm::ProofStorageStat::c_prunned:
+            proof_size_diff -= vm::ProofStorageStat::estimate_prunned_size(loaded_cell.data_cell->get_level_mask());
+            proof_size_diff += vm::ProofStorageStat::estimate_serialized_size(loaded_cell.data_cell);
+            break;
+          case vm::ProofStorageStat::c_loaded:
+            break;
+        }
+        if (proof_size_diff > (td::int64)dict.proof_stat.estimate_proof_size()) {
+          return false;
+        }
+      } else {
+        collated_data_stat.add_loaded_cell(loaded_cell.data_cell, static_cast<td::uint8>(loaded_cell.effective_level));
+      }
+    }
+    vm::CellSlice cs{std::move(loaded_cell.data_cell)};
+    for (unsigned i = 0; i < cs.size_refs(); ++i) {
+      if (!dfs(cs.prefetch_ref(i))) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // Visit cells that were used in storage stat computation to calculate collated data increase
+  bool account_proof_too_big = false;
+  state_usage_tree_->set_ignore_loads(true);
+  for (const auto& cell : dict.storage_stat_updates) {
+    if (!dfs(cell)) {
+      account_proof_too_big = true;
+      break;
+    }
+  }
+  state_usage_tree_->set_ignore_loads(false);
+
+  if (account_proof_too_big) {
+    LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex()
+               << " : account_proof_size>=" << proof_size_diff
+               << ", dict_proof_size=" << dict.proof_stat.estimate_proof_size() << ", include dict in collated data";
+    dict.add_to_collated_data = true;
+    collated_data_stat.add_loaded_cells(dict.proof_stat);
+  } else {
+    LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex()
+               << " : account_proof_size=" << proof_size_diff
+               << ", dict_proof_size=" << dict.proof_stat.estimate_proof_size()
+               << ", DO NOT include dict in collated data";
+    // Include account storage in collated data
+    calculate_proof_size_diff = false;
+    visited.clear();
+    for (const auto& cell : dict.storage_stat_updates) {
+      FAIL_UNLESS(dfs(cell));
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -2448,7 +3127,7 @@ bool Collator::combine_account_transactions() {
   vm::AugmentedDictionary dict{256, block::tlb::aug_ShardAccountBlocks};
   for (auto& z : accounts) {
     block::Account& acc = *(z.second);
-    CHECK(acc.addr == z.first);
+    FAIL_UNLESS(acc.addr == z.first);
     if (!acc.transactions.empty()) {
       // have transactions for this account
       vm::CellBuilder cb;
@@ -2458,21 +3137,11 @@ bool Collator::combine_account_transactions() {
       auto cell = cb.finalize();
       auto csr = vm::load_cell_slice_ref(cell);
       if (verbosity > 2) {
-        std::cerr << "new AccountBlock for " << z.first.to_hex() << ": ";
-        block::gen::t_AccountBlock.print_ref(std::cerr, cell);
-        csr->print_rec(std::cerr);
-      }
-      if (!block::gen::t_AccountBlock.validate_ref(100000, cell)) {
-        block::gen::t_AccountBlock.print_ref(std::cerr, cell);
-        csr->print_rec(std::cerr);
-        return fatal_error(std::string{"new AccountBlock for "} + z.first.to_hex() +
-                           " failed to pass automatic validation tests");
-      }
-      if (!block::tlb::t_AccountBlock.validate_ref(100000, cell)) {
-        block::gen::t_AccountBlock.print_ref(std::cerr, cell);
-        csr->print_rec(std::cerr);
-        return fatal_error(std::string{"new AccountBlock for "} + z.first.to_hex() +
-                           " failed to pass handwritten validation tests");
+        FLOG(INFO) {
+          sb << "new AccountBlock for " << z.first.to_hex() << ": ";
+          block::gen::t_AccountBlock.print_ref(sb, cell);
+          csr->print_rec(sb);
+        };
       }
       if (!dict.set(z.first, csr, vm::Dictionary::SetMode::Add)) {
         return fatal_error(std::string{"new AccountBlock for "} + z.first.to_hex() +
@@ -2483,7 +3152,7 @@ bool Collator::combine_account_transactions() {
         // account changed
         if (acc.orig_status == block::Account::acc_nonexist) {
           // account created
-          CHECK(acc.status != block::Account::acc_nonexist);
+          FAIL_UNLESS(acc.status != block::Account::acc_nonexist);
           vm::CellBuilder cb;
           if (!(cb.store_ref_bool(acc.total_state)             // account_descr$_ account:^Account
                 && cb.store_bits_bool(acc.last_trans_hash_)    // last_trans_hash:bits256
@@ -2495,8 +3164,10 @@ bool Collator::combine_account_transactions() {
         } else if (acc.status == block::Account::acc_nonexist) {
           // account deleted
           if (verbosity > 2) {
-            std::cerr << "deleting account " << acc.addr.to_hex() << " with empty new value ";
-            block::gen::t_Account.print_ref(std::cerr, acc.total_state);
+            FLOG(INFO) {
+              sb << "deleting account " << acc.addr.to_hex() << " with empty new value ";
+              block::gen::t_Account.print_ref(sb, acc.total_state);
+            };
           }
           if (account_dict->lookup_delete(acc.addr).is_null()) {
             return fatal_error(std::string{"cannot delete account "} + acc.addr.to_hex() + " from ShardAccounts");
@@ -2504,8 +3175,10 @@ bool Collator::combine_account_transactions() {
         } else {
           // existing account modified
           if (verbosity > 4) {
-            std::cerr << "modifying account " << acc.addr.to_hex() << " to ";
-            block::gen::t_Account.print_ref(std::cerr, acc.total_state);
+            FLOG(INFO) {
+              sb << "modifying account " << acc.addr.to_hex() << " to ";
+              block::gen::t_Account.print_ref(sb, acc.total_state);
+            };
           }
           if (!(cb.store_ref_bool(acc.total_state)             // account_descr$_ account:^Account
                 && cb.store_bits_bool(acc.last_trans_hash_)    // last_trans_hash:bits256
@@ -2515,6 +3188,9 @@ bool Collator::combine_account_transactions() {
                                " in ShardAccounts");
           }
         }
+      }
+      if (!process_account_storage_dict(acc)) {
+        return false;
       }
     } else {
       if (acc.total_state->get_hash() != acc.orig_total_state->get_hash()) {
@@ -2528,30 +3204,19 @@ bool Collator::combine_account_transactions() {
     return fatal_error("cannot serialize ShardAccountBlocks");
   }
   if (verbosity > 2) {
-    std::cerr << "new ShardAccountBlocks: ";
-    block::gen::t_ShardAccountBlocks.print_ref(std::cerr, shard_account_blocks_);
-    vm::load_cell_slice(shard_account_blocks_).print_rec(std::cerr);
-  }
-  if (!block::gen::t_ShardAccountBlocks.validate_ref(100000, shard_account_blocks_)) {
-    return fatal_error("new ShardAccountBlocks failed to pass automatic validity tests");
-  }
-  if (!block::tlb::t_ShardAccountBlocks.validate_ref(100000, shard_account_blocks_)) {
-    return fatal_error("new ShardAccountBlocks failed to pass handwritten validity tests");
+    FLOG(INFO) {
+      sb << "new ShardAccountBlocks: ";
+      block::gen::t_ShardAccountBlocks.print_ref(sb, shard_account_blocks_);
+      vm::load_cell_slice(shard_account_blocks_).print_rec(sb);
+    };
   }
   auto shard_accounts = account_dict->get_root();
   if (verbosity > 2) {
-    std::cerr << "new ShardAccounts: ";
-    block::gen::t_ShardAccounts.print(std::cerr, *shard_accounts);
-    shard_accounts->print_rec(std::cerr);
-  }
-  if (verify >= 2) {
-    LOG(INFO) << "verifying new ShardAccounts";
-    if (!block::gen::t_ShardAccounts.validate_upto(100000, *shard_accounts)) {
-      return fatal_error("new ShardAccounts failed to pass automatic validity tests");
-    }
-    if (!block::tlb::t_ShardAccounts.validate_upto(100000, *shard_accounts)) {
-      return fatal_error("new ShardAccounts failed to pass handwritten validity tests");
-    }
+    FLOG(INFO) {
+      sb << "new ShardAccounts: ";
+      block::gen::t_ShardAccounts.print(sb, shard_accounts);
+      shard_accounts->print_rec(sb);
+    };
   }
   return true;
 }
@@ -2570,11 +3235,11 @@ bool Collator::create_special_transaction(block::CurrencyCollection amount, Ref<
   if (amount.is_zero()) {
     return true;
   }
-  CHECK(dest_addr_cell.not_null());
+  FAIL_UNLESS(dest_addr_cell.not_null());
   ton::StdSmcAddress addr;
-  CHECK(vm::load_cell_slice(dest_addr_cell).prefetch_bits_to(addr));
+  FAIL_UNLESS(vm::load_cell_slice(dest_addr_cell).prefetch_bits_to(addr));
   LOG(INFO) << "creating special transaction to recover " << amount.to_str() << " to account " << addr.to_hex();
-  CHECK(in_msg.is_null());
+  FAIL_UNLESS(in_msg.is_null());
   ton::LogicalTime lt = start_lt;
   vm::CellBuilder cb;
   Ref<vm::Cell> msg;
@@ -2584,7 +3249,7 @@ bool Collator::create_special_transaction(block::CurrencyCollection amount, Ref<
         && cb.store_long_bool(0x4ff, 11)  // addr_std$10 anycast:(Maybe Anycast) workchain_id:int8
         && cb.store_bits_bool(addr)       //   address:bits256 => dest:MsgAddressInt
         && amount.store(cb)               // value:CurrencyCollection
-        && cb.store_zeroes_bool(4 + 4)    // ihr_fee:Grams fwd_fee:Grams
+        && cb.store_zeroes_bool(4 + 4)    // extra_flags:(VarUInteger 16) fwd_fee:Grams
         && cb.store_long_bool(lt, 64)     // created_lt:uint64
         && cb.store_long_bool(now_, 32)   // created_at:uint32
         && cb.store_zeroes_bool(2)        // init:(Maybe ...) body:(Either X ^X) = Message X
@@ -2593,15 +3258,17 @@ bool Collator::create_special_transaction(block::CurrencyCollection amount, Ref<
                        addr.to_hex());
   }
   if (verbosity >= 4) {
-    block::gen::t_Message_Any.print_ref(std::cerr, msg);
+    FLOG(INFO) {
+      block::gen::t_Message_Any.print_ref(sb, msg);
+    };
   }
-  CHECK(block::gen::t_Message_Any.validate_ref(msg));
-  CHECK(block::tlb::t_Message.validate_ref(msg));
-  if (process_one_new_message(block::NewOutMsg{lt, msg, Ref<vm::Cell>{}}, false, &in_msg) != 1) {
+  FAIL_UNLESS(block::gen::t_Message_Any.validate_ref(msg));
+  FAIL_UNLESS(block::tlb::t_Message.validate_ref(msg));
+  if (process_one_new_message(block::NewOutMsg{lt, msg, Ref<vm::Cell>{}, 0}, false, &in_msg) != 1) {
     return fatal_error("cannot generate special transaction for recovering "s + amount.to_str() + " to account " +
                        addr.to_hex());
   }
-  CHECK(in_msg.not_null());
+  FAIL_UNLESS(in_msg.not_null());
   return true;
 }
 
@@ -2612,7 +3279,7 @@ bool Collator::create_special_transaction(block::CurrencyCollection amount, Ref<
  * @returns True if both special transactions were
  */
 bool Collator::create_special_transactions() {
-  CHECK(is_masterchain());
+  FAIL_UNLESS(is_masterchain());
   return create_special_transaction(value_flow_.recovered, config_->get_config_param(3, 1), recover_create_msg_) &&
          create_special_transaction(value_flow_.minted, config_->get_config_param(2, 0), mint_msg_);
 }
@@ -2622,7 +3289,7 @@ bool Collator::create_special_transactions() {
  *
  * @param smc_addr The address of the smart contract.
  * @param req_start_lt The requested start logical time for the transaction.
- * @param mask The value indicating wheter the thansaction is tick (mask == 2) or tock (mask == 1).
+ * @param mask The value indicating whether the thansaction is tick (mask == 2) or tock (mask == 1).
  *
  * @returns True if the transaction was created successfully, false otherwise.
  */
@@ -2639,13 +3306,25 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
     return true;
   }
   req_start_lt = std::max(req_start_lt, start_lt + 1);
+  auto it = last_dispatch_queue_emitted_lt_.find(acc->addr);
+  if (it != last_dispatch_queue_emitted_lt_.end()) {
+    req_start_lt = std::max(req_start_lt, it->second + 1);
+  }
   if (acc->last_trans_end_lt_ >= start_lt && acc->transactions.empty()) {
     return fatal_error(td::Status::Error(-666, PSTRING()
                                                    << "last transaction time in the state of account " << workchain()
                                                    << ":" << smc_addr.to_hex() << " is too large"));
   }
+  set_current_tx_storage_dict(*acc);
   std::unique_ptr<block::transaction::Transaction> trans = std::make_unique<block::transaction::Transaction>(
-      *acc, mask == 2 ? block::transaction::Transaction::tr_tick : block::transaction::Transaction::tr_tock, req_start_lt, now_);
+      *acc, mask == 2 ? block::transaction::Transaction::tr_tick : block::transaction::Transaction::tr_tock,
+      req_start_lt, now_);
+  SCOPE_EXIT {
+    stats_.work_time.trx_tvm += trans->time_tvm;
+    stats_.work_time.trx_storage_stat += trans->time_storage_stat;
+    stats_.work_time.trx_other -= trans->time_tvm + trans->time_storage_stat;
+  };
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.trx_other};
   if (!trans->prepare_storage_phase(storage_phase_cfg_, true)) {
     return fatal_error(td::Status::Error(
         -666, std::string{"cannot create storage phase of a new transaction for smart contract "} + smc_addr.to_hex()));
@@ -2663,7 +3342,7 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
     return fatal_error(td::Status::Error(
         -666, std::string{"cannot create action phase of a new transaction for smart contract "} + smc_addr.to_hex()));
   }
-  if (!trans->serialize()) {
+  if (!trans->serialize(serialize_cfg_)) {
     return fatal_error(td::Status::Error(
         -666, std::string{"cannot serialize new transaction for smart contract "} + smc_addr.to_hex()));
   }
@@ -2674,8 +3353,14 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
     return fatal_error(
         td::Status::Error(-666, std::string{"cannot commit new transaction for smart contract "} + smc_addr.to_hex()));
   }
-  update_max_lt(acc->last_trans_end_lt_);
-  register_new_msgs(*trans);
+  if (!update_account_dict_estimation(*trans)) {
+    return fatal_error(-666, "cannot update account dict size estimation");
+  }
+  update_account_storage_dict_info(*trans);
+  FAIL_UNLESS(update_max_lt(acc->last_trans_end_lt_));
+  block::MsgMetadata new_msg_metadata{0, acc->workchain, acc->addr, trans->start_lt};
+  FAIL_UNLESS(register_new_msgs(*trans, std::move(new_msg_metadata)));
+  ++stats_.transactions;
   return true;
 }
 
@@ -2683,11 +3368,15 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
  * Creates an ordinary transaction using a given message.
  *
  * @param msg_root The root of the message to be processed serialized using Message TLB-scheme.
+ * @param msg_metadata Metadata of the inbound message.
+ * @param after_lt Transaction lt will be grater than after_lt. Used for deferred messages.
  * @param is_special_tx True if creating a special transaction (mint/recover), false otherwise.
  *
  * @returns The root of the serialized transaction, or an empty reference if the transaction creation fails.
  */
-Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root, bool is_special_tx) {
+Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
+                                                    td::optional<block::MsgMetadata> msg_metadata, LogicalTime after_lt,
+                                                    bool is_special_tx) {
   ton::StdSmcAddress addr;
   auto cs = vm::load_cell_slice(msg_root);
   bool external;
@@ -2731,8 +3420,21 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root, bool
   block::Account* acc = acc_res.move_as_ok();
   assert(acc);
 
-  auto res = impl_create_ordinary_transaction(msg_root, acc, now_, start_lt, &storage_phase_cfg_, &compute_phase_cfg_,
-                                              &action_phase_cfg_, external, last_proc_int_msg_.first);
+  if (external) {
+    after_lt = std::max(after_lt, last_proc_int_msg_.first);
+  }
+  auto it = last_dispatch_queue_emitted_lt_.find(acc->addr);
+  if (it != last_dispatch_queue_emitted_lt_.end()) {
+    after_lt = std::max(after_lt, it->second);
+  }
+  set_current_tx_storage_dict(*acc);
+  td::Result<std::unique_ptr<block::transaction::Transaction>> res;
+  {
+    td::ScopedRealCpuTimer::Guard timer{work_timer_,
+                                        nullptr};  // trx time is updated in impl_reate_ordinary_transaction
+    res = impl_create_ordinary_transaction(msg_root, acc, now_, start_lt, &storage_phase_cfg_, &compute_phase_cfg_,
+                                           &action_phase_cfg_, &serialize_cfg_, external, after_lt, &stats_);
+  }
   if (res.is_error()) {
     auto error = res.move_as_error();
     if (error.code() == -701) {
@@ -2755,10 +3457,23 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root, bool
     fatal_error("cannot commit new transaction for smart contract "s + addr.to_hex());
     return {};
   }
+  if (!update_account_dict_estimation(*trans)) {
+    fatal_error("cannot update account dict size estimation");
+    return {};
+  }
+  update_account_storage_dict_info(*trans);
 
-  register_new_msgs(*trans);
-  update_max_lt(acc->last_trans_end_lt_);
+  td::optional<block::MsgMetadata> new_msg_metadata;
+  if (external || is_special_tx) {
+    new_msg_metadata = block::MsgMetadata{0, acc->workchain, acc->addr, trans->start_lt};
+  } else if (msg_metadata) {
+    new_msg_metadata = std::move(msg_metadata);
+    ++new_msg_metadata.value().depth;
+  }
+  FAIL_UNLESS(register_new_msgs(*trans, std::move(new_msg_metadata)));
+  FAIL_UNLESS(update_max_lt(acc->last_trans_end_lt_));
   value_flow_.burned += trans->blackhole_burned;
+  ++stats_.transactions;
   return trans_root;
 }
 
@@ -2772,89 +3487,98 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root, bool
  * @param storage_phase_cfg The configuration for the storage phase of the transaction.
  * @param compute_phase_cfg The configuration for the compute phase of the transaction.
  * @param action_phase_cfg The configuration for the action phase of the transaction.
+ * @param serialize_cfg The configuration for the serialization of the transaction.
  * @param external Flag indicating if the message is external.
  * @param after_lt The logical time after which the transaction should occur. Used only for external messages.
+ * @param stats Stats to write real/cpu time to (optional)
  *
  * @returns A Result object containing the created transaction.
  *          Returns error_code == 669 if the error is fatal and the block can not be produced.
  *          Returns error_code == 701 if the transaction can not be included into block, but it's ok (external or too early internal).
  */
-td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_create_ordinary_transaction(Ref<vm::Cell> msg_root,
-                                                         block::Account* acc,
-                                                         UnixTime utime, LogicalTime lt,
-                                                         block::StoragePhaseConfig* storage_phase_cfg,
-                                                         block::ComputePhaseConfig* compute_phase_cfg,
-                                                         block::ActionPhaseConfig* action_phase_cfg,
-                                                         bool external, LogicalTime after_lt) {
+td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_create_ordinary_transaction(
+    Ref<vm::Cell> msg_root, block::Account* acc, UnixTime utime, LogicalTime lt,
+    block::StoragePhaseConfig* storage_phase_cfg, block::ComputePhaseConfig* compute_phase_cfg,
+    block::ActionPhaseConfig* action_phase_cfg, block::SerializeConfig* serialize_cfg, bool external,
+    LogicalTime after_lt, CollationStats* stats) {
   if (acc->last_trans_end_lt_ >= lt && acc->transactions.empty()) {
     return td::Status::Error(-669, PSTRING() << "last transaction time in the state of account " << acc->workchain
                                              << ":" << acc->addr.to_hex() << " is too large");
   }
   auto trans_min_lt = lt;
-  if (external) {
-    // transactions processing external messages must have lt larger than all processed internal messages
-    trans_min_lt = std::max(trans_min_lt, after_lt);
-  }
+  // transactions processing external messages must have lt larger than all processed internal messages
+  // if account has deferred message processed in this block, the next transaction should have lt > emitted_lt
+  trans_min_lt = std::max(trans_min_lt, after_lt);
 
-  std::unique_ptr<block::transaction::Transaction> trans =
-      std::make_unique<block::transaction::Transaction>(*acc, block::transaction::Transaction::tr_ord, trans_min_lt + 1, utime, msg_root);
-  bool ihr_delivered = false;  // FIXME
-  if (!trans->unpack_input_msg(ihr_delivered, action_phase_cfg)) {
-    if (external) {
-      // inbound external message was not accepted
-      return td::Status::Error(-701, "inbound external message rejected by account "s + acc->addr.to_hex() +
-                                         " before smart-contract execution");
+  std::unique_ptr<block::transaction::Transaction> trans = std::make_unique<block::transaction::Transaction>(
+      *acc, block::transaction::Transaction::tr_ord, trans_min_lt + 1, utime, msg_root);
+  {
+    td::RealCpuTimer timer;
+    SCOPE_EXIT {
+      if (stats) {
+        stats->work_time.trx_tvm += trans->time_tvm;
+        stats->work_time.trx_storage_stat += trans->time_storage_stat;
+        stats->work_time.trx_other += timer.elapsed_both() - trans->time_tvm - trans->time_storage_stat;
+      }
+    };
+    bool ihr_delivered = false;  // FIXME
+    if (!trans->unpack_input_msg(ihr_delivered, action_phase_cfg)) {
+      if (external) {
+        // inbound external message was not accepted
+        return td::Status::Error(-701, "inbound external message rejected by account "s + acc->addr.to_hex() +
+                                           " before smart-contract execution");
+      }
+      return td::Status::Error(-669, "cannot unpack input message for a new transaction");
     }
-    return td::Status::Error(-669, "cannot unpack input message for a new transaction");
-  }
-  if (trans->bounce_enabled) {
-    if (!trans->prepare_storage_phase(*storage_phase_cfg, true)) {
+    if (trans->bounce_enabled) {
+      if (!trans->prepare_storage_phase(*storage_phase_cfg, true)) {
+        return td::Status::Error(
+            -669, "cannot create storage phase of a new transaction for smart contract "s + acc->addr.to_hex());
+      }
+      if (!external && !trans->prepare_credit_phase()) {
+        return td::Status::Error(
+            -669, "cannot create credit phase of a new transaction for smart contract "s + acc->addr.to_hex());
+      }
+    } else {
+      if (!external && !trans->prepare_credit_phase()) {
+        return td::Status::Error(
+            -669, "cannot create credit phase of a new transaction for smart contract "s + acc->addr.to_hex());
+      }
+      if (!trans->prepare_storage_phase(*storage_phase_cfg, true, true)) {
+        return td::Status::Error(
+            -669, "cannot create storage phase of a new transaction for smart contract "s + acc->addr.to_hex());
+      }
+    }
+    if (!trans->prepare_compute_phase(*compute_phase_cfg)) {
       return td::Status::Error(
-          -669, "cannot create storage phase of a new transaction for smart contract "s + acc->addr.to_hex());
+          -669, "cannot create compute phase of a new transaction for smart contract "s + acc->addr.to_hex());
     }
-    if (!external && !trans->prepare_credit_phase()) {
+    if (!trans->compute_phase->accepted) {
+      if (external) {
+        // inbound external message was not accepted
+        const auto& cp = *trans->compute_phase;
+        return td::Status::Error(
+            -701, PSLICE() << "inbound external message rejected by transaction " << acc->addr.to_hex() << ":\n"
+                           << "exitcode=" << cp.exit_code << ", steps=" << cp.vm_steps << ", gas_used=" << cp.gas_used
+                           << (cp.vm_log.empty() ? "" : "\nVM Log (truncated):\n..." + cp.vm_log));
+      } else if (trans->compute_phase->skip_reason == block::ComputePhase::sk_none) {
+        return td::Status::Error(-669, "new ordinary transaction for smart contract "s + acc->addr.to_hex() +
+                                           " has not been accepted by the smart contract (?)");
+      }
+    }
+    if (trans->compute_phase->success && !trans->prepare_action_phase(*action_phase_cfg)) {
       return td::Status::Error(
-          -669, "cannot create credit phase of a new transaction for smart contract "s + acc->addr.to_hex());
+          -669, "cannot create action phase of a new transaction for smart contract "s + acc->addr.to_hex());
     }
-  } else {
-    if (!external && !trans->prepare_credit_phase()) {
+    if (trans->bounce_enabled &&
+        (!trans->compute_phase->success || trans->action_phase->state_exceeds_limits || trans->action_phase->bounce) &&
+        !trans->prepare_bounce_phase(*action_phase_cfg)) {
       return td::Status::Error(
-          -669, "cannot create credit phase of a new transaction for smart contract "s + acc->addr.to_hex());
+          -669, "cannot create bounce phase of a new transaction for smart contract "s + acc->addr.to_hex());
     }
-    if (!trans->prepare_storage_phase(*storage_phase_cfg, true, true)) {
-      return td::Status::Error(
-          -669, "cannot create storage phase of a new transaction for smart contract "s + acc->addr.to_hex());
+    if (!trans->serialize(*serialize_cfg)) {
+      return td::Status::Error(-669, "cannot serialize new transaction for smart contract "s + acc->addr.to_hex());
     }
-  }
-  if (!trans->prepare_compute_phase(*compute_phase_cfg)) {
-    return td::Status::Error(
-        -669, "cannot create compute phase of a new transaction for smart contract "s + acc->addr.to_hex());
-  }
-  if (!trans->compute_phase->accepted) {
-    if (external) {
-      // inbound external message was not accepted
-      auto const& cp = *trans->compute_phase;
-      return td::Status::Error(
-          -701, PSLICE() << "inbound external message rejected by transaction " << acc->addr.to_hex() << ":\n"
-                         << "exitcode=" << cp.exit_code << ", steps=" << cp.vm_steps << ", gas_used=" << cp.gas_used
-                         << (cp.vm_log.empty() ? "" : "\nVM Log (truncated):\n..." + cp.vm_log));
-    } else if (trans->compute_phase->skip_reason == block::ComputePhase::sk_none) {
-      return td::Status::Error(-669, "new ordinary transaction for smart contract "s + acc->addr.to_hex() +
-                                         " has not been accepted by the smart contract (?)");
-    }
-  }
-  if (trans->compute_phase->success && !trans->prepare_action_phase(*action_phase_cfg)) {
-    return td::Status::Error(
-        -669, "cannot create action phase of a new transaction for smart contract "s + acc->addr.to_hex());
-  }
-  if (trans->bounce_enabled &&
-      (!trans->compute_phase->success || trans->action_phase->state_exceeds_limits || trans->action_phase->bounce) &&
-      !trans->prepare_bounce_phase(*action_phase_cfg)) {
-    return td::Status::Error(
-        -669, "cannot create bounce phase of a new transaction for smart contract "s + acc->addr.to_hex());
-  }
-  if (!trans->serialize()) {
-    return td::Status::Error(-669, "cannot serialize new transaction for smart contract "s + acc->addr.to_hex());
   }
   return std::move(trans);
 }
@@ -2863,12 +3587,15 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
  * Updates the maximum logical time if the given logical time is greater than the current maximum logical time.
  *
  * @param lt The logical time to be compared.
+*
+ * @returns True if the operation was successful, false otherwise.
  */
-void Collator::update_max_lt(ton::LogicalTime lt) {
-  CHECK(lt >= start_lt);
+bool Collator::update_max_lt(ton::LogicalTime lt) {
+  FAIL_UNLESS(lt >= start_lt);
   if (lt > max_lt) {
     max_lt = lt;
   }
+  return true;
 }
 
 /**
@@ -2881,7 +3608,7 @@ void Collator::update_max_lt(ton::LogicalTime lt) {
 bool Collator::update_last_proc_int_msg(const std::pair<ton::LogicalTime, ton::Bits256>& new_lt_hash) {
   if (last_proc_int_msg_ < new_lt_hash) {
     last_proc_int_msg_ = new_lt_hash;
-    CHECK(new_lt_hash.first > 0);
+    FAIL_UNLESS(new_lt_hash.first > 0);
     LOG(DEBUG) << "last_proc_int_msg updated to (" << new_lt_hash.first << ", " << new_lt_hash.second.to_hex() << ")";
     return true;
   } else {
@@ -2896,12 +3623,12 @@ bool Collator::update_last_proc_int_msg(const std::pair<ton::LogicalTime, ton::B
  * Creates ticktock transactions for special accounts.
  * Used in masterchain collator.
  *
- * @param mask The value indicating wheter the thansactions are tick (mask == 2) or tock (mask == 1).
+ * @param mask The value indicating whether the transactions are tick (mask == 2) or tock (mask == 1).
  *
  * @returns True if all ticktock transactions were successfully created, false otherwise.
  */
 bool Collator::create_ticktock_transactions(int mask) {
-  ton::LogicalTime req_lt = max_lt;
+  ton::LogicalTime req_lt = mask == 2 ? start_lt + 1 : max_lt;
   for (auto smc_addr : special_smcs) {
     auto found = lookup_account(smc_addr.cbits());
     int ticktock = (found ? found->tick * 2 + found->tock : config_->get_smc_tick_tock(smc_addr.cbits()));
@@ -2948,7 +3675,7 @@ bool Collator::is_our_address(const ton::StdSmcAddress& addr) const {
 }
 
 /**
- * Processes a message generated in this block.
+ * Processes a message generated in this block or a message from DispatchQueue.
  *
  * @param msg The new message to be processed.
  * @param enqueue_only Flag indicating whether the message should only be enqueued.
@@ -2958,9 +3685,10 @@ bool Collator::is_our_address(const ton::StdSmcAddress& addr) const {
  *          0 - message was enqueued.
  *          1 - message was processed.
  *          3 - message was processed, all future messages must be enqueued.
- *          -1 - error occured.
+ *          -1 - error occurred.
  */
 int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, Ref<vm::Cell>* is_special) {
+  bool from_dispatch_queue = msg.msg_env_from_dispatch_queue.not_null();
   Ref<vm::CellSlice> src, dest;
   bool enqueue, external;
   auto cs = load_cell_slice(msg.msg);
@@ -2972,7 +3700,7 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
       if (!tlb::unpack(cs, info)) {
         return -1;
       }
-      CHECK(info.created_lt == msg.lt && info.created_at == now_);
+      FAIL_UNLESS_ERRCODE(info.created_lt == msg.lt && info.created_at == now_ && !from_dispatch_queue, -1);
       src = std::move(info.src);
       enqueue = external = true;
       break;
@@ -2982,11 +3710,11 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
       if (!tlb::unpack(cs, info)) {
         return -1;
       }
-      CHECK(info.created_lt == msg.lt && info.created_at == now_);
+      FAIL_UNLESS_ERRCODE(from_dispatch_queue || (info.created_lt == msg.lt && info.created_at == now_), -1);
       src = std::move(info.src);
       dest = std::move(info.dest);
       fwd_fees = block::tlb::t_Grams.as_integer(info.fwd_fee);
-      CHECK(fwd_fees.not_null());
+      FAIL_UNLESS_ERRCODE(fwd_fees.not_null(), -1);
       external = false;
       enqueue = (enqueue_only || !is_our_address(dest));
       break;
@@ -2994,21 +3722,70 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     default:
       return -1;
   }
-  CHECK(is_our_address(std::move(src)));
+  FAIL_UNLESS_ERRCODE(is_our_address(src), -1);
   if (external) {
     // 1. construct a msg_export_ext OutMsg
     vm::CellBuilder cb;
-    CHECK(cb.store_long_bool(0, 3)           // msg_export_ext$000
-          && cb.store_ref_bool(msg.msg)      // msg:^(Message Any)
-          && cb.store_ref_bool(msg.trans));  // transaction:^Transaction
+    FAIL_UNLESS_ERRCODE(cb.store_long_bool(0, 3)              // msg_export_ext$000
+                            && cb.store_ref_bool(msg.msg)     // msg:^(Message Any)
+                            && cb.store_ref_bool(msg.trans),  // transaction:^Transaction
+                        -1);
     // 2. insert OutMsg into OutMsgDescr
-    CHECK(insert_out_msg(cb.finalize()));  // OutMsg -> OutMsgDescr
+    FAIL_UNLESS_ERRCODE(insert_out_msg(cb.finalize()), -1);  // OutMsg -> OutMsgDescr
     // (if ever a structure in the block for listing all external outbound messages appears, insert this message there as well)
     return 0;
   }
-  if (enqueue) {
-    auto lt = msg.lt;
-    bool ok = enqueue_message(std::move(msg), std::move(fwd_fees), lt);
+
+  WorkchainId src_wc;
+  StdSmcAddress src_addr;
+  FAIL_UNLESS_ERRCODE(block::tlb::t_MsgAddressInt.extract_std_address(src, src_wc, src_addr), -1);
+  FAIL_UNLESS_ERRCODE(src_wc == workchain(), -1);
+  bool is_special_account = is_masterchain() && config_->is_special_smartcontract(src_addr);
+  bool defer = false;
+  const char* defer_reason = "";
+  if (!from_dispatch_queue) {
+    if (deferring_messages_enabled_ && params_.collator_opts->deferring_enabled && !is_special && !is_special_account &&
+        !params_.collator_opts->whitelist.count({src_wc, src_addr}) && msg.msg_idx != 0) {
+      if (++sender_generated_messages_count_[src_addr] >= params_.collator_opts->defer_messages_after ||
+          out_msg_queue_size_ > defer_out_queue_size_limit_) {
+        defer = true;
+        defer_reason = " because account sent too many messages in this block";
+      }
+    }
+    if (!defer && (dispatch_queue_->lookup(src_addr).not_null() || unprocessed_deferred_messages_.count(src_addr))) {
+      defer = true;
+      defer_reason = " because account dispatch queue is not empty";
+    }
+    if (!defer && out_msg_queue_size_ + new_msgs_from_dispatch >= out_msg_queue_size_hard_limit_ && !is_special) {
+      defer = true;
+      defer_reason = " due to out msg queue overflow";
+    }
+  } else {
+    auto& x = unprocessed_deferred_messages_[src_addr];
+    FAIL_UNLESS_ERRCODE(x > 0, -1);
+    if (--x == 0) {
+      unprocessed_deferred_messages_.erase(src_addr);
+    }
+  }
+
+  if (enqueue || defer) {
+    bool ok;
+    if (from_dispatch_queue) {
+      auto msg_env = msg.msg_env_from_dispatch_queue;
+      block::tlb::MsgEnvelope::Record_std env;
+      FAIL_UNLESS_ERRCODE(block::tlb::unpack_cell(msg_env, env), -1);
+      auto src_prefix = block::tlb::MsgAddressInt::get_prefix(src);
+      auto dest_prefix = block::tlb::MsgAddressInt::get_prefix(dest);
+      FAIL_UNLESS_ERRCODE(env.emitted_lt && env.emitted_lt.value() == msg.lt, -1);
+      ok = enqueue_transit_message(std::move(msg.msg), std::move(msg_env), src_prefix, src_prefix, dest_prefix,
+                                   std::move(env.fwd_fee_remaining), std::move(env.metadata), msg.lt, true);
+    } else {
+      if (defer) {
+        LOG(INFO) << "deferring new message from account " << workchain() << ":" << src_addr.to_hex()
+                  << ", lt=" << msg.lt << defer_reason;
+      }
+      ok = enqueue_message(std::move(msg), std::move(fwd_fees), src_addr, defer);
+    }
     return ok ? 0 : -1;
   }
   // process message by a transaction in this block:
@@ -3019,26 +3796,40 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     return -1;
   }
   // 1. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(msg.msg, is_special != nullptr);
+  auto trans_root = create_ordinary_transaction(msg.msg, msg.metadata, msg.lt, is_special != nullptr);
   if (trans_root.is_null()) {
     fatal_error("cannot create transaction for re-processing output message");
     return -1;
   }
   // 2. create a MsgEnvelope enveloping this Message
-  vm::CellBuilder cb;
-  CHECK(cb.store_long_bool(0x46060, 20)                         // msg_envelope#4 cur_addr:.. next_addr:..
-        && block::tlb::t_Grams.store_integer_ref(cb, fwd_fees)  // fwd_fee_remaining:t_Grams
-        && cb.store_ref_bool(msg.msg));                         // msg:^(Message Any)
-  Ref<vm::Cell> msg_env = cb.finalize();
+  block::tlb::MsgEnvelope::Record_std msg_env_rec{0x60, 0x60, fwd_fees, msg.msg, {}, msg.metadata};
+  Ref<vm::Cell> msg_env;
+  FAIL_UNLESS_ERRCODE(block::tlb::pack_cell(msg_env, msg_env_rec), -1);
   if (verbosity > 2) {
-    std::cerr << "new (processed outbound) message envelope: ";
-    block::gen::t_MsgEnvelope.print_ref(std::cerr, msg_env);
+    FLOG(INFO) {
+      sb << "new (processed outbound) message envelope: ";
+      block::gen::t_MsgEnvelope.print_ref(sb, msg_env);
+    };
   }
   // 3. create InMsg, referring to this MsgEnvelope and this Transaction
-  CHECK(cb.store_long_bool(3, 3)                                  // msg_import_imm$011
-        && cb.store_ref_bool(msg_env)                             // in_msg:^MsgEnvelope
-        && cb.store_ref_bool(trans_root)                          // transaction:^Transaction
-        && block::tlb::t_Grams.store_integer_ref(cb, fwd_fees));  // fwd_fee:Grams
+  vm::CellBuilder cb;
+  if (from_dispatch_queue) {
+    auto msg_env = msg.msg_env_from_dispatch_queue;
+    block::tlb::MsgEnvelope::Record_std env;
+    FAIL_UNLESS_ERRCODE(block::tlb::unpack_cell(msg_env, env), -1);
+    FAIL_UNLESS_ERRCODE(env.emitted_lt && env.emitted_lt.value() == msg.lt, -1);
+    FAIL_UNLESS_ERRCODE(cb.store_long_bool(0b00100, 5)        // msg_import_deferred_fin$00100
+                            && cb.store_ref_bool(msg_env)     // in_msg:^MsgEnvelope
+                            && cb.store_ref_bool(trans_root)  // transaction:^Transaction
+                            && block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining),  // fwd_fee:Grams
+                        -1);
+  } else {
+    FAIL_UNLESS_ERRCODE(cb.store_long_bool(3, 3)                                     // msg_import_imm$011
+                            && cb.store_ref_bool(msg_env)                            // in_msg:^MsgEnvelope
+                            && cb.store_ref_bool(trans_root)                         // transaction:^Transaction
+                            && block::tlb::t_Grams.store_integer_ref(cb, fwd_fees),  // fwd_fee:Grams
+                        -1);
+  }
   // 4. insert InMsg into InMsgDescr
   Ref<vm::Cell> in_msg = cb.finalize();
   if (!insert_in_msg(in_msg)) {
@@ -3049,21 +3840,25 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     *is_special = in_msg;
     return 1;
   }
-  // 5. create OutMsg, referring to this MsgEnvelope and InMsg
-  CHECK(cb.store_long_bool(2, 3)         // msg_export_imm$010
-        && cb.store_ref_bool(msg_env)    // out_msg:^MsgEnvelope
-        && cb.store_ref_bool(msg.trans)  // transaction:^Transaction
-        && cb.store_ref_bool(in_msg));   // reimport:^InMsg
-  // 6. insert OutMsg into OutMsgDescr
-  if (!insert_out_msg(cb.finalize())) {
-    return -1;
+  if (!from_dispatch_queue) {
+    // 5. create OutMsg, referring to this MsgEnvelope and InMsg
+    FAIL_UNLESS_ERRCODE(cb.store_long_bool(2, 3)             // msg_export_imm$010
+                            && cb.store_ref_bool(msg_env)    // out_msg:^MsgEnvelope
+                            && cb.store_ref_bool(msg.trans)  // transaction:^Transaction
+                            && cb.store_ref_bool(in_msg),    // reimport:^InMsg
+                        -1);
+    // 6. insert OutMsg into OutMsgDescr
+    if (!insert_out_msg(cb.finalize())) {
+      return -1;
+    }
   }
   // 7. check whether the block is full now
   if (!block_limit_status_->fits(block::ParamLimits::cl_normal)) {
     block_full_ = true;
+    block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
     return 3;
   }
-  if (soft_timeout_.is_in_past(td::Timestamp::now())) {
+  if (internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
     LOG(WARNING) << "soft timeout reached, stop processing new messages";
     block_full_ = true;
     return 3;
@@ -3081,61 +3876,86 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
  * @param cur_prefix The account ID prefix for the next hop.
  * @param dest_prefix The prefix of the destination account ID.
  * @param fwd_fee_remaining The remaining forward fee.
+ * @param msg_metadata Metadata of the message.
+ * @param emitted_lt If present - the message was originally taken from DispatchQueue, and msg_env will have this emitted_lt.
+ * @param from_dispatch_queue The message was taken from dispatch queue in this block.
  *
  * @returns True if the transit message is successfully enqueued, false otherwise.
  */
 bool Collator::enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_env,
                                        ton::AccountIdPrefixFull prev_prefix, ton::AccountIdPrefixFull cur_prefix,
-                                       ton::AccountIdPrefixFull dest_prefix, td::RefInt256 fwd_fee_remaining) {
-  LOG(DEBUG) << "enqueueing transit message " << msg->get_hash().bits().to_hex(256);
-  bool requeue = is_our_address(prev_prefix);
+                                       ton::AccountIdPrefixFull dest_prefix, td::RefInt256 fwd_fee_remaining,
+                                       td::optional<block::MsgMetadata> msg_metadata,
+                                       td::optional<LogicalTime> emitted_lt, bool from_dispatch_queue) {
+  if (from_dispatch_queue) {
+    FAIL_UNLESS(emitted_lt);
+    LOG(DEBUG) << "enqueueing message from dispatch queue " << msg->get_hash().bits().to_hex(256)
+               << ", emitted_lt=" << emitted_lt.value();
+  } else {
+    LOG(DEBUG) << "enqueueing transit message " << msg->get_hash().bits().to_hex(256);
+  }
+  bool requeue = !from_dispatch_queue && is_our_address(prev_prefix);
   // 1. perform hypercube routing
   auto route_info = block::perform_hypercube_routing(cur_prefix, dest_prefix, shard_);
   if ((unsigned)route_info.first > 96 || (unsigned)route_info.second > 96) {
     return fatal_error("cannot perform hypercube routing for a transit message");
   }
   // 2. compute our part of transit fees
-  td::RefInt256 transit_fee = action_phase_cfg_.fwd_std.get_next_part(fwd_fee_remaining);
+  td::RefInt256 transit_fee =
+      from_dispatch_queue ? td::zero_refint() : action_phase_cfg_.fwd_std.get_next_part(fwd_fee_remaining);
   fwd_fee_remaining -= transit_fee;
-  CHECK(td::sgn(transit_fee) >= 0 && td::sgn(fwd_fee_remaining) >= 0);
+  FAIL_UNLESS(td::sgn(transit_fee) >= 0 && td::sgn(fwd_fee_remaining) >= 0);
   // 3. create a new MsgEnvelope
-  vm::CellBuilder cb;
-  CHECK(cb.store_long_bool(4, 4)                                         // msg_envelope#4 cur_addr:.. next_addr:..
-        && cb.store_long_bool(route_info.first, 8)                       // cur_addr:IntermediateAddress
-        && cb.store_long_bool(route_info.second, 8)                      // next_addr:IntermediateAddress
-        && block::tlb::t_Grams.store_integer_ref(cb, fwd_fee_remaining)  // fwd_fee_remaining:t_Grams
-        && cb.store_ref_bool(msg));                                      // msg:^(Message Any)
-  Ref<vm::Cell> msg_env = cb.finalize();
+  block::tlb::MsgEnvelope::Record_std msg_env_rec{route_info.first, route_info.second,      fwd_fee_remaining, msg,
+                                                  emitted_lt,       std::move(msg_metadata)};
+  Ref<vm::Cell> msg_env;
+  FAIL_UNLESS(block::tlb::t_MsgEnvelope.pack_cell(msg_env, msg_env_rec));
   // 4. create InMsg
-  CHECK(cb.store_long_bool(5, 3)                                     // msg_import_tr$101
-        && cb.store_ref_bool(old_msg_env)                            // in_msg:^MsgEnvelope
-        && cb.store_ref_bool(msg_env)                                // out_msg:^MsgEnvelope
-        && block::tlb::t_Grams.store_integer_ref(cb, transit_fee));  // transit_fee:Grams
+  vm::CellBuilder cb;
+  if (from_dispatch_queue) {
+    FAIL_UNLESS(cb.store_long_bool(0b00101, 5)     // msg_import_deferred_tr$00101
+                && cb.store_ref_bool(old_msg_env)  // in_msg:^MsgEnvelope
+                && cb.store_ref_bool(msg_env));    // out_msg:^MsgEnvelope
+  } else {
+    FAIL_UNLESS(cb.store_long_bool(5, 3)                                     // msg_import_tr$101
+                && cb.store_ref_bool(old_msg_env)                            // in_msg:^MsgEnvelope
+                && cb.store_ref_bool(msg_env)                                // out_msg:^MsgEnvelope
+                && block::tlb::t_Grams.store_integer_ref(cb, transit_fee));  // transit_fee:Grams
+  }
   Ref<vm::Cell> in_msg = cb.finalize();
   // 5. create a new OutMsg
-  CHECK(cb.store_long_bool(requeue ? 7 : 3, 3)  // msg_export_tr$011 or msg_export_tr_req$111
-        && cb.store_ref_bool(msg_env)           // out_msg:^MsgEnvelope
-        && cb.store_ref_bool(in_msg));          // imported:^InMsg
+  // msg_export_tr$011 / msg_export_tr_req$111 / msg_export_deferred_tr$10101
+  if (from_dispatch_queue) {
+    FAIL_UNLESS(cb.store_long_bool(0b10101, 5));
+  } else {
+    FAIL_UNLESS(cb.store_long_bool(requeue ? 7 : 3, 3));
+  }
+  FAIL_UNLESS(cb.store_ref_bool(msg_env)      // out_msg:^MsgEnvelope
+              && cb.store_ref_bool(in_msg));  // imported:^InMsg
   Ref<vm::Cell> out_msg = cb.finalize();
   // 4.1. insert OutMsg into OutMsgDescr
   if (verbosity > 2) {
-    std::cerr << "OutMsg for a transit message: ";
-    block::gen::t_OutMsg.print_ref(std::cerr, out_msg);
+    FLOG(INFO) {
+      sb << "OutMsg for a transit message: ";
+      block::gen::t_OutMsg.print_ref(sb, out_msg);
+    };
   }
   if (!insert_out_msg(out_msg)) {
     return fatal_error("cannot insert a new OutMsg into OutMsgDescr");
   }
   // 4.2. insert InMsg into InMsgDescr
   if (verbosity > 2) {
-    std::cerr << "InMsg for a transit message: ";
-    block::gen::t_InMsg.print_ref(std::cerr, in_msg);
+    FLOG(INFO) {
+      sb << "InMsg for a transit message: ";
+      block::gen::t_InMsg.print_ref(sb, in_msg);
+    };
   }
   if (!insert_in_msg(in_msg)) {
     return fatal_error("cannot insert a new InMsg into InMsgDescr");
   }
   // 5. create EnqueuedMsg
-  CHECK(cb.store_long_bool(start_lt)     // _ enqueued_lt:uint64
-        && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
+  FAIL_UNLESS(cb.store_long_bool(from_dispatch_queue ? emitted_lt.value() : start_lt)  // _ enqueued_lt:uint64
+              && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
   // 6. insert EnqueuedMsg into OutMsgQueue
   // NB: we use here cur_prefix instead of src_prefix; should we check that route_info.first >= next_addr.use_dest_bits of the old envelope?
   auto next_hop = block::interpolate_addr(cur_prefix, dest_prefix, route_info.second);
@@ -3148,7 +3968,7 @@ bool Collator::enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_
     LOG(DEBUG) << "inserting into outbound queue message with (lt,key)=(" << start_lt << "," << key.to_hex() << ")";
     ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
     ++out_msg_queue_size_;
-  } catch (vm::VmError) {
+  } catch (vm::VmError&) {
     ok = false;
   }
   if (!ok) {
@@ -3170,9 +3990,9 @@ bool Collator::delete_out_msg_queue_msg(td::ConstBitPtr key) {
   try {
     LOG(DEBUG) << "deleting from outbound queue message with key=" << key.to_hex(352);
     queue_rec = out_msg_queue_->lookup_delete(key, 352);
-    CHECK(out_msg_queue_size_ > 0);
+    FAIL_UNLESS(out_msg_queue_size_ > 0);
     --out_msg_queue_size_;
-  } catch (vm::VmError err) {
+  } catch (vm::VmError& err) {
     LOG(ERROR) << "error deleting from out_msg_queue dictionary: " << err.get_msg();
   }
   if (queue_rec.is_null()) {
@@ -3182,31 +4002,22 @@ bool Collator::delete_out_msg_queue_msg(td::ConstBitPtr key) {
   return register_out_msg_queue_op();
 }
 
-/**
- * Processes an inbound message from a neighbor's outbound queue.
- * The message may create a transaction or be enqueued.
- *
- * @param enq_msg The inbound message serialized using EnqueuedMsg TLB-scheme.
- * @param lt The logical time of the message.
- * @param key The 32+64+256-bit key of the message.
- * @param src_nb The description of the source neighbor shard.
- *
- * @returns True if the message was processed successfully, false otherwise.
- */
-bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalTime lt, td::ConstBitPtr key,
-                                       const block::McShardDescr& src_nb) {
+bool Collator::precheck_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalTime lt) {
   ton::LogicalTime enqueued_lt = 0;
   if (enq_msg.is_null() || enq_msg->size_ext() != 0x10040 ||
       (enqueued_lt = enq_msg->prefetch_ulong(64)) < /* 0 */ 1 * lt) {  // DEBUG
     if (enq_msg.not_null()) {
-      block::gen::t_EnqueuedMsg.print(std::cerr, *enq_msg);
+      FLOG(WARNING) {
+        sb << "inbound internal message is not a valid EnqueuedMsg: ";
+        block::gen::t_EnqueuedMsg.print(sb, enq_msg);
+      };
     }
     LOG(ERROR) << "inbound internal message is not a valid EnqueuedMsg (created lt " << lt << ", enqueued "
                << enqueued_lt << ")";
     return false;
   }
   auto msg_env = enq_msg->prefetch_ref();
-  CHECK(msg_env.not_null());
+  FAIL_UNLESS(msg_env.not_null());
   // 0. check MsgEnvelope
   if (msg_env->get_level() != 0) {
     LOG(ERROR) << "cannot import a message with non-zero level!";
@@ -3220,6 +4031,25 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
     LOG(ERROR) << "inbound internal MsgEnvelope is invalid according to hand-written checks";
     return false;
   }
+  return true;
+}
+
+/**
+ * Processes an inbound message from a neighbor's outbound queue.
+ * The message may create a transaction or be enqueued.
+ *
+ * @param enq_msg The inbound message serialized using EnqueuedMsg TLB-scheme.
+ * @param lt The logical time of the message.
+ * @param key The 32+64+256-bit key of the message.
+ * @param src_nb_idx The index of the source neighbor shard.
+ *
+ * @returns True if the message was processed successfully, false otherwise.
+ */
+bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalTime lt, td::ConstBitPtr key,
+                                       int src_nb_idx) {
+  const auto& src_nb = neighbors_.at(src_nb_idx);
+  ton::LogicalTime enqueued_lt = enq_msg->prefetch_ulong(64);
+  auto msg_env = enq_msg->prefetch_ref();
   // 1. unpack MsgEnvelope
   block::tlb::MsgEnvelope::Record_std env;
   if (!tlb::unpack_cell(msg_env, env)) {
@@ -3237,9 +4067,14 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
     LOG(ERROR) << "cannot unpack CommonMsgInfo of an inbound internal message";
     return false;
   }
-  if (info.created_lt != lt) {
+  if (!env.emitted_lt && info.created_lt != lt) {
     LOG(ERROR) << "inbound internal message has an augmentation value in source OutMsgQueue distinct from the one in "
-                  "its contents";
+                  "its contents (CommonMsgInfo)";
+    return false;
+  }
+  if (env.emitted_lt && env.emitted_lt.value() != lt) {
+    LOG(ERROR) << "inbound internal message has an augmentation value in source OutMsgQueue distinct from the one in "
+                  "its contents (deferred_it in MsgEnvelope)";
     return false;
   }
   if (!block::tlb::validate_message_libs(env.msg)) {
@@ -3302,13 +4137,16 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
   bool our = ton::shard_contains(shard_, cur_prefix);
   bool to_us = ton::shard_contains(shard_, dest_prefix);
 
-  block::EnqueuedMsgDescr enq_msg_descr{cur_prefix, next_prefix, info.created_lt, enqueued_lt,
+  block::EnqueuedMsgDescr enq_msg_descr{cur_prefix, next_prefix,
+                                        env.emitted_lt ? env.emitted_lt.value() : info.created_lt, enqueued_lt,
                                         env.msg->get_hash().bits()};
   if (processed_upto_->already_processed(enq_msg_descr)) {
     LOG(DEBUG) << "inbound internal message with lt=" << enq_msg_descr.lt_ << " hash=" << enq_msg_descr.hash_.to_hex()
                << " enqueued_lt=" << enq_msg_descr.enqueued_lt_ << " has been already processed by us before, skipping";
     // should we dequeue the message if it is ours (after a merge?)
     // (it should have been dequeued by out_msg_queue_cleanup() before)
+    auto& neighbor_stats = stats_.neighbors.at(src_nb_idx);
+    ++neighbor_stats.skipped_msgs;
     return true;
   }
   // 6.1. check whether we have already processed this message by IHR
@@ -3319,7 +4157,7 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
     // destination is outside our shard, relay transit message
     // (very similar to enqueue_message())
     if (!enqueue_transit_message(std::move(env.msg), std::move(msg_env), cur_prefix, next_prefix, dest_prefix,
-                                 std::move(env.fwd_fee_remaining))) {
+                                 std::move(env.fwd_fee_remaining), std::move(env.metadata), env.emitted_lt, false)) {
       return fatal_error("cannot enqueue transit internal message with key "s + key.to_hex(352));
     }
     return !our || delete_out_msg_queue_msg(key);
@@ -3328,23 +4166,23 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
   // process the message by an ordinary transaction similarly to process_one_new_message()
   //
   // 8. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(env.msg);
+  auto trans_root = create_ordinary_transaction(env.msg, env.metadata, 0);
   if (trans_root.is_null()) {
     return fatal_error("cannot create transaction for processing inbound message");
   }
   // 9. create InMsg, referring to this MsgEnvelope and this Transaction
   vm::CellBuilder cb;
-  CHECK(cb.store_long_bool(4, 3)                                               // msg_import_fin$100
-        && cb.store_ref_bool(msg_env)                                          // in_msg:^MsgEnvelope
-        && cb.store_ref_bool(trans_root)                                       // transaction:^Transaction
-        && block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining));  // fwd_fee:Grams
+  FAIL_UNLESS(cb.store_long_bool(4, 3)                                               // msg_import_fin$100
+              && cb.store_ref_bool(msg_env)                                          // in_msg:^MsgEnvelope
+              && cb.store_ref_bool(trans_root)                                       // transaction:^Transaction
+              && block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining));  // fwd_fee:Grams
   Ref<vm::Cell> in_msg = cb.finalize();
   if (our) {
     // if the message originates from the output queue of current shard, create a msg_export_deq_imm record
     // 10. create OutMsg with msg_export_deq_imm for dequeueing this message
-    CHECK(cb.store_long_bool(4, 3)        // msg_export_deq_imm$100
-          && cb.store_ref_bool(msg_env)   // out_msg:^MsgEnvelope
-          && cb.store_ref_bool(in_msg));  // reimport:^InMsg
+    FAIL_UNLESS(cb.store_long_bool(4, 3)        // msg_export_deq_imm$100
+                && cb.store_ref_bool(msg_env)   // out_msg:^MsgEnvelope
+                && cb.store_ref_bool(in_msg));  // reimport:^InMsg
     // 11. insert OutMsg into OutMsgDescr
     if (!insert_out_msg(cb.finalize())) {
       return fatal_error("cannot insert a dequeueing OutMsg with msg_export_deq_imm constructor into OutMsgDescr");
@@ -3362,36 +4200,98 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
 }
 
 /**
+ * Creates a string that explains which limit is exceeded. Used for collator stats.
+ *
+ * @param block_limit_status Status of block limits.
+ * @param cls Which limit class is exceeded.
+ *
+ * @returns String for collator stats.
+ */
+static std::string block_full_comment(const block::BlockLimitStatus& block_limit_status, unsigned cls) {
+  auto bytes = block_limit_status.estimate_block_size();
+  if (!block_limit_status.limits.bytes.fits(cls, bytes)) {
+    return PSTRING() << "block_full bytes " << bytes;
+  }
+  if (!block_limit_status.limits.gas.fits(cls, block_limit_status.gas_used)) {
+    return PSTRING() << "block_full gas " << block_limit_status.gas_used;
+  }
+  auto lt_delta = block_limit_status.cur_lt - block_limit_status.limits.start_lt;
+  if (!block_limit_status.limits.lt_delta.fits(cls, lt_delta)) {
+    return PSTRING() << "block_full lt_delta " << lt_delta;
+  }
+  auto collated_data_bytes = block_limit_status.collated_data_size_estimate;
+  if (!block_limit_status.limits.collated_data.fits(cls, collated_data_bytes)) {
+    return PSTRING() << "block_full collated_data " << collated_data_bytes;
+  }
+  return "";
+}
+
+/**
  * Processes inbound internal messages from message queues of the neighbors.
  * Messages are processed until the normal limit is reached, soft timeout is reached or there are no more messages.
  *
  * @returns True if the processing was successful, false otherwise.
  */
 bool Collator::process_inbound_internal_messages() {
-  while (!block_full_ && !nb_out_msgs_->is_eof()) {
+  SCOPE_EXIT {
+    stats_.load_fraction_internals = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
+  };
+  while (!nb_out_msgs_->is_eof()) {
     block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
-    if (block_full_) {
-      LOG(INFO) << "BLOCK FULL, stop processing inbound internal messages";
-      break;
-    }
-    if (soft_timeout_.is_in_past(td::Timestamp::now())) {
-      block_full_ = true;
-      LOG(WARNING) << "soft timeout reached, stop processing inbound internal messages";
-      break;
-    }
     auto kv = nb_out_msgs_->extract_cur();
-    CHECK(kv && kv->msg.not_null());
-    LOG(DEBUG) << "processing inbound message with (lt,hash)=(" << kv->lt << "," << kv->key.to_hex()
-               << ") from neighbor #" << kv->source;
-    if (verbosity > 2) {
-      std::cerr << "inbound message: lt=" << kv->lt << " from=" << kv->source << " key=" << kv->key.to_hex() << " msg=";
-      block::gen::t_EnqueuedMsg.print(std::cerr, *(kv->msg));
+    FAIL_UNLESS(kv && kv->msg.not_null());
+    auto& neighbor_stats = stats_.neighbors.at(kv->source);
+    if (kv->limit_exceeded) {
+      LOG(INFO) << "limit for imported messages is reached, stop processing inbound internal messages";
+      neighbor_stats.limit_reached = true;
+      block::EnqueuedMsgDescr enq;
+      enq.unpack(kv->msg.write());  // Visit cells to include it in proof
+      break;
     }
-    if (!process_inbound_message(kv->msg, kv->lt, kv->key.cbits(), neighbors_.at(kv->source))) {
+    if (!precheck_inbound_message(kv->msg, kv->lt)) {
       if (verbosity > 1) {
         std::cerr << "invalid inbound message: lt=" << kv->lt << " from=" << kv->source << " key=" << kv->key.to_hex()
                   << " msg=";
         block::gen::t_EnqueuedMsg.print(std::cerr, *(kv->msg));
+      }
+      return fatal_error("error processing inbound internal message");
+    }
+    if (have_unprocessed_account_dispatch_queue_) {
+      LOG(INFO) << "have unprocessed account dispatch queue, stop processing inbound internal messages";
+      return true;
+    }
+    if (block_full_) {
+      LOG(INFO) << "BLOCK FULL, stop processing inbound internal messages";
+      block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
+      stats_.limits_log += PSTRING() << "INBOUND_INT_MESSAGES: "
+                                     << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
+      break;
+    }
+    if (internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
+      block_full_ = true;
+      LOG(WARNING) << "soft timeout reached, stop processing inbound internal messages";
+      stats_.limits_log += PSTRING() << "INBOUND_INT_MESSAGES: timeout\n";
+      break;
+    }
+    if (!check_cancelled()) {
+      return false;
+    }
+    LOG(DEBUG) << "processing inbound message with (lt,hash)=(" << kv->lt << "," << kv->key.to_hex()
+               << ") from neighbor #" << kv->source;
+    ++neighbor_stats.processed_msgs;
+    if (verbosity > 2) {
+      FLOG(INFO) {
+        sb << "inbound message: lt=" << kv->lt << " from=" << kv->source << " key=" << kv->key.to_hex() << " msg=";
+        block::gen::t_EnqueuedMsg.print(sb, kv->msg);
+      };
+    }
+    if (!process_inbound_message(kv->msg, kv->lt, kv->key.cbits(), kv->source)) {
+      if (verbosity > 1) {
+        FLOG(INFO) {
+          sb << "invalid inbound message: lt=" << kv->lt << " from=" << kv->source << " key=" << kv->key.to_hex()
+             << " msg=";
+          block::gen::t_EnqueuedMsg.print(sb, kv->msg);
+        };
       }
       return fatal_error("error processing inbound internal message");
     }
@@ -3402,52 +4302,156 @@ bool Collator::process_inbound_internal_messages() {
 }
 
 /**
+ * Processes inbound external messages and new internal messages.
+ */
+td::actor::Task<> Collator::process_external_and_new_messages() {
+  td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
+  if (out_msg_queue_size_ > SKIP_EXTERNALS_QUEUE_SIZE) {
+    LOG(INFO) << "skipping processing of inbound external messages (except for high-priority) because out_msg_queue is "
+                 "too big ("
+              << out_msg_queue_size_ << " > " << SKIP_EXTERNALS_QUEUE_SIZE << ")";
+  }
+  bool enqueue_only = !inbound_queues_empty_;
+  while (true) {
+    // 5. import inbound external messages (if space&gas left)
+    LOG(INFO) << "process inbound external messages";
+    {
+      td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, nullptr};
+      if (!co_await process_inbound_external_messages()) {
+        co_return td::Status::Error("cannot process inbound external messages");
+      }
+    }
+    // 6. process newly-generated messages (if space&gas left)
+    //    (if we were unable to process all inbound messages, all new messages must be queued)
+    LOG(INFO) << "process newly-generated messages";
+    {
+      td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.process_new_msgs};
+      if (!process_new_messages(enqueue_only)) {
+        co_return td::Status::Error("cannot process newly-generated outbound messages");
+      }
+    }
+    if (!params_.wait_externals_until || params_.wait_externals_until.is_in_past()) {
+      LOG(INFO) << "Don't wait for new external messages";
+      break;
+    }
+    if (skip_extmsg_ || params_.attempt_idx >= 2) {
+      LOG(INFO) << "Processing external messages is disabled, don't wait for new external messages";
+      break;
+    }
+    if (!block_limit_status_->fits(block::ParamLimits::cl_soft) || external_msg_timeout_.is_in_past()) {
+      LOG(INFO) << "MEDIUM LIMIT is reached, don't wait for new external messages";
+      break;
+    }
+    {
+      LOG(INFO) << "Waiting for new external messages (" << params_.wait_externals_until.in() << "s)";
+      td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, nullptr};
+      td::Timer wait_timer;
+      auto S = co_await wait_for_external_message(params_.wait_externals_until).wrap();
+      wait_externals_total_time_ += wait_timer.elapsed();
+      if (S.is_error()) {
+        LOG(INFO) << "No new external messages appeared before timeout";
+        break;
+      }
+    }
+  }
+  co_return {};
+}
+
+/**
  * Processes inbound external messages.
- * Messages are processed until the soft limit is reached, medium timeout is reached or there are no more messages.
- * 
+ * Messages are processed until the medium limit is reached, medium timeout is reached or there are no more messages.
+ *
  * @returns True if the processing was successful, false otherwise.
  */
-bool Collator::process_inbound_external_messages() {
+td::actor::Task<bool> Collator::process_inbound_external_messages() {
+  // Existing per-message total timers exclude queue waits, so their delta is this phase's active work.
+  td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.import_externals};
+  SCOPE_EXIT {
+    stats_.load_fraction_externals = block_limit_status_->load_fraction(block::ParamLimits::cl_soft);
+  };
   if (skip_extmsg_) {
     LOG(INFO) << "skipping processing of inbound external messages";
-    return true;
+    co_return true;
   }
-  if (out_msg_queue_size_ > SKIP_EXTERNALS_QUEUE_SIZE) {
-    LOG(INFO) << "skipping processing of inbound external messages because out_msg_queue is too big ("
-              << out_msg_queue_size_ << " > " << SKIP_EXTERNALS_QUEUE_SIZE << ")";
-    return true;
+  if (params_.attempt_idx >= 2) {
+    LOG(INFO) << "Attempt #" << params_.attempt_idx << ": skip external messages (attempt >= 2)";
+    co_return true;
   }
   bool full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
-  for (auto& ext_msg_pair : ext_msg_list_) {
+  while (true) {
     if (full) {
       LOG(INFO) << "BLOCK FULL, stop processing external messages";
+      stats_.limits_log += PSTRING() << "INBOUND_EXT_MESSAGES: "
+                                     << block_full_comment(*block_limit_status_, block::ParamLimits::cl_soft) << "\n";
       break;
     }
-    if (medium_timeout_.is_in_past(td::Timestamp::now())) {
+    if (external_msg_timeout_.is_in_past(td::Timestamp::now())) {
       LOG(WARNING) << "medium timeout reached, stop processing inbound external messages";
+      stats_.limits_log += PSTRING() << "INBOUND_EXT_MESSAGES: timeout\n";
       break;
     }
-    auto ext_msg = ext_msg_pair.first;
+    if (!check_cancelled()) {
+      co_return false;
+    }
+    std::pair<td::Ref<ExtMessage>, int> item;
+    if (pending_ext_msg_) {
+      item = std::move(*pending_ext_msg_);
+      pending_ext_msg_.reset();
+    } else {
+      td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, nullptr};
+      td::ScopedRealCpuTimer::Guard timer{work_timer_, nullptr};
+      td::Result<std::pair<td::Ref<ExtMessage>, int>> maybe;
+      td::Timer wait_timer;
+      if (params_.wait_externals_until) {
+        maybe = co_await ext_msg_queue_.try_pop().wrap();
+      } else {
+        // In this case queue is closed after pushing the first batch of messages
+        maybe = co_await ext_msg_queue_.pop().wrap();
+      }
+      wait_externals_total_time_ += wait_timer.elapsed();
+      if (maybe.is_error()) {
+        break;  // queue empty or closed
+      }
+      item = maybe.move_as_ok();
+    }
+    auto [ext_msg_ref, priority] = std::move(item);
+    ++stats_.ext_msgs_total;
+    if (out_msg_queue_size_ > SKIP_EXTERNALS_QUEUE_SIZE && priority < HIGH_PRIORITY_EXTERNAL) {
+      ++stats_.ext_msgs_skipped_backpressure;
+      continue;
+    }
+    if (processed_external_messages_.find(ext_msg_ref->hash_norm())) {
+      ++stats_.ext_msgs_skipped_duplicate;
+      continue;
+    }
+    processed_external_messages_ = processed_external_messages_.insert(ext_msg_ref->hash_norm(), td::Unit{});
+    if (register_external_message(ext_msg_ref, priority).is_error()) {
+      ++stats_.ext_msgs_filtered;
+      bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
+      continue;
+    }
+    auto ext_msg = ext_msg_ref->root_cell();
     ton::Bits256 hash{ext_msg->get_hash().bits()};
     int r = process_external_message(std::move(ext_msg));
-    if (r < 0) {
-      bad_ext_msgs_.emplace_back(ext_msg_pair.second);
-      return false;
+    if (r > 0) {
+      ++stats_.ext_msgs_accepted;
+    } else {
+      ++stats_.ext_msgs_rejected;
     }
-    if (!r) {
-      delay_ext_msgs_.emplace_back(ext_msg_pair.second);
+    if (r < 0) {
+      bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
+      co_return false;
+    }
+    if (r == 0) {
+      bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
     }
     if (r > 0) {
       full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
-    }
-    auto it = ext_msg_map.find(hash);
-    CHECK(it != ext_msg_map.end());
-    it->second = (r >= 1 ? 3 : -2);  // processed or skipped
-    if (r >= 3) {
-      break;
+      block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
     }
   }
-  return true;
+  co_return true;
 }
 
 /**
@@ -3459,7 +4463,6 @@ bool Collator::process_inbound_external_messages() {
  *          -1 if a fatal error occurred.
  *           0 if the message is rejected.
  *           1 if the message was processed.
- *           3 if the message was processed and all future messages must be skipped (block overflown).
  */
 int Collator::process_external_message(Ref<vm::Cell> msg) {
   auto cs = load_cell_slice(msg);
@@ -3473,7 +4476,7 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
   }
   // process message by a transaction in this block:
   // 1. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(msg);
+  auto trans_root = create_ordinary_transaction(msg, /* metadata = */ {}, 0);
   if (trans_root.is_null()) {
     if (busy_) {
       // transaction rejected by account
@@ -3486,15 +4489,291 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
   }
   // 2. create InMsg, referring to this Message and this Transaction
   vm::CellBuilder cb;
-  CHECK(cb.store_long_bool(0, 3)            // msg_import_ext$000
-        && cb.store_ref_bool(msg)           // in_msg:^(Message Any)
-        && cb.store_ref_bool(trans_root));  // transaction:^Transaction
+  FAIL_UNLESS_ERRCODE(cb.store_long_bool(0, 3)               // msg_import_ext$000
+                          && cb.store_ref_bool(msg)          // in_msg:^(Message Any)
+                          && cb.store_ref_bool(trans_root),  // transaction:^Transaction
+                      -1);
   Ref<vm::Cell> in_msg = cb.finalize();
   // 3. insert InMsg into InMsgDescr
   if (!insert_in_msg(std::move(in_msg))) {
     return -1;
   }
   return 1;
+}
+
+/**
+ * Processes messages from dispatch queue
+ *
+ * Messages from dispatch queue are taken in three steps:
+ * 1. Take one message from each account (in the order of lt)
+ * 2. Take up to 10 per account (including from p.1), up to 20 per initiator, up to 150 in total
+ * 3. Take up to X messages per initiator, up to 150 in total. X depends on out msg queue size
+ *
+ * @returns True if the processing was successful, false otherwise.
+ */
+bool Collator::process_dispatch_queue() {
+  SCOPE_EXIT {
+    stats_.load_fraction_dispatch = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
+  };
+  if (out_msg_queue_size_ > defer_out_queue_size_limit_ && old_out_msg_queue_size_ > hard_defer_out_queue_size_limit_) {
+    return true;
+  }
+  have_unprocessed_account_dispatch_queue_ = true;
+  size_t max_total_count[3] = {1 << 30, params_.collator_opts->dispatch_phase_2_max_total,
+                               params_.collator_opts->dispatch_phase_3_max_total};
+  size_t max_per_initiator[3] = {1 << 30, params_.collator_opts->dispatch_phase_2_max_per_initiator, 0};
+  if (params_.collator_opts->dispatch_phase_3_max_per_initiator) {
+    max_per_initiator[2] = params_.collator_opts->dispatch_phase_3_max_per_initiator.value();
+  } else if (out_msg_queue_size_ <= 256) {
+    max_per_initiator[2] = 10;
+  } else if (out_msg_queue_size_ <= 512) {
+    max_per_initiator[2] = 2;
+  } else if (out_msg_queue_size_ <= 1500) {
+    max_per_initiator[2] = 1;
+  }
+  for (int iter = 0; iter < 3; ++iter) {
+    if (max_per_initiator[iter] == 0 || max_total_count[iter] == 0) {
+      continue;
+    }
+    if (iter > 0 && params_.attempt_idx >= 1) {
+      LOG(INFO) << "Attempt #" << params_.attempt_idx << ": skip process_dispatch_queue";
+      break;
+    }
+    vm::AugmentedDictionary cur_dispatch_queue{dispatch_queue_->get_root(), 256, block::tlb::aug_DispatchQueue};
+    std::map<std::tuple<WorkchainId, StdSmcAddress, LogicalTime>, size_t> count_per_initiator;
+    size_t total_count = 0;
+    auto prioritylist = params_.collator_opts->prioritylist;
+    auto prioritylist_iter = prioritylist.begin();
+    while (!cur_dispatch_queue.is_empty()) {
+      if (out_msg_queue_size_ + new_msgs_from_dispatch >= out_msg_queue_size_hard_limit_) {
+        LOG(INFO) << "out msg queue size too big, stop processing dispatch queue";
+        have_unprocessed_account_dispatch_queue_ = false;
+        return true;
+      }
+      block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
+      if (block_full_) {
+        LOG(INFO) << "BLOCK FULL, stop processing dispatch queue";
+        block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
+        stats_.limits_log += PSTRING() << "DISPATCH_QUEUE_STAGE_" << iter << ": "
+                                       << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal)
+                                       << "\n";
+        return register_dispatch_queue_op(true);
+      }
+      if (internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
+        block_full_ = true;
+        LOG(WARNING) << "soft timeout reached, stop processing dispatch queue";
+        stats_.limits_log += PSTRING() << "DISPATCH_QUEUE_STAGE_" << iter << ": timeout\n";
+        return register_dispatch_queue_op(true);
+      }
+      StdSmcAddress src_addr;
+      td::Ref<vm::CellSlice> account_queue_csr;
+      while (!prioritylist.empty()) {
+        if (prioritylist_iter == prioritylist.end()) {
+          prioritylist_iter = prioritylist.begin();
+        }
+        auto priority_addr = *prioritylist_iter;
+        if (priority_addr.first != workchain() || !is_our_address(priority_addr.second)) {
+          prioritylist_iter = prioritylist.erase(prioritylist_iter);
+          continue;
+        }
+        src_addr = priority_addr.second;
+        account_queue_csr = cur_dispatch_queue.lookup(src_addr);
+        if (account_queue_csr.is_null()) {
+          prioritylist_iter = prioritylist.erase(prioritylist_iter);
+        } else {
+          ++prioritylist_iter;
+          break;
+        }
+      }
+      if (account_queue_csr.is_null()) {
+        account_queue_csr = block::get_dispatch_queue_min_lt_account(cur_dispatch_queue, src_addr);
+        if (account_queue_csr.is_null()) {
+          return fatal_error("invalid dispatch queue in shard state");
+        }
+      }
+      block::AccountDispatchQueue account_queue;
+      if (!account_queue.unpack(account_queue_csr)) {
+        return fatal_error(PSTRING() << "invalid account dispatch queue for account " << src_addr.to_hex());
+      }
+      td::BitArray<64> key;
+      Ref<vm::CellSlice> enqueued_msg = account_queue.dict.extract_minmax_key(key.bits(), 64, false, false);
+      LogicalTime lt = key.to_ulong();
+
+      td::optional<block::MsgMetadata> msg_metadata;
+      if (!process_deferred_message(enqueued_msg, src_addr, lt, msg_metadata)) {
+        return fatal_error(PSTRING() << "error processing internal message from dispatch queue: account="
+                                     << src_addr.to_hex() << ", lt=" << lt);
+      }
+
+      // Remove message from DispatchQueue
+      bool ok;
+      if (iter == 0 ||
+          (iter == 1 && sender_generated_messages_count_[src_addr] >= params_.collator_opts->defer_messages_after &&
+           !params_.collator_opts->whitelist.contains({workchain(), src_addr}))) {
+        ok = cur_dispatch_queue.lookup_delete(src_addr).not_null();
+      } else {
+        account_queue.dict.lookup_delete(key);
+        --account_queue.dict_size;
+        if (store_dispatch_queue_balance_ && account_queue.total_balance.is_valid()) {
+          account_queue.total_balance -= block::get_message_balance_for_dispatch_queue(enqueued_msg, global_version_);
+          if (!account_queue.total_balance.is_valid()) {
+            return fatal_error(PSTRING() << "error calculating dispatch queue balance (1): account="
+                                         << src_addr.to_hex() << ", lt=" << lt);
+          }
+        } else {
+          account_queue.total_balance.invalidate();
+        }
+        account_queue.pack(account_queue_csr);
+        ok = account_queue_csr.not_null() ? cur_dispatch_queue.set(src_addr, account_queue_csr)
+                                          : cur_dispatch_queue.lookup_delete(src_addr).not_null();
+      }
+      if (!ok) {
+        return fatal_error(PSTRING() << "error processing internal message from dispatch queue: account="
+                                     << src_addr.to_hex() << ", lt=" << lt);
+      }
+      if (msg_metadata) {
+        auto initiator = std::make_tuple(msg_metadata.value().initiator_wc, msg_metadata.value().initiator_addr,
+                                         msg_metadata.value().initiator_lt);
+        size_t initiator_count = ++count_per_initiator[initiator];
+        if (initiator_count >= max_per_initiator[iter]) {
+          cur_dispatch_queue.lookup_delete(src_addr);
+        }
+      }
+      ++total_count;
+      if (total_count >= max_total_count[iter]) {
+        dispatch_queue_total_limit_reached_ = true;
+        stats_.limits_log += PSTRING() << "DISPATCH_QUEUE_STAGE_" << iter << ": total limit reached\n";
+        break;
+      }
+    }
+    if (iter == 0) {
+      have_unprocessed_account_dispatch_queue_ = false;
+    }
+    register_dispatch_queue_op(true);
+  }
+  return true;
+}
+
+/**
+ * Processes an internal message from DispatchQueue.
+ * The message may create a transaction or be enqueued.
+ *
+ * Similar to Collator::process_inbound_message.
+ *
+ * @param enq_msg The internal message serialized using EnqueuedMsg TLB-scheme.
+ * @param src_addr 256-bit address of the sender.
+ * @param lt The logical time of the message.
+ * @param msg_metadata Reference to store msg_metadata
+ *
+ * @returns True if the message was processed successfully, false otherwise.
+ */
+bool Collator::process_deferred_message(Ref<vm::CellSlice> enq_msg, StdSmcAddress src_addr, LogicalTime lt,
+                                        td::optional<block::MsgMetadata>& msg_metadata) {
+  if (!block::remove_dispatch_queue_entry(*dispatch_queue_, src_addr, lt, store_dispatch_queue_balance_,
+                                          global_version_)) {
+    return fatal_error(PSTRING() << "failed to delete message from DispatchQueue: address=" << src_addr.to_hex()
+                                 << ", lt=" << lt);
+  }
+  register_dispatch_queue_op();
+  ++sender_generated_messages_count_[src_addr];
+
+  LogicalTime enqueued_lt = 0;
+  if (enq_msg.is_null() || enq_msg->size_ext() != 0x10040 || (enqueued_lt = enq_msg->prefetch_ulong(64)) != lt) {
+    if (enq_msg.not_null()) {
+      FLOG(WARNING) {
+        sb << "internal message in DispatchQueue is not a valid EnqueuedMsg: ";
+        block::gen::t_EnqueuedMsg.print(sb, enq_msg);
+      };
+    }
+    LOG(ERROR) << "internal message in DispatchQueue is not a valid EnqueuedMsg (created lt " << lt << ", enqueued "
+               << enqueued_lt << ")";
+    return false;
+  }
+  auto msg_env = enq_msg->prefetch_ref();
+  FAIL_UNLESS(msg_env.not_null());
+  // 0. check MsgEnvelope
+  if (msg_env->get_level() != 0) {
+    LOG(ERROR) << "cannot import a message with non-zero level!";
+    return false;
+  }
+  if (!block::gen::t_MsgEnvelope.validate_ref(msg_env)) {
+    LOG(ERROR) << "MsgEnvelope from DispatchQueue is invalid according to automated checks";
+    return false;
+  }
+  if (!block::tlb::t_MsgEnvelope.validate_ref(msg_env)) {
+    LOG(ERROR) << "MsgEnvelope from DispatchQueue is invalid according to hand-written checks";
+    return false;
+  }
+  // 1. unpack MsgEnvelope
+  block::tlb::MsgEnvelope::Record_std env;
+  if (!tlb::unpack_cell(msg_env, env)) {
+    LOG(ERROR) << "cannot unpack MsgEnvelope from DispatchQueue";
+    return false;
+  }
+  // 2. unpack CommonMsgInfo of the message
+  vm::CellSlice cs{vm::NoVmOrd{}, env.msg};
+  if (block::gen::t_CommonMsgInfo.get_tag(cs) != block::gen::CommonMsgInfo::int_msg_info) {
+    LOG(ERROR) << "internal message from DispatchQueue is not in fact internal!";
+    return false;
+  }
+  block::gen::CommonMsgInfo::Record_int_msg_info info;
+  if (!tlb::unpack(cs, info)) {
+    LOG(ERROR) << "cannot unpack CommonMsgInfo of an internal message from DispatchQueue";
+    return false;
+  }
+  if (info.created_lt != lt) {
+    LOG(ERROR) << "internal message has lt in DispatchQueue distinct from the one in "
+                  "its contents";
+    return false;
+  }
+  if (!block::tlb::validate_message_libs(env.msg)) {
+    LOG(ERROR) << "internal message in DispatchQueue has invalid StateInit";
+    return false;
+  }
+  // 2.1. check fwd_fee and fwd_fee_remaining
+  td::RefInt256 orig_fwd_fee = block::tlb::t_Grams.as_integer(info.fwd_fee);
+  if (env.fwd_fee_remaining > orig_fwd_fee) {
+    LOG(ERROR) << "internal message if DispatchQueue has fwd_fee_remaining=" << td::dec_string(env.fwd_fee_remaining)
+               << " larger than original fwd_fee=" << td::dec_string(orig_fwd_fee);
+    return false;
+  }
+  // 3. extract source and destination shards
+  auto src_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.src);
+  auto dest_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.dest);
+  if (!(src_prefix.is_valid() && dest_prefix.is_valid())) {
+    LOG(ERROR) << "internal message in DispatchQueue has invalid source or destination address";
+    return false;
+  }
+  // 4. chech current and next hop shards
+  if (env.cur_addr != 0 || env.next_addr != 0) {
+    LOG(ERROR) << "internal message in DispatchQueue is expected to have zero cur_addr and next_addr";
+    return false;
+  }
+  // 5. calculate emitted_lt
+  LogicalTime emitted_lt = std::max(start_lt, last_dispatch_queue_emitted_lt_[src_addr]) + 1;
+  auto it = accounts.find(src_addr);
+  if (it != accounts.end()) {
+    emitted_lt = std::max(emitted_lt, it->second->last_trans_end_lt_ + 1);
+  }
+  last_dispatch_queue_emitted_lt_[src_addr] = emitted_lt;
+  FAIL_UNLESS(update_max_lt(emitted_lt + 1));
+
+  env.emitted_lt = emitted_lt;
+  if (!block::tlb::pack_cell(msg_env, env)) {
+    return fatal_error("cannot pack msg envelope");
+  }
+
+  // 6. create NewOutMsg
+  block::NewOutMsg new_msg{emitted_lt, env.msg, {}, 0};
+  new_msg.metadata = env.metadata;
+  new_msg.msg_env_from_dispatch_queue = msg_env;
+  ++unprocessed_deferred_messages_[src_addr];
+  LOG(INFO) << "delivering deferred message from account " << src_addr.to_hex() << ", lt=" << lt
+            << ", emitted_lt=" << emitted_lt;
+  block_limit_status_->add_cell(msg_env);
+  register_new_msg(std::move(new_msg));
+  msg_metadata = std::move(env.metadata);
+  return true;
 }
 
 /**
@@ -3506,16 +4785,19 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
  */
 bool Collator::insert_in_msg(Ref<vm::Cell> in_msg) {
   if (verbosity > 2) {
-    std::cerr << "InMsg being inserted into InMsgDescr: ";
-    block::gen::t_InMsg.print_ref(std::cerr, in_msg);
+    FLOG(INFO) {
+      sb << "InMsg being inserted into InMsgDescr: ";
+      block::gen::t_InMsg.print_ref(sb, in_msg);
+    };
   }
   auto cs = load_cell_slice(in_msg);
   if (!cs.size_refs()) {
     return false;
   }
   Ref<vm::Cell> msg = cs.prefetch_ref();
-  int tag = (int)cs.prefetch_ulong(3);
-  if (!(tag == 0 || tag == 2)) {  // msg_import_ext$000 or msg_import_ihr$010 contain (Message Any) directly
+  int tag = block::gen::t_InMsg.get_tag(cs);
+  // msg_import_ext$000 or msg_import_ihr$010 contain (Message Any) directly
+  if (!(tag == block::gen::InMsg::msg_import_ext || tag == block::gen::InMsg::msg_import_ihr)) {
     // extract Message Any from MsgEnvelope to compute correct key
     auto cs2 = load_cell_slice(std::move(msg));
     if (!cs2.size_refs()) {
@@ -3526,7 +4808,7 @@ bool Collator::insert_in_msg(Ref<vm::Cell> in_msg) {
   bool ok;
   try {
     ok = in_msg_dict->set(msg->get_hash().bits(), 256, cs, vm::Dictionary::SetMode::Add);
-  } catch (vm::VmError) {
+  } catch (vm::VmError&) {
     LOG(ERROR) << "cannot add an InMsg into InMsgDescr dictionary!";
     ok = false;
   }
@@ -3547,8 +4829,10 @@ bool Collator::insert_in_msg(Ref<vm::Cell> in_msg) {
  */
 bool Collator::insert_out_msg(Ref<vm::Cell> out_msg) {
   if (verbosity > 2) {
-    std::cerr << "OutMsg being inserted into OutMsgDescr: ";
-    block::gen::t_OutMsg.print_ref(std::cerr, out_msg);
+    FLOG(INFO) {
+      sb << "OutMsg being inserted into OutMsgDescr: ";
+      block::gen::t_OutMsg.print_ref(sb, out_msg);
+    };
   }
   auto cs = load_cell_slice(out_msg);
   if (!cs.size_refs()) {
@@ -3578,7 +4862,7 @@ bool Collator::insert_out_msg(Ref<vm::Cell> out_msg) {
 bool Collator::insert_out_msg(Ref<vm::Cell> out_msg, td::ConstBitPtr msg_hash) {
   bool ok;
   try {
-    ok = out_msg_dict->set(msg_hash, 256, load_cell_slice(std::move(out_msg)), vm::Dictionary::SetMode::Add);
+    ok = out_msg_dict->set(msg_hash, 256, load_cell_slice(out_msg), vm::Dictionary::SetMode::Add);
   } catch (vm::VmError&) {
     ok = false;
   }
@@ -3596,11 +4880,15 @@ bool Collator::insert_out_msg(Ref<vm::Cell> out_msg, td::ConstBitPtr msg_hash) {
  *
  * @param msg The new outbound message to enqueue.
  * @param fwd_fees_remaining The remaining forward fees for the message.
- * @param enqueued_lt The logical time at which the message is enqueued.
+ * @param src_addr 256-bit address of the sender
+ * @param defer Put the message to DispatchQueue
  *
  * @returns True if the message was successfully enqueued, false otherwise.
  */
-bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, ton::LogicalTime enqueued_lt) {
+bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
+                               bool defer) {
+  LogicalTime enqueued_lt = msg.lt;
+  FAIL_UNLESS(msg.msg_env_from_dispatch_queue.is_null());
   // 0. unpack src_addr and dest_addr
   block::gen::CommonMsgInfo::Record_int_msg_info info;
   if (!tlb::unpack_cell_inexact(msg.msg, info)) {
@@ -3620,30 +4908,68 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
     return fatal_error("cannot perform hypercube routing for a new outbound message");
   }
   // 2. create a new MsgEnvelope
-  vm::CellBuilder cb;
-  CHECK(cb.store_long_bool(4, 4)                                          // msg_envelope#4 cur_addr:.. next_addr:..
-        && cb.store_long_bool(route_info.first, 8)                        // cur_addr:IntermediateAddress
-        && cb.store_long_bool(route_info.second, 8)                       // next_addr:IntermediateAddress
-        && block::tlb::t_Grams.store_integer_ref(cb, fwd_fees_remaining)  // fwd_fee_remaining:t_Grams
-        && cb.store_ref_bool(msg.msg));                                   // msg:^(Message Any)
-  Ref<vm::Cell> msg_env = cb.finalize();
+  block::tlb::MsgEnvelope::Record_std msg_env_rec{
+      defer ? 0 : route_info.first, defer ? 0 : route_info.second, fwd_fees_remaining, msg.msg, {}, msg.metadata};
+  Ref<vm::Cell> msg_env;
+  FAIL_UNLESS(block::tlb::pack_cell(msg_env, msg_env_rec));
   // 3. create a new OutMsg
-  CHECK(cb.store_long_bool(1, 3)           // msg_export_new$001
-        && cb.store_ref_bool(msg_env)      // out_msg:^MsgEnvelope
-        && cb.store_ref_bool(msg.trans));  // transaction:^Transaction
-  Ref<vm::Cell> out_msg = cb.finalize();
+  vm::CellBuilder cb;
+  Ref<vm::Cell> out_msg;
+  if (defer) {
+    FAIL_UNLESS(cb.store_long_bool(0b10100, 5)     // msg_export_new_defer$10100
+                && cb.store_ref_bool(msg_env)      // out_msg:^MsgEnvelope
+                && cb.store_ref_bool(msg.trans));  // transaction:^Transaction
+    out_msg = cb.finalize();
+  } else {
+    FAIL_UNLESS(cb.store_long_bool(1, 3)           // msg_export_new$001
+                && cb.store_ref_bool(msg_env)      // out_msg:^MsgEnvelope
+                && cb.store_ref_bool(msg.trans));  // transaction:^Transaction
+    out_msg = cb.finalize();
+  }
   // 4. insert OutMsg into OutMsgDescr
   if (verbosity > 2) {
-    std::cerr << "OutMsg for a newly-generated message: ";
-    block::gen::t_OutMsg.print_ref(std::cerr, out_msg);
+    FLOG(INFO) {
+      sb << "OutMsg for a newly-generated message: ";
+      block::gen::t_OutMsg.print_ref(sb, out_msg);
+    };
   }
   if (!insert_out_msg(out_msg)) {
     return fatal_error("cannot insert a new OutMsg into OutMsgDescr");
   }
   // 5. create EnqueuedMsg
-  CHECK(cb.store_long_bool(enqueued_lt)  // _ enqueued_lt:uint64
-        && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
-  // 6. insert EnqueuedMsg into OutMsgQueue
+  FAIL_UNLESS(cb.store_long_bool(enqueued_lt)  // _ enqueued_lt:uint64
+              && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
+
+  // 6. insert EnqueuedMsg into OutMsgQueue (or DispatchQueue)
+  if (defer) {
+    block::AccountDispatchQueue account_queue;
+    if (!account_queue.unpack(dispatch_queue_->lookup(src_addr))) {
+      return fatal_error(PSTRING() << "cannot unpack AccountDispatchQueue for account " << src_addr.to_hex());
+    }
+    td::BitArray<64> key;
+    key.store_ulong(msg.lt);
+    if (!account_queue.dict.set_builder(key, cb, vm::Dictionary::SetMode::Add)) {
+      return fatal_error(PSTRING() << "cannot add message to AccountDispatchQueue for account " << src_addr.to_hex()
+                                   << ", lt=" << msg.lt);
+    }
+    ++account_queue.dict_size;
+    if (store_dispatch_queue_balance_ && account_queue.total_balance.is_valid()) {
+      account_queue.total_balance += block::get_message_balance_for_dispatch_queue(msg.msg, global_version_);
+      if (!account_queue.total_balance.is_valid()) {
+        return fatal_error(PSTRING() << "error calculating dispatch queue balance (2): account=" << src_addr.to_hex()
+                                     << ", lt=" << msg.lt);
+      }
+    } else {
+      account_queue.total_balance.invalidate();
+    }
+    Ref<vm::CellSlice> account_dict_csr;
+    if (!account_queue.pack(account_dict_csr)) {
+      return fatal_error(PSTRING() << "cannot pack AccountDispatchQueue for account " << src_addr.to_hex());
+    }
+    dispatch_queue_->set(src_addr, account_dict_csr);
+    return register_dispatch_queue_op();
+  }
+
   auto next_hop = block::interpolate_addr(src_prefix, dest_prefix, route_info.second);
   td::BitArray<32 + 64 + 256> key;
   key.bits().store_int(next_hop.workchain, 32);
@@ -3655,7 +4981,7 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
                << ")";
     ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
     ++out_msg_queue_size_;
-  } catch (vm::VmError) {
+  } catch (vm::VmError&) {
     ok = false;
   }
   if (!ok) {
@@ -3672,14 +4998,32 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
  *
  * @returns True if all new messages were processed successfully, false otherwise.
  */
-bool Collator::process_new_messages(bool enqueue_only) {
+bool Collator::process_new_messages(bool& enqueue_only) {
+  SCOPE_EXIT {
+    stats_.load_fraction_new_msgs = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
+  };
   while (!new_msgs.empty()) {
+    if (!block_limit_status_->fits(block::ParamLimits::cl_normal)) {
+      block_full_ = true;
+    }
+    if (!block_full_ && internal_msg_timeout_.is_in_past()) {
+      LOG(INFO) << "soft timeout reached, enqueue all remaining new messages";
+      block_full_ = true;
+    }
     block::NewOutMsg msg = new_msgs.top();
     new_msgs.pop();
+    if (msg.msg_env_from_dispatch_queue.not_null()) {
+      --new_msgs_from_dispatch;
+    }
     block_limit_status_->extra_out_msgs--;
-    if (block_full_ && !enqueue_only) {
+    if ((block_full_ || have_unprocessed_account_dispatch_queue_) && !enqueue_only) {
       LOG(INFO) << "BLOCK FULL, enqueue all remaining new messages";
       enqueue_only = true;
+      stats_.limits_log += PSTRING() << "NEW_MESSAGES: "
+                                     << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
+    }
+    if (!check_cancelled()) {
+      return false;
     }
     LOG(DEBUG) << "have message with lt=" << msg.lt;
     int res = process_one_new_message(std::move(msg), enqueue_only);
@@ -3688,6 +5032,8 @@ bool Collator::process_new_messages(bool enqueue_only) {
     } else if (res == 3) {
       LOG(INFO) << "All remaining new messages must be enqueued (BLOCK FULL)";
       enqueue_only = true;
+      stats_.limits_log += PSTRING() << "NEW_MESSAGES: "
+                                     << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
     }
   }
   return true;
@@ -3702,6 +5048,9 @@ void Collator::register_new_msg(block::NewOutMsg new_msg) {
   if (new_msg.lt < min_new_msg_lt) {
     min_new_msg_lt = new_msg.lt;
   }
+  if (new_msg.msg_env_from_dispatch_queue.not_null()) {
+    ++new_msgs_from_dispatch;
+  }
   new_msgs.push(std::move(new_msg));
   block_limit_status_->extra_out_msgs++;
 }
@@ -3710,12 +5059,21 @@ void Collator::register_new_msg(block::NewOutMsg new_msg) {
  * Registers new messages that were created in the transaction.
  *
  * @param trans The transaction containing the messages.
+ * @param msg_metadata Metadata of the new messages.
+ *
+ * @returns True if the operation was successful, false otherwise.
  */
-void Collator::register_new_msgs(block::transaction::Transaction& trans) {
-  CHECK(trans.root.not_null());
+bool Collator::register_new_msgs(block::transaction::Transaction& trans,
+                                 td::optional<block::MsgMetadata> msg_metadata) {
+  FAIL_UNLESS(trans.root.not_null());
   for (unsigned i = 0; i < trans.out_msgs.size(); i++) {
-    register_new_msg(trans.extract_out_msg_ext(i));
+    block::NewOutMsg msg = trans.extract_out_msg_ext(i);
+    if (msg_metadata_enabled_) {
+      msg.metadata = msg_metadata;
+    }
+    register_new_msg(std::move(msg));
   }
+  return true;
 }
 
 /*
@@ -3797,7 +5155,7 @@ static int update_one_shard(block::McShardHash& info, const block::McShardHash* 
       // prepare split
       info.set_fsm_split(now + wc_info->split_merge_delay, wc_info->split_merge_interval);
       changed = true;
-      LOG(INFO) << "preparing to split shard " << info.shard().to_str() << " during " << info.fsm_utime() << " .. "
+      LOG(INFO) << "preparing to split shard " << info.shard() << " during " << info.fsm_utime() << " .. "
                 << info.fsm_utime_end();
     } else if (info.is_fsm_none() && depth > wc_info->min_split && (info.want_merge_ || depth > wc_info->max_split) &&
                sibling && !sibling->before_split_ && sibling->is_fsm_none() &&
@@ -3805,16 +5163,15 @@ static int update_one_shard(block::McShardHash& info, const block::McShardHash* 
       // prepare merge
       info.set_fsm_merge(now + wc_info->split_merge_delay, wc_info->split_merge_interval);
       changed = true;
-      LOG(INFO) << "preparing to merge shard " << info.shard().to_str() << " with " << sibling->shard().to_str()
-                << " during " << info.fsm_utime() << " .. " << info.fsm_utime_end();
+      LOG(INFO) << "preparing to merge shard " << info.shard() << " with " << sibling->shard() << " during "
+                << info.fsm_utime() << " .. " << info.fsm_utime_end();
     } else if (info.is_fsm_merge() && depth > wc_info->min_split && sibling && !sibling->before_split_ &&
                sibling->is_fsm_merge() && now >= info.fsm_utime() && now >= sibling->fsm_utime() &&
                (depth > wc_info->max_split || (info.want_merge_ && sibling->want_merge_))) {
       // force merge
       info.before_merge_ = true;
       changed = true;
-      LOG(INFO) << "force immediate merging of shard " << info.shard().to_str() << " with "
-                << sibling->shard().to_str();
+      LOG(INFO) << "force immediate merging of shard " << info.shard() << " with " << sibling->shard();
     }
   }
   if (info.before_merge_ != old_before_merge) {
@@ -3872,7 +5229,7 @@ bool Collator::update_shard_config(const block::WorkchainSet& wc_set, const bloc
  */
 bool Collator::create_mc_state_extra() {
   if (!is_masterchain()) {
-    CHECK(mc_state_extra_.is_null());
+    FAIL_UNLESS(mc_state_extra_.is_null());
     return true;
   }
   // should update mc_state_extra with a new McStateExtra
@@ -3891,14 +5248,17 @@ bool Collator::create_mc_state_extra() {
                        " : " + cfg_res.move_as_error().to_string());
   }
   auto cfg_smc_config = cfg_res.move_as_ok();
-  CHECK(cfg_smc_config.not_null());
+  FAIL_UNLESS(cfg_smc_config.not_null());
   vm::Dictionary cfg_dict{cfg_smc_config, 32};
   bool ignore_cfg_changes = false;
   Ref<vm::Cell> cfg0;
   if (!block::valid_config_data(cfg_smc_config, config_addr, true, true, old_mparams_)) {
-    block::gen::t_Hashmap_32_Ref_Cell.print_ref(std::cerr, cfg_smc_config);
     LOG(ERROR) << "configuration smart contract "s + config_addr.to_hex() +
                       " contains an invalid configuration in its data, IGNORING CHANGES";
+    FLOG(WARNING) {
+      sb << "ignored configuration: ";
+      block::gen::t_Hashmap_32_Ref_Cell.print_ref(sb, cfg_smc_config);
+    };
     ignore_cfg_changes = true;
   } else {
     cfg0 = cfg_dict.lookup_ref(td::BitArray<32>{(long long)0});
@@ -3922,7 +5282,7 @@ bool Collator::create_mc_state_extra() {
              changed_cfg) {
     LOG(WARNING) << "global configuration changed, updating";
     vm::CellBuilder cb;
-    CHECK(cb.store_bits_bool(config_addr) && cb.store_ref_bool(cfg_smc_config));
+    FAIL_UNLESS(cb.store_bits_bool(config_addr) && cb.store_ref_bool(cfg_smc_config));
     state_extra.config = vm::load_cell_slice_ref(cb.finalize());
     LOG(WARNING) << "marking new block as a key block";
     is_key_block_ = true;
@@ -3936,37 +5296,26 @@ bool Collator::create_mc_state_extra() {
     return fatal_error(wset_res.move_as_error());
   }
   bool update_shard_cc = is_key_block_ || (now_ / ccvc.shard_cc_lifetime > prev_now_ / ccvc.shard_cc_lifetime);
-  // temp debug
-  if (verbosity >= 3 * 1) {
-    auto csr = shard_conf_->get_root_csr();
-    LOG(INFO) << "new shard configuration before post-processing is";
-    std::ostringstream os;
-    csr->print_rec(os);
-    block::gen::t_ShardHashes.print(os, csr.write());
-    LOG(INFO) << os.str();
-  }
-  // end (temp debug)
   if (!update_shard_config(wset_res.move_as_ok(), ccvc, update_shard_cc)) {
     auto csr = shard_conf_->get_root_csr();
     if (csr.is_null()) {
       LOG(WARNING) << "new shard configuration is null (!)";
     } else {
       LOG(WARNING) << "invalid new shard configuration is";
-      std::ostringstream os;
-      csr->print_rec(os);
-      block::gen::t_ShardHashes.print(os, csr.write());
-      LOG(WARNING) << os.str();
+      FLOG(WARNING) {
+        csr->print_rec(sb);
+        block::gen::t_ShardHashes.print(sb, csr);
+      };
     }
     return fatal_error("cannot post-process shard configuration");
   }
   // 3. save new shard_hashes
   state_extra.shard_hashes = shard_conf_->get_root_csr();
-  if (verbosity >= 3 * 0) {  // DEBUG
-    std::cerr << "updated shard configuration to ";
-    block::gen::t_ShardHashes.print(std::cerr, *state_extra.shard_hashes);
-  }
-  if (!block::gen::t_ShardHashes.validate_upto(10000, *state_extra.shard_hashes)) {
-    return fatal_error("new ShardHashes is invalid");
+  if (verbosity >= 3) {
+    FLOG(INFO) {
+      sb << "updated shard configuration to ";
+      block::gen::t_ShardHashes.print(sb, state_extra.shard_hashes);
+    };
   }
   // 4. check extension flags
   if (state_extra.r1.flags & ~1) {
@@ -3979,10 +5328,7 @@ bool Collator::create_mc_state_extra() {
   if (!tlb::csr_unpack(state_extra.r1.validator_info, val_info)) {
     return fatal_error("cannot unpack ValidatorInfo from previous state");
   }
-  auto cur_vset_cell = cfg_dict_new.lookup_ref(td::BitArray<32>{35});
-  if (cur_vset_cell.is_null()) {
-    cur_vset_cell = cfg_dict_new.lookup_ref(td::BitArray<32>{34});
-  }
+  auto cur_vset_cell = cfg_dict_new.lookup_ref(td::BitArray<32>{34});
   auto res = block::Config::unpack_validator_set(std::move(cur_vset_cell));
   if (res.is_error()) {
     auto err = res.move_as_error();
@@ -3990,7 +5336,7 @@ bool Collator::create_mc_state_extra() {
     return fatal_error(std::move(err));
   }
   auto cur_validators = res.move_as_ok();
-  LOG_CHECK(cur_validators) << "unpacked current validator set is empty";
+  FAIL_UNLESS(cur_validators);
 
   unsigned lifetime = ccvc.mc_cc_lifetime;
   bool cc_updated = false;
@@ -3999,8 +5345,8 @@ bool Collator::create_mc_state_extra() {
     cc_updated = true;
     LOG(INFO) << "increased masterchain catchain seqno to " << val_info.catchain_seqno;
   }
-  auto nodes = block::Config::do_compute_validator_set(ccvc, shard_, *cur_validators, now_, val_info.catchain_seqno);
-  LOG_CHECK(!nodes.empty()) << "validator node list in unpacked validator set is empty";
+  auto nodes = block::Config::do_compute_validator_set(ccvc, shard_, *cur_validators, val_info.catchain_seqno);
+  FAIL_UNLESS(!nodes.empty());
 
   auto vlist_hash = block::compute_validator_set_hash(/* val_info.catchain_seqno */ 0, shard_, std::move(nodes));
   LOG(INFO) << "masterchain validator set hash changed from " << val_info.validator_list_hash_short << " to "
@@ -4015,27 +5361,26 @@ bool Collator::create_mc_state_extra() {
   }
   // ...
   // 6. update prev_blocks
-  CHECK(new_block_seqno > 0 && new_block_seqno == last_block_seqno + 1);
+  FAIL_UNLESS(new_block_seqno > 0 && new_block_seqno == last_block_seqno + 1);
   vm::AugmentedDictionary dict{state_extra.r1.prev_blocks, 32, block::tlb::aug_OldMcBlocksInfo};
   vm::CellBuilder cb;
   LOG(DEBUG) << "previous state is a key state: " << config_->is_key_state();
-  CHECK(cb.store_bool_bool(config_->is_key_state()) && store_prev_blk_ref(cb, false) &&
-        dict.set_builder(td::BitArray<32>(last_block_seqno), cb, vm::Dictionary::SetMode::Add));
+  FAIL_UNLESS(cb.store_bool_bool(config_->is_key_state()) && store_prev_blk_ref(cb, false) &&
+              dict.set_builder(td::BitArray<32>(last_block_seqno), cb, vm::Dictionary::SetMode::Add));
   state_extra.r1.prev_blocks = std::move(dict).extract_root();
   cb.reset();
   // 7. update after_key_block:Bool and last_key_block:(Maybe ExtBlkRef)
   state_extra.r1.after_key_block = is_key_block_;
   if (prev_key_block_exists_) {
     // have non-trivial previous key block
-    LOG(DEBUG) << "previous key block is " << prev_key_block_.to_str() << " lt " << prev_key_block_lt_;
-    CHECK(cb.store_bool_bool(true) && store_ext_blk_ref_to(cb, prev_key_block_, prev_key_block_lt_));
+    LOG(DEBUG) << "previous key block is " << prev_key_block_ << " lt " << prev_key_block_lt_;
+    FAIL_UNLESS(cb.store_bool_bool(true) && store_ext_blk_ref_to(cb, prev_key_block_, prev_key_block_lt_));
   } else if (config_->is_key_state()) {
-    LOG(DEBUG) << "setting previous key block to the previous block " << prev_blocks.at(0).to_str() << " lt "
-               << config_->lt;
-    CHECK(cb.store_bool_bool(true) && store_ext_blk_ref_to(cb, prev_blocks.at(0), config_->lt));
+    LOG(DEBUG) << "setting previous key block to the previous block " << prev_blocks.at(0) << " lt " << config_->lt;
+    FAIL_UNLESS(cb.store_bool_bool(true) && store_ext_blk_ref_to(cb, prev_blocks.at(0), config_->lt));
   } else {
     LOG(DEBUG) << "have no previous key block";
-    CHECK(cb.store_bool_bool(false));
+    FAIL_UNLESS(cb.store_bool_bool(false));
     if (state_extra.r1.last_key_block->size() > 1) {
       return fatal_error("cannot have no last key block after a state with last key block");
     }
@@ -4046,6 +5391,11 @@ bool Collator::create_mc_state_extra() {
   global_balance_ += value_flow_.created;
   global_balance_ += value_flow_.minted;
   global_balance_ += import_created_;
+  if (global_version_ >= 17) {
+    FAIL_UNLESS(calculated_prev_global_balance_.not_null());
+    global_balance_.grams =
+        calculated_prev_global_balance_ + value_flow_.created.grams + import_created_.grams - value_flow_.burned.grams;
+  }
   LOG(INFO) << "Global balance is " << global_balance_.to_str();
   if (!global_balance_.pack_to(state_extra.global_balance)) {
     return fatal_error("cannot store global_balance");
@@ -4058,19 +5408,13 @@ bool Collator::create_mc_state_extra() {
   if (state_extra.r1.flags & 1) {
     vm::CellBuilder cb;
     // block_create_stats#17 counters:(HashmapE 256 CreatorStats) = BlockCreateStats;
-    CHECK(cb.store_long_bool(0x17, 8) && cb.append_cellslice_bool(block_create_stats_->get_root()));
+    FAIL_UNLESS(cb.store_long_bool(0x17, 8) && cb.append_cellslice_bool(block_create_stats_->get_root()));
     auto cs = vm::load_cell_slice_ref(cb.finalize());
     state_extra.r1.block_create_stats = cs;
-    if (verify >= 2) {
-      LOG(INFO) << "verifying new BlockCreateStats";
-      if (!block::gen::t_BlockCreateStats.validate_csr(100000, cs)) {
-        cs->print_rec(std::cerr);
-        block::gen::t_BlockCreateStats.print(std::cerr, *cs);
-        return fatal_error("BlockCreateStats in the new masterchain state failed to pass automated validity checks");
-      }
-    }
     if (verbosity >= 4 * 1) {
-      block::gen::t_BlockCreateStats.print(std::cerr, *cs);
+      FLOG(INFO) {
+        block::gen::t_BlockCreateStats.print(sb, cs);
+      };
     }
   } else {
     state_extra.r1.block_create_stats.clear();
@@ -4078,11 +5422,6 @@ bool Collator::create_mc_state_extra() {
   // 10. pack new McStateExtra
   if (!tlb::pack(cb, state_extra) || !cb.finalize_to(mc_state_extra_)) {
     return fatal_error("cannot pack new McStateExtra");
-  }
-  if (verify >= 2) {
-    LOG(INFO) << "verifying new McStateExtra";
-    CHECK(block::gen::t_McStateExtra.validate_ref(1000000, mc_state_extra_));
-    CHECK(block::tlb::t_McStateExtra.validate_ref(1000000, mc_state_extra_));
   }
   LOG(INFO) << "McStateExtra created";
   return true;
@@ -4105,7 +5444,6 @@ bool Collator::update_block_creator_count(td::ConstBitPtr key, unsigned shard_in
   if (!block::unpack_CreatorStats(std::move(cs), mc_cnt, shard_cnt)) {
     return fatal_error("cannot unpack CreatorStats for "s + key.to_hex(256) + " from previous masterchain state");
   }
-  // std::cerr << mc_cnt.to_str() << " " << shard_cnt.to_str() << std::endl;
   if (mc_incr && !mc_cnt.increase_by(mc_incr, now_)) {
     return fatal_error(PSTRING() << "cannot increase masterchain block counter in CreatorStats for " << key.to_hex(256)
                                  << " by " << mc_incr << " (old value is " << mc_cnt.to_str() << ")");
@@ -4163,15 +5501,15 @@ bool Collator::update_block_creator_stats() {
     return true;
   }
   LOG(INFO) << "updating block creator statistics";
-  CHECK(block_create_stats_);
+  FAIL_UNLESS(block_create_stats_);
   for (const auto& p : block_create_count_) {
     if (!update_block_creator_count(p.first.bits(), p.second, 0)) {
       return fatal_error("cannot update CreatorStats for "s + p.first.to_hex());
     }
   }
-  auto has_creator = !created_by_.is_zero();
-  if (has_creator && !update_block_creator_count(created_by_.as_bits256().bits(), 0, 1)) {
-    return fatal_error("cannot update CreatorStats for "s + created_by_.as_bits256().to_hex());
+  auto has_creator = !params_.creator.is_zero();
+  if (has_creator && !update_block_creator_count(params_.creator.as_bits256().bits(), 0, 1)) {
+    return fatal_error("cannot update CreatorStats for "s + params_.creator.as_bits256().to_hex());
   }
   if ((has_creator || block_create_total_) &&
       !update_block_creator_count(td::Bits256::zero().bits(), block_create_total_, has_creator)) {
@@ -4181,7 +5519,7 @@ bool Collator::update_block_creator_stats() {
   LOG(INFO) << "scanning for outdated CreatorStats entries";
   /*
   int cnt = block_create_stats_->filter([this](vm::CellSlice& cs, td::ConstBitPtr key, int key_len) {
-    CHECK(key_len == 256);
+    FAIL_UNLESS(key_len == 256);
     return creator_count_outdated(key, cs);
   });
   */
@@ -4216,7 +5554,7 @@ bool Collator::update_block_creator_stats() {
  * @returns A Result object containing a reference to the configuration data.
  */
 td::Result<Ref<vm::Cell>> Collator::get_config_data_from_smc(const ton::StdSmcAddress& cfg_addr) {
-  return block::get_config_data_from_smc(account_dict->lookup_ref(cfg_addr));
+  return block::get_config_data_from_smc(account_dict->lookup(cfg_addr));
 }
 
 /**
@@ -4251,7 +5589,7 @@ bool Collator::try_fetch_new_config(const ton::StdSmcAddress& cfg_addr, Ref<vm::
  *
  * @returns The weight of the history.
  */
-static int history_weight(td::uint64 history) {
+int Collator::history_weight(td::uint64 history) {
   return td::count_bits64(history & 0xffff) * 3 + td::count_bits64(history & 0xffff0000) * 2 +
          td::count_bits64(history & 0xffff00000000) - (3 + 2 + 1) * 16 * 2 / 3;
 }
@@ -4269,10 +5607,56 @@ bool Collator::check_block_overload() {
   block_size_estimate_ = block_limit_status_->estimate_block_size();
   LOG(INFO) << "block load statistics: gas=" << block_limit_status_->gas_used
             << " lt_delta=" << block_limit_status_->cur_lt - block_limit_status_->limits.start_lt
-            << " size_estimate=" << block_size_estimate_;
-  auto cl = block_limit_status_->classify();
-  if (cl <= block::ParamLimits::cl_underload) {
-    if (out_msg_queue_size_ > MERGE_MAX_QUEUE_SIZE) {
+            << " size_estimate=" << block_size_estimate_
+            << " collated_size_estimate=" << block_limit_status_->collated_data_size_estimate;
+  block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
+
+  bool long_collation_overload = false;
+  bool long_collation_underload = false;
+  if (params_.wait_externals_until) {
+    double do_collate_time = td::Timestamp::now() - do_collate_started_at_;
+    double total_time = td::Timestamp::now() - collator_started_at_;
+    stats_.check_load_do_collate_time = do_collate_time;
+    stats_.check_load_total_time = total_time;
+    LOG(INFO) << "Check block overload timers: wait_externals=" << wait_externals_total_time_
+              << " do_collate=" << do_collate_time << " total=" << total_time;
+    if (total_time > 0.1 && wait_externals_total_time_ < total_time * 0.2 && do_collate_time > total_time * 0.6) {
+      long_collation_overload = true;
+    }
+    if (total_time > 0.1 && wait_externals_total_time_ < total_time * 0.7 && do_collate_time > total_time * 0.6) {
+      long_collation_underload = true;
+    }
+  }
+
+  if (block_limit_class_ >= block::ParamLimits::cl_soft || dispatch_queue_total_limit_reached_ ||
+      long_collation_overload) {
+    std::string message = "block is overloaded ";
+    if (block_limit_class_ >= block::ParamLimits::cl_soft) {
+      message += PSTRING() << "(category " << block_limit_class_ << ")";
+    } else if (long_collation_overload) {
+      message += PSTRING() << "(collation takes too long)";
+    } else {
+      message += "(long dispatch queue processing)";
+    }
+    if (out_msg_queue_size_ > SPLIT_MAX_QUEUE_SIZE) {
+      LOG(INFO) << message << ", but don't set overload history because out_msg_queue size is too big to split ("
+                << out_msg_queue_size_ << " > " << SPLIT_MAX_QUEUE_SIZE << ")";
+    } else {
+      overload_history_ |= 1;
+      // Record which cause set the overload bit, mirroring the message priority above.
+      if (block_limit_class_ >= block::ParamLimits::cl_soft) {
+        stats_.overload_reason = 1;  // load: a block-limit axis hit soft
+      } else if (long_collation_overload) {
+        stats_.overload_reason = 3;  // collation took too long
+      } else {
+        stats_.overload_reason = 4;  // long dispatch queue processing
+      }
+      LOG(INFO) << message;
+    }
+  } else if (block_limit_class_ <= block::ParamLimits::cl_underload) {
+    if (long_collation_underload) {
+      LOG(INFO) << "block is not underloaded because collation takes too long";
+    } else if (out_msg_queue_size_ > MERGE_MAX_QUEUE_SIZE) {
       LOG(INFO)
           << "block is underloaded, but don't set underload history because out_msg_queue size is too big to merge ("
           << out_msg_queue_size_ << " > " << MERGE_MAX_QUEUE_SIZE << ")";
@@ -4280,43 +5664,32 @@ bool Collator::check_block_overload() {
       underload_history_ |= 1;
       LOG(INFO) << "block is underloaded";
     }
-  } else if (cl >= block::ParamLimits::cl_soft) {
-    if (out_msg_queue_size_ > SPLIT_MAX_QUEUE_SIZE) {
-      LOG(INFO) << "block is overloaded (category " << cl
-                << "), but don't set overload history because out_msg_queue size is too big to split ("
-                << out_msg_queue_size_ << " > " << SPLIT_MAX_QUEUE_SIZE << ")";
-    } else {
-      overload_history_ |= 1;
-      LOG(INFO) << "block is overloaded (category " << cl << ")";
-    }
   } else {
     LOG(INFO) << "block is loaded normally";
   }
   if (!(overload_history_ & 1) && out_msg_queue_size_ >= FORCE_SPLIT_QUEUE_SIZE &&
       out_msg_queue_size_ <= SPLIT_MAX_QUEUE_SIZE) {
     overload_history_ |= 1;
+    stats_.overload_reason = 2;  // out_msg_queue reached the force-split limit
     LOG(INFO) << "setting overload history because out_msg_queue reached force split limit (" << out_msg_queue_size_
               << " >= " << FORCE_SPLIT_QUEUE_SIZE << ")";
   }
-  if (collator_settings & 1) {
-    LOG(INFO) << "want_split manually set";
-    want_split_ = true;
-    return true;
-  } else if (collator_settings & 2) {
-    LOG(INFO) << "want_merge manually set";
-    want_merge_ = true;
-    return true;
-  }
   char buffer[17];
   if (history_weight(overload_history_) >= 0) {
-    sprintf(buffer, "%016llx", (unsigned long long)overload_history_);
+    snprintf(buffer, sizeof(buffer), "%016llx", (unsigned long long)overload_history_);
     LOG(INFO) << "want_split set because of overload history " << buffer;
     want_split_ = true;
+  } else if (out_msg_queue_size_ > out_msg_queue_size_hard_limit_ / 2) {
+    LOG(INFO) << "out msg queue " << out_msg_queue_size_
+              << " exceeds hard_limit/2 = " << out_msg_queue_size_hard_limit_ / 2 << ", cannot set want_merge";
   } else if (history_weight(underload_history_) >= 0) {
-    sprintf(buffer, "%016llx", (unsigned long long)underload_history_);
+    snprintf(buffer, sizeof(buffer), "%016llx", (unsigned long long)underload_history_);
     LOG(INFO) << "want_merge set because of underload history " << buffer;
     want_merge_ = true;
   }
+  // Record the final want_split decision and the peak block-limit class for session-stats attribution.
+  stats_.want_split = want_split_;
+  stats_.peak_block_limit_class = block_limit_class_;
   return true;
 }
 
@@ -4356,7 +5729,7 @@ bool Collator::remove_public_library(td::ConstBitPtr key, td::ConstBitPtr addr) 
   if (publishers.is_empty()) {
     LOG(INFO) << "library " << key.to_hex(256) << " has no publishers left, removing altogether";
     auto val2 = shard_libraries_->lookup_delete(key, 256);
-    CHECK(val2.not_null());
+    FAIL_UNLESS(val2.not_null());
     return true;
   }
   rec.publishers = vm::load_cell_slice_ref(std::move(publishers).extract_root_cell());
@@ -4386,7 +5759,7 @@ bool Collator::remove_public_library(td::ConstBitPtr key, td::ConstBitPtr addr) 
  */
 bool Collator::add_public_library(td::ConstBitPtr key, td::ConstBitPtr addr, Ref<vm::Cell> library) {
   LOG(INFO) << "Adding public library " << key.to_hex(256) << " of account " << addr.to_hex(256);
-  CHECK(library.not_null() && !library->get_hash().bits().compare(key, 256));
+  FAIL_UNLESS(library.not_null() && !library->get_hash().bits().compare(key, 256));
   block::gen::LibDescr::Record rec;
   std::unique_ptr<vm::Dictionary> publishers;
   auto val = shard_libraries_->lookup(key, 256);
@@ -4438,7 +5811,7 @@ bool Collator::update_account_public_libraries(Ref<vm::Cell> orig_libs, Ref<vm::
   vm::Dictionary dict1{std::move(orig_libs), 256}, dict2{std::move(final_libs), 256};
   return dict1.scan_diff(
       dict2, [this, &addr](td::ConstBitPtr key, int n, Ref<vm::CellSlice> val1, Ref<vm::CellSlice> val2) -> bool {
-        CHECK(n == 256);
+        FAIL_UNLESS(n == 256);
         bool f = block::is_public_library(key, std::move(val1));
         bool g = block::is_public_library(key, val2);
         if (f && !g) {
@@ -4458,22 +5831,24 @@ bool Collator::update_account_public_libraries(Ref<vm::Cell> orig_libs, Ref<vm::
  * @returns True if the update was successful, false otherwise.
  */
 bool Collator::update_public_libraries() {
-  CHECK(is_masterchain());
+  FAIL_UNLESS(is_masterchain());
   for (auto& z : accounts) {
     block::Account& acc = *(z.second);
-    CHECK(acc.addr == z.first);
+    FAIL_UNLESS(acc.addr == z.first);
     if (acc.libraries_changed()) {
       LOG(DEBUG) << "libraries of " << acc.addr.to_hex() << " changed, rescanning";
-      CHECK(!acc.transactions.empty());
+      FAIL_UNLESS(!acc.transactions.empty());
       if (!update_account_public_libraries(acc.orig_library, acc.library, acc.addr)) {
         return fatal_error("error scanning public libraries of account "s + acc.addr.to_hex());
       }
     }
   }
   if (libraries_changed_ && verbosity >= 2) {
-    std::cerr << "New public libraries: ";
-    block::gen::t_HashmapE_256_LibDescr.print(std::cerr, shard_libraries_->get_root());
-    shard_libraries_->get_root()->print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "New public libraries: ";
+      block::gen::t_HashmapE_256_LibDescr.print(sb, shard_libraries_->get_root());
+      shard_libraries_->get_root()->print_rec(sb);
+    };
   }
   return true;
 }
@@ -4508,6 +5883,76 @@ bool Collator::register_out_msg_queue_op(bool force) {
 }
 
 /**
+ * Registers a dispatch queue message queue operation.
+ * Adds the proof to the block limit status every 64 operations.
+ *
+ * @param force If true, the proof will always be added to the block limit status.
+ *
+ * @returns True if the operation was successfully registered, false otherwise.
+ */
+bool Collator::register_dispatch_queue_op(bool force) {
+  ++dispatch_queue_ops_;
+  if (force || !(dispatch_queue_ops_ & 63)) {
+    return block_limit_status_->add_proof(dispatch_queue_->get_root_cell());
+  } else {
+    return true;
+  }
+}
+
+/**
+ * Update size estimation for the account dictionary.
+ * This is required to count the depth of the ShardAccounts dictionary in the block size estimation.
+ * account_dict_estimator_ is used for block limits only.
+ *
+ * @param trans Newly-created transaction.
+ *
+ * @returns True on success, false otherwise.
+ */
+bool Collator::update_account_dict_estimation(const block::transaction::Transaction& trans) {
+  const block::Account& acc = trans.account;
+  if (acc.orig_total_state->get_hash() != acc.total_state->get_hash() &&
+      account_dict_estimator_added_accounts_.insert(acc.addr).second) {
+    // see combine_account_transactions
+    if (acc.status == block::Account::acc_nonexist) {
+      account_dict_estimator_->lookup_delete(acc.addr);
+    } else {
+      vm::CellBuilder cb;
+      if (!(cb.store_ref_bool(acc.total_state)             // account_descr$_ account:^Account
+            && cb.store_bits_bool(acc.last_trans_hash_)    // last_trans_hash:bits256
+            && cb.store_long_bool(acc.last_trans_lt_, 64)  // last_trans_lt:uint64
+            && account_dict_estimator_->set_builder(acc.addr, cb))) {
+        return false;
+      }
+    }
+  }
+  ++account_dict_ops_;
+  if (!(account_dict_ops_ & 15)) {
+    return block_limit_status_->add_proof(account_dict_estimator_->get_root_cell());
+  }
+  return true;
+}
+
+/**
+ * Update `storage_stat_updates` for AccountStorageDict for the new transaction.
+ *
+ * @param trans Newly-created transaction.
+ */
+void Collator::update_account_storage_dict_info(const block::transaction::Transaction& trans) {
+  if (!trans.account.orig_storage_dict_hash) {
+    return;
+  }
+  auto it = account_storage_dicts_.find(trans.account.orig_storage_dict_hash.value());
+  if (it == account_storage_dicts_.end()) {
+    return;
+  }
+  for (const Ref<vm::Cell>& cell : trans.storage_stat_updates) {
+    if (cell.not_null()) {
+      it->second.storage_stat_updates.push_back(cell);
+    }
+  }
+}
+
+/**
  * Creates a new shard state and the Merkle update.
  *
  * @returns True if the shard state and Merkle update were successfully created, false otherwise.
@@ -4533,7 +5978,6 @@ bool Collator::create_shard_state() {
         && cb.store_ref_bool(cb2.finalize())            // ...
         && cb2.store_long_bool(overload_history_, 64)   // ^[ overload_history:uint64
         && cb2.store_long_bool(underload_history_, 64)  //    underload_history:uint64
-        && compute_total_balance()                      //    -> total_balance, total_validator_fees
         && total_balance_.store(cb2)                    //  total_balance:CurrencyCollection
         && total_validator_fees_.store(cb2)             //  total_validator_fees:CurrencyCollection
         && shard_libraries_->append_dict_to_bool(cb2)   //    libraries:(HashmapE 256 LibDescr)
@@ -4546,24 +5990,24 @@ bool Collator::create_shard_state() {
   }
   LOG(DEBUG) << "min_ref_mc_seqno is " << min_ref_mc_seqno_;
   if (verbosity > 2) {
-    std::cerr << "new ShardState: ";
-    block::gen::t_ShardState.print_ref(std::cerr, state_root);
-    vm::load_cell_slice(state_root).print_rec(std::cerr);
-  }
-  if (verify >= 2) {
-    LOG(INFO) << "verifying new ShardState";
-    CHECK(block::gen::t_ShardState.validate_ref(1000000, state_root));
-    CHECK(block::tlb::t_ShardState.validate_ref(1000000, state_root));
+    FLOG(INFO) {
+      sb << "new ShardState: ";
+      block::gen::t_ShardState.print_ref(sb, state_root);
+      vm::load_cell_slice(state_root).print_rec(sb);
+    };
   }
   LOG(INFO) << "creating Merkle update for the ShardState";
-  state_update = vm::MerkleUpdate::generate(prev_state_root_, state_root, state_usage_tree_.get());
-  if (state_update.is_null()) {
+  auto r_state_update = vm::MerkleUpdate::generate(prev_state_root_, state_root, state_usage_tree_.get());
+  if (r_state_update.is_error()) {
     return fatal_error("cannot create Merkle update for ShardState");
   }
+  state_update = r_state_update.move_as_ok();
   if (verbosity > 2) {
-    std::cerr << "Merkle Update for ShardState: ";
-    vm::CellSlice cs{vm::NoVm{}, state_update};
-    cs.print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "Merkle Update for ShardState: ";
+      vm::CellSlice cs{vm::NoVm{}, state_update};
+      cs.print_rec(sb);
+    };
   }
   LOG(INFO) << "updating block profile statistics";
   block_limit_status_->add_proof(state_root);
@@ -4608,15 +6052,36 @@ bool Collator::update_processed_upto() {
  */
 bool Collator::compute_out_msg_queue_info(Ref<vm::Cell>& out_msg_queue_info) {
   if (verbosity >= 2) {
-    auto rt = out_msg_queue_->get_root();
-    std::cerr << "resulting out_msg_queue is ";
-    block::gen::t_OutMsgQueue.print(std::cerr, *rt);
-    rt->print_rec(std::cerr);
+    FLOG(INFO) {
+      auto rt = out_msg_queue_->get_root();
+      sb << "resulting out_msg_queue is ";
+      block::gen::t_OutMsgQueue.print(sb, rt);
+      rt->print_rec(sb);
+    };
   }
   vm::CellBuilder cb;
-  return register_out_msg_queue_op(true) && out_msg_queue_->append_dict_to_bool(cb)  // _ out_queue:OutMsgQueue
-         && processed_upto_->pack(cb)                                                // proc_info:ProcessedInfo
-         && ihr_pending->append_dict_to_bool(cb)                                     // ihr_pending:IhrPendingInfo
+  // out_msg_queue_extra#0 dispatch_queue:DispatchQueue out_queue_size:(Maybe uint48) = OutMsgQueueExtra;
+  // ... extra:(Maybe OutMsgQueueExtra)
+  if (!dispatch_queue_->is_empty() || store_out_msg_queue_size_) {
+    if (!(cb.store_long_bool(1, 1) && cb.store_long_bool(0, 4) && dispatch_queue_->append_dict_to_bool(cb))) {
+      return false;
+    }
+    if (!(cb.store_bool_bool(store_out_msg_queue_size_) &&
+          (!store_out_msg_queue_size_ || cb.store_long_bool(out_msg_queue_size_, 48)))) {
+      return false;
+    }
+  } else {
+    if (!cb.store_long_bool(0, 1)) {
+      return false;
+    }
+  }
+  vm::CellSlice maybe_extra = cb.as_cellslice();
+  cb.reset();
+
+  return register_out_msg_queue_op(true) && register_dispatch_queue_op(true) &&
+         out_msg_queue_->append_dict_to_bool(cb)   // _ out_queue:OutMsgQueue
+         && processed_upto_->pack(cb)              // proc_info:ProcessedInfo
+         && cb.append_cellslice_bool(maybe_extra)  // extra:(Maybe OutMsgQueueExtra)
          && cb.finalize_to(out_msg_queue_info);
 }
 
@@ -4642,8 +6107,10 @@ bool Collator::compute_total_balance() {
   }
   vm::CellSlice cs{*(in_msg_dict->get_root_extra())};
   if (verbosity > 2) {
-    block::gen::t_ImportFees.print(std::cerr, vm::CellSlice{*(in_msg_dict->get_root_extra())});
-    cs.print_rec(std::cerr);
+    FLOG(INFO) {
+      block::gen::t_ImportFees.print(sb, in_msg_dict->get_root_extra());
+      cs.print_rec(sb);
+    };
   }
   auto new_import_fees = block::tlb::t_Grams.as_integer_skip(cs);
   if (new_import_fees.is_null()) {
@@ -4671,7 +6138,7 @@ bool Collator::compute_total_balance() {
   // 3. compute total_validator_fees
   total_validator_fees_ += value_flow_.fees_collected;
   total_validator_fees_ -= value_flow_.recovered;
-  CHECK(total_validator_fees_.is_valid());
+  FAIL_UNLESS(total_validator_fees_.is_valid());
   return true;
 }
 
@@ -4685,8 +6152,8 @@ bool Collator::compute_total_balance() {
 bool Collator::create_block_info(Ref<vm::Cell>& block_info) {
   vm::CellBuilder cb, cb2;
   bool mc = is_masterchain();
-  td::uint32 val_hash = is_hardfork_ ? 0 : validator_set_->get_validator_set_hash();
-  CatchainSeqno cc_seqno = is_hardfork_ ? 0 : validator_set_->get_catchain_seqno();
+  td::uint32 val_hash = params_.is_hardfork ? 0 : params_.validator_set->get_validator_set_hash();
+  CatchainSeqno cc_seqno = params_.is_hardfork ? 0 : params_.validator_set->get_catchain_seqno();
   return cb.store_long_bool(0x9bc7a987, 32)                         // block_info#9bc7a987
          && cb.store_long_bool(0, 32)                               // version:uint32
          && cb.store_bool_bool(!mc)                                 // not_master:(## 1)
@@ -4696,7 +6163,7 @@ bool Collator::create_block_info(Ref<vm::Cell>& block_info) {
          && cb.store_bool_bool(want_split_)                         // want_split:Bool
          && cb.store_bool_bool(want_merge_)                         // want_merge:Bool
          && cb.store_bool_bool(is_key_block_)                       // key_block:Bool
-         && cb.store_bool_bool(is_hardfork_)                        // vert_seqno_incr:(## 1)
+         && cb.store_bool_bool(params_.is_hardfork)                 // vert_seqno_incr:(## 1)
          && cb.store_long_bool((int)report_version_, 8)             // flags:(## 8)
          && cb.store_long_bool(new_block_seqno, 32)                 // seq_no:#
          && cb.store_long_bool(vert_seqno_, 32)                     // vert_seq_no:#
@@ -4713,7 +6180,7 @@ bool Collator::create_block_info(Ref<vm::Cell>& block_info) {
                     && cb.store_builder_ref_bool(std::move(cb2))))  // .. ^BlkMasterInfo
          && store_prev_blk_ref(cb2, after_merge_)                   // prev_ref:..
          && cb.store_builder_ref_bool(std::move(cb2))               // .. ^(PrevBlkInfo after_merge)
-         && (!is_hardfork_ ||                                       // prev_vert_ref:vert_seqno_incr?..
+         && (!params_.is_hardfork ||                                // prev_vert_ref:vert_seqno_incr?..
              (store_master_ref(cb2)                                 //
               && cb.store_builder_ref_bool(std::move(cb2))))        // .. ^(BlkPrevInfo 0)
          && cb.finalize_to(block_info);
@@ -4738,11 +6205,11 @@ bool Collator::store_version(vm::CellBuilder& cb) const {
  * @returns True if the zero state reference is successfully stored, false otherwise.
  */
 bool Collator::store_zero_state_ref(vm::CellBuilder& cb) {
-  CHECK(prev_state_root_.not_null());
+  FAIL_UNLESS(prev_state_root_.not_null());
   RootHash root_hash = prev_state_root_->get_hash().bits();
-  CHECK(prev_blocks.size() == 1);
-  CHECK(!prev_blocks[0].seqno());
-  CHECK(root_hash == prev_blocks[0].root_hash);
+  FAIL_UNLESS(prev_blocks.size() == 1);
+  FAIL_UNLESS(!prev_blocks[0].seqno());
+  FAIL_UNLESS(root_hash == prev_blocks[0].root_hash);
   return cb.store_long_bool(prev_state_lt_, 64)            // ext_blk_ref$_ end_lt:uint64
          && cb.store_long_bool(0, 32)                      // seq_no:uint32
          && cb.store_bits_bool(root_hash)                  // root_hash:bits256
@@ -4760,8 +6227,8 @@ bool Collator::store_zero_state_ref(vm::CellBuilder& cb) {
 bool Collator::store_prev_blk_ref(vm::CellBuilder& cb, bool is_after_merge) {
   if (is_after_merge) {
     auto root2 = prev_block_data.at(1)->root_cell();
-    CHECK(prev_block_root.not_null());
-    CHECK(root2.not_null());
+    FAIL_UNLESS(prev_block_root.not_null());
+    FAIL_UNLESS(root2.not_null());
     vm::CellBuilder cb2;
     return store_ext_blk_ref_to(cb2, prev_blocks.at(0), prev_block_root) && cb.store_ref_bool(cb2.finalize()) &&
            store_ext_blk_ref_to(cb2, prev_blocks.at(1), std::move(root2)) && cb.store_ref_bool(cb2.finalize());
@@ -4769,7 +6236,7 @@ bool Collator::store_prev_blk_ref(vm::CellBuilder& cb, bool is_after_merge) {
   if (!last_block_seqno) {
     return store_zero_state_ref(cb);
   } else {
-    CHECK(prev_block_root.not_null());
+    FAIL_UNLESS(prev_block_root.not_null());
     return store_ext_blk_ref_to(cb, prev_blocks.at(0), prev_block_root);
   }
 }
@@ -4802,10 +6269,10 @@ bool Collator::create_block_extra(Ref<vm::Cell>& block_extra) {
   return cb.store_long_bool(0x4a33f6fdU, 32)                                             // block_extra
          && in_msg_dict->append_dict_to_bool(cb2) && cb.store_ref_bool(cb2.finalize())   // in_msg_descr:^InMsgDescr
          && out_msg_dict->append_dict_to_bool(cb2) && cb.store_ref_bool(cb2.finalize())  // out_msg_descr:^OutMsgDescr
-         && cb.store_ref_bool(shard_account_blocks_)      // account_blocks:^ShardAccountBlocks
-         && cb.store_bits_bool(rand_seed_)                // rand_seed:bits256
-         && cb.store_bits_bool(created_by_.as_bits256())  // created_by:bits256
-         && cb.store_bool_bool(mc)                        // custom:(Maybe
+         && cb.store_ref_bool(shard_account_blocks_)          // account_blocks:^ShardAccountBlocks
+         && cb.store_bits_bool(rand_seed_)                    // rand_seed:bits256
+         && cb.store_bits_bool(params_.creator.as_bits256())  // created_by:bits256
+         && cb.store_bool_bool(mc)                            // custom:(Maybe
          && (!mc || (create_mc_block_extra(mc_block_extra) && cb.store_ref_bool(mc_block_extra)))  // .. ^McBlockExtra)
          && cb.finalize_to(block_extra);                                                           // = BlockExtra;
 }
@@ -4871,11 +6338,15 @@ bool Collator::create_block() {
     return fatal_error("cannot create new Block");
   }
   if (verbosity >= 3 * 1) {
-    std::cerr << "new Block: ";
-    block::gen::t_Block.print_ref(std::cerr, new_block);
-    vm::load_cell_slice(new_block).print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "new Block: ";
+      block::gen::t_Block.print_ref(sb, new_block);
+      vm::load_cell_slice(new_block).print_rec(sb);
+    };
   }
-  if (verify >= 1) {
+  {
+    auto tlb_cache = tlb::TLB::ValidateCache::create_for_type(&block::gen::t_Transaction);
+    tlb::TLB::ValidateCache::Guard guard(&tlb_cache);
     LOG(INFO) << "verifying new Block";
     if (!block::gen::t_Block.validate_ref(10000000, new_block)) {
       return fatal_error("new Block failed to pass automatic validity tests");
@@ -4901,7 +6372,7 @@ Ref<vm::Cell> Collator::collate_shard_block_descr_set() {
     td::BitArray<96> key;
     key.bits().store_int(shard.workchain, 32);
     (key.bits() + 32).store_uint(shard.shard, 64);
-    CHECK(dict.set_ref(key, descr->get_root(), vm::Dictionary::SetMode::Add));
+    FAIL_UNLESS(dict.set_ref(key, descr->get_root(), vm::Dictionary::SetMode::Add));
   }
   block::gen::TopBlockDescrSet::Record rec;
   Ref<vm::Cell> cell;
@@ -4911,11 +6382,79 @@ Ref<vm::Cell> Collator::collate_shard_block_descr_set() {
     return {};
   }
   if (verbosity >= 4 * 1) {
-    std::cerr << "serialized TopBlockDescrSet for collated data is: ";
-    block::gen::t_TopBlockDescrSet.print_ref(std::cerr, cell);
-    vm::load_cell_slice(cell).print_rec(std::cerr);
+    FLOG(INFO) {
+      sb << "serialized TopBlockDescrSet for collated data is: ";
+      block::gen::t_TopBlockDescrSet.print_ref(sb, cell);
+      vm::load_cell_slice(cell).print_rec(sb);
+    };
   }
   return cell;
+}
+
+/**
+ * Visits certain cells in state to add them to the proof
+ *
+ * @returns True on success, False if error occurred
+ */
+bool Collator::prepare_proofs() {
+  auto res = old_account_dict->scan_diff(
+      *account_dict, [](td::ConstBitPtr, int, Ref<vm::CellSlice>, Ref<vm::CellSlice>) { return true; }, 2);
+  if (!res) {
+    return false;
+  }
+  res = old_out_msg_queue_->scan_diff(
+      *out_msg_queue_,
+      [this](td::ConstBitPtr key, int key_len, Ref<vm::CellSlice> old_value, Ref<vm::CellSlice> new_value) {
+        old_value = old_out_msg_queue_->extract_value(std::move(old_value));
+        new_value = out_msg_queue_->extract_value(std::move(new_value));
+        if (new_value.not_null()) {
+          if (!block::gen::t_EnqueuedMsg.validate_csr(new_value)) {
+            return false;
+          }
+          if (!block::tlb::t_EnqueuedMsg.validate_csr(new_value)) {
+            return false;
+          }
+        }
+        if (old_value.not_null()) {
+          if (!block::gen::t_EnqueuedMsg.validate_csr(old_value)) {
+            return false;
+          }
+          if (!block::tlb::t_EnqueuedMsg.validate_csr(old_value)) {
+            return false;
+          }
+        }
+        return true;
+      },
+      2);
+  if (!res) {
+    return false;
+  }
+  res = old_dispatch_queue_->scan_diff(
+      *dispatch_queue_,
+      [this](td::ConstBitPtr, int, Ref<vm::CellSlice> old_value, Ref<vm::CellSlice> new_value) -> bool {
+        if (old_value.not_null()) {
+          old_value = old_dispatch_queue_->extract_value(std::move(old_value));
+          block::AccountDispatchQueue account_queue;
+          FAIL_UNLESS(account_queue.unpack(old_value));
+          td::BitArray<64> max_lt;
+          FAIL_UNLESS(account_queue.dict.get_minmax_key(max_lt, true).not_null());
+        }
+        if (new_value.not_null()) {
+          new_value = dispatch_queue_->extract_value(std::move(new_value));
+          block::AccountDispatchQueue account_queue;
+          FAIL_UNLESS(account_queue.unpack(new_value));
+          td::BitArray<64> min_lt;
+          FAIL_UNLESS(account_queue.dict.get_minmax_key(min_lt, false).not_null());
+        }
+        return true;
+      },
+      2);
+  for (auto& [addr, account] : accounts) {
+    if (!account->transactions.empty()) {
+      old_dispatch_queue_->lookup(addr);
+    }
+  }
+  return res;
 }
 
 /**
@@ -4924,17 +6463,160 @@ Ref<vm::Cell> Collator::collate_shard_block_descr_set() {
  * @returns True if the collated data was successfully created, false otherwise.
  */
 bool Collator::create_collated_data() {
-  // TODO: store something into collated_roots_
-  // 1. store the set of used shard block descriptions
+  // 1.1 store the set of used shard block descriptions
   if (!used_shard_block_descr_.empty()) {
     auto cell = collate_shard_block_descr_set();
-    if (cell.is_null()) {
-      return true;
-      return fatal_error("cannot collate the collection of used shard block descriptions");
+    if (cell.not_null()) {
+      collated_roots_.push_back(std::move(cell));
     }
+  }
+  // 1.2 store ConsensusExtraData
+  {
+    // consensus_extra_data#638eb292 flags:# gen_utime_ms:uint64 = ConsensusExtraData;
+    auto cell = vm::CellBuilder{}.store_long(0x638eb292, 32).store_long(0, 32).store_long(now_ms_, 64).finalize_novm();
     collated_roots_.push_back(std::move(cell));
   }
-  // 2. ...
+  if (!full_collated_data_) {
+    return true;
+  }
+  // 2. Proofs for hashes of states: previous states + neighbors
+  for (const auto& p : block_state_proofs_) {
+    collated_roots_.push_back(p.second);
+  }
+  bool new_collated_data_format = global_version_ >= 16;
+  std::vector<Ref<vm::Cell>> new_proof_roots;
+  // 3. Previous state proof (only shardchains)
+  std::map<td::Bits256, Ref<vm::Cell>> old_proofs;
+  if (!is_masterchain()) {
+    if (!prepare_proofs()) {
+      return fatal_error("cannot prepare proof for collated data");
+    }
+
+    if (new_collated_data_format) {
+      for (auto prev_state : prev_states) {
+        new_proof_roots.push_back(prev_state->root_cell());
+        Ref<vm::Cell> cell;
+        FAIL_UNLESS(
+            block::gen::t_CollatedDataRootState.cell_pack_collated_data_root_state(cell, prev_state->root_hash()));
+        collated_roots_.push_back(std::move(cell));
+      }
+    } else {
+      state_usage_tree_->set_ignore_loads(true);
+      auto r_state_proof = vm::MerkleProof::generate(
+          prev_state_root_, [&](const Ref<vm::Cell>& c) { return !collated_data_stat.is_loaded(c->get_hash()); });
+      if (r_state_proof.is_error()) {
+        return fatal_error("cannot generate Merkle proof for previous state");
+      }
+      auto state_proof = r_state_proof.move_as_ok();
+      if (after_merge_) {
+        bool special;
+        auto cs = vm::load_cell_slice_special(state_proof, special);
+        FAIL_UNLESS(cs.special_type() == vm::CellTraits::SpecialType::MerkleProof);
+        cs = vm::load_cell_slice(cs.prefetch_ref(0));
+        FAIL_UNLESS(cs.size_refs() == 2);
+        FAIL_UNLESS(cs.size() == 32);
+        FAIL_UNLESS(cs.prefetch_ulong(32) == 0x5f327da5U);
+        old_proofs[cs.prefetch_ref(0)->get_hash(0).bits()] = vm::CellBuilder::create_merkle_proof(cs.prefetch_ref(0));
+        old_proofs[cs.prefetch_ref(1)->get_hash(0).bits()] = vm::CellBuilder::create_merkle_proof(cs.prefetch_ref(1));
+      } else {
+        old_proofs[prev_state_root_->get_hash().bits()] = std::move(state_proof);
+      }
+    }
+  }
+  // 4. Proofs for message queues
+  for (auto& [block_id, mpb] : neighbor_proof_builders_) {
+    if (prev_block_idx(block_id) != -1) {
+      // This was already generated in "3. Previous state proof"
+      continue;
+    }
+    if (new_collated_data_format) {
+      new_proof_roots.push_back(mpb.original_root());
+      Ref<vm::Cell> cell;
+      FAIL_UNLESS(block::gen::t_CollatedDataRootState.cell_pack_collated_data_root_state(
+          cell, mpb.root()->get_hash().as_bits256()));
+      collated_roots_.push_back(std::move(cell));
+    } else {
+      auto r_proof = vm::MerkleProof::generate(
+          mpb.original_root(), [&](const Ref<vm::Cell>& c) { return !collated_data_stat.is_loaded(c->get_hash()); });
+      if (r_proof.is_error()) {
+        return fatal_error("cannot generate Merkle proof for neighbor");
+      }
+      auto proof = r_proof.move_as_ok();
+      auto it = old_proofs.emplace(mpb.root()->get_hash().bits(), proof);
+      if (!it.second) {
+        auto r_combine = vm::MerkleProof::combine(it.first->second, std::move(proof));
+        if (r_combine.is_error()) {
+          return fatal_error("cannot combine merkle proofs");
+        }
+        it.first->second = r_combine.move_as_ok();
+      }
+    }
+  }
+
+  for (auto& p : old_proofs) {
+    collated_roots_.push_back(std::move(p.second));
+  }
+
+  // 5. Proofs for account storage dicts
+  for (auto& [_, dict] : account_storage_dicts_) {
+    if (!dict.add_to_collated_data) {
+      continue;
+    }
+    if (new_collated_data_format) {
+      new_proof_roots.push_back(dict.mpb.original_root());
+      Ref<vm::Cell> cell;
+      FAIL_UNLESS(block::gen::t_CollatedDataRootStorageDict.cell_pack_collated_data_root_storage_dict(
+          cell, new_proof_roots.back()->get_hash().as_bits256()));
+      collated_roots_.push_back(std::move(cell));
+    } else {
+      auto r_proof = vm::MerkleProof::generate(dict.mpb.original_root(), [&](const Ref<vm::Cell>& c) {
+        return !collated_data_stat.is_loaded(c->get_hash());
+      });
+      if (r_proof.is_error()) {
+        return fatal_error("cannot generate Merkle proof for neighbor");
+      }
+      auto proof = r_proof.move_as_ok();
+      // account_storage_dict_proof#37c1e3fc proof:^Cell = AccountStorageDictProof;
+      collated_roots_.push_back(vm::CellBuilder()
+                                    .store_long(block::gen::AccountStorageDictProof::cons_tag[0], 32)
+                                    .store_ref(proof)
+                                    .finalize_novm());
+    }
+  }
+
+  if (new_collated_data_format) {
+    Ref<vm::Cell> separator;
+    FAIL_UNLESS(block::gen::t_CollatedDataSeparator.cell_pack_collated_data_separator(separator));
+    collated_roots_.push_back(std::move(separator));
+    state_usage_tree_->set_ignore_loads(true);
+    td::HashMap<vm::CellHash, Ref<vm::Cell>> cache;
+    std::function<Ref<vm::Cell>(const Ref<vm::Cell>&)> dfs = [&](const Ref<vm::Cell>& cell) -> Ref<vm::Cell> {
+      auto it = cache.find(cell->get_hash());
+      if (it != cache.end()) {
+        return it->second;
+      }
+      if (!collated_data_stat.is_loaded(cell->get_hash())) {
+        return cache[cell->get_hash()] = vm::CellBuilder::create_pruned_branch(cell, vm::Cell::max_level);
+      }
+      vm::CellSlice cs(vm::NoVm(), cell);
+      vm::CellBuilder cb;
+      cb.store_bits(cs.fetch_bits(cs.size()));
+      for (unsigned i = 0; i < cs.size_refs(); i++) {
+        cb.store_ref(dfs(cs.prefetch_ref(i)));
+      }
+      auto hash_hint = [&](unsigned level, const vm::Cell::LevelMask&, vm::CellHash& hash) {
+        if (level <= cell->get_level()) {
+          hash = cell->get_hash(level);
+          return true;
+        }
+        return false;
+      };
+      return cache[cell->get_hash()] = cb.finalize(cs.is_special(), std::move(hash_hint));
+    };
+    for (const auto& root : new_proof_roots) {
+      collated_roots_.push_back(dfs(root));
+    }
+  }
   return true;
 }
 
@@ -4951,6 +6633,7 @@ bool Collator::create_collated_data() {
  * @returns True if the block candidate was created successfully, false otherwise.
  */
 bool Collator::create_block_candidate() {
+  auto consensus_config = config_->get_new_consensus_config(workchain());
   // 1. serialize block
   LOG(INFO) << "serializing new Block";
   vm::BagOfCells boc;
@@ -4976,7 +6659,7 @@ bool Collator::create_block_candidate() {
     if (res.is_error()) {
       return fatal_error(res.move_as_error());
     }
-    auto cdata_res = boc_collated.serialize_to_slice(31);
+    auto cdata_res = boc_collated.serialize_to_slice(2);
     if (cdata_res.is_error()) {
       LOG(ERROR) << "cannot serialize collated data";
       return fatal_error(cdata_res.move_as_error());
@@ -4984,64 +6667,65 @@ bool Collator::create_block_candidate() {
     cdata_slice = cdata_res.move_as_ok();
   }
   LOG(INFO) << "serialized block size " << blk_slice.size() << " bytes (preliminary estimate was "
-            << block_size_estimate_ << "), collated data " << cdata_slice.size() << " bytes";
+            << block_size_estimate_ << ")";
   auto st = block_limit_status_->st_stat.get_total_stat();
   LOG(INFO) << "size regression stats: " << blk_slice.size() << " " << st.cells << " " << st.bits << " "
             << st.internal_refs << " " << st.external_refs << " " << block_limit_status_->accounts << " "
             << block_limit_status_->transactions;
+  LOG(INFO) << "serialized collated data size " << cdata_slice.size() << " bytes (preliminary estimate was "
+            << block_limit_status_->collated_data_size_estimate << ")";
+  auto new_block_id_ext = ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(),
+                                          block::compute_file_hash(blk_slice.as_slice())};
   // 3. create a BlockCandidate
-  block_candidate = std::make_unique<BlockCandidate>(
-      created_by_,
-      ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(),
-                      block::compute_file_hash(blk_slice.as_slice())},
-      block::compute_file_hash(cdata_slice.as_slice()), blk_slice.clone(), cdata_slice.clone());
+  block_candidate = std::make_unique<BlockCandidate>(params_.creator, new_block_id_ext,
+                                                     block::compute_file_hash(cdata_slice.as_slice()),
+                                                     blk_slice.clone(), cdata_slice.clone());
+
   // 3.1 check block and collated data size
-  auto consensus_config = config_->get_consensus_config();
   if (block_candidate->data.size() > consensus_config.max_block_size) {
     return fatal_error(PSTRING() << "block size (" << block_candidate->data.size()
                                  << ") exceeds the limit in consensus config (" << consensus_config.max_block_size
                                  << ")");
   }
-  if (block_candidate->collated_data.size() > consensus_config.max_collated_data_size) {
+  if (block_candidate->collated_data.size() > consensus_config.max_collated_data_size &&
+      !params_.collator_opts->ignore_collated_data_limits) {
     return fatal_error(PSTRING() << "collated data size (" << block_candidate->collated_data.size()
                                  << ") exceeds the limit in consensus config ("
                                  << consensus_config.max_collated_data_size << ")");
   }
-  // 4. save block candidate
-  LOG(INFO) << "saving new BlockCandidate";
-  td::actor::send_closure_later(manager, &ValidatorManager::set_block_candidate, block_candidate->id,
-                                block_candidate->clone(), [self = get_self()](td::Result<td::Unit> saved) -> void {
-                                  LOG(DEBUG) << "got answer to set_block_candidate";
-                                  td::actor::send_closure_later(std::move(self), &Collator::return_block_candidate,
-                                                                std::move(saved));
-                                });
+  // 4. finish collation
+  td::actor::send_closure_later(actor_id(this), &Collator::return_block_candidate);
   // 5. communicate about bad and delayed external messages
-  if (!bad_ext_msgs_.empty() || !delay_ext_msgs_.empty()) {
+  if (!bad_ext_msgs_.empty()) {
     LOG(INFO) << "sending complete_external_messages() to Manager";
-    td::actor::send_closure_later(manager, &ValidatorManager::complete_external_messages, std::move(delay_ext_msgs_),
-                                  std::move(bad_ext_msgs_));
+    td::actor::send_closure_later(manager, &ValidatorManager::complete_external_messages, std::move(bad_ext_msgs_));
+  }
+  if (!storage_stat_cache_update_.empty()) {
+    td::actor::send_closure(manager, &ValidatorManager::update_storage_stat_cache,
+                            std::move(storage_stat_cache_update_));
   }
   return true;
 }
 
 /**
  * Returns a block candidate to the Promise.
- *
- * @param saved The result of saving the block candidate to the disk.
  */
-void Collator::return_block_candidate(td::Result<td::Unit> saved) {
+void Collator::return_block_candidate() {
   // 6. return data to the original "caller"
-  if (saved.is_error()) {
-    auto err = saved.move_as_error();
-    LOG(ERROR) << "cannot save block candidate: " << err.to_string();
-    fatal_error(std::move(err));
-  } else {
-    CHECK(block_candidate);
-    LOG(WARNING) << "sending new BlockCandidate to Promise";
-    main_promise(block_candidate->clone());
-    busy_ = false;
-    stop();
-  }
+  FAIL_UNLESS_VOID(block_candidate);
+  LOG(WARNING) << "sending new BlockCandidate to Promise";
+  LOG(WARNING) << "collation took " << perf_timer_.elapsed() << " s";
+  LOG(WARNING) << perf_log_;
+  finalize_stats();
+  stats_.status = td::Status::OK();
+  td::actor::send_closure(manager, &ValidatorManager::log_collate_query_stats, std::move(stats_));
+  main_promise.set_value(GeneratedCandidate{
+      .candidate = block_candidate->clone(),
+      .collated_at_monotonic = td::Timestamp::now().at(),
+      .processed_external_messages = processed_external_messages_,
+  });
+  busy_ = false;
+  stop();
 }
 
 /*
@@ -5053,47 +6737,39 @@ void Collator::return_block_candidate(td::Result<td::Unit> saved) {
 /**
  * Registers an external message to the list of external messages in the Collator.
  *
- * @param ext_msg The reference to the external message cell.
- * @param ext_hash The hash of the external message.
+ * @param ext_msg External message.
+ * @param priority Priority of the message.
  *
  * @returns Result indicating the success or failure of the registration.
- *          - If the external message is invalid, returns an error.
- *          - If the external message has been previously rejected, returns an error
- *          - If the external message has been previuosly registered and accepted, returns false.
- *          - Otherwise returns true.
+ *          - If the external message is invalid or duplicate, returns an error.
+ *          - Otherwise returns OK.
  */
-td::Result<bool> Collator::register_external_message_cell(Ref<vm::Cell> ext_msg, const ExtMessage::Hash& ext_hash) {
-  if (ext_msg->get_level() != 0) {
+td::Status Collator::register_external_message(Ref<ExtMessage> ext_msg, int priority) {
+  Ref<vm::Cell> ext_msg_cell = ext_msg->root_cell();
+  if (ext_msg_cell.is_null()) {
+    return td::Status::Error("external message cell is null");
+  }
+  if (ext_msg_cell->get_level() != 0) {
     return td::Status::Error("external message must have zero level");
   }
-  vm::CellSlice cs{vm::NoVmOrd{}, ext_msg};
+  vm::CellSlice cs{vm::NoVmOrd{}, ext_msg_cell};
   if (cs.prefetch_ulong(2) != 2) {  // ext_in_msg_info$10
     return td::Status::Error("external message must begin with ext_in_msg_info$10");
   }
-  ton::Bits256 hash{ext_msg->get_hash().bits()};
-  auto it = ext_msg_map.find(hash);
-  if (it != ext_msg_map.end()) {
-    if (it->second > 0) {
-      // message registered before
-      return false;
-    } else {
-      return td::Status::Error("external message has been rejected before");
-    }
-  }
-  if (!block::gen::t_Message_Any.validate_ref(256, ext_msg)) {
+  if (!block::gen::t_Message_Any.validate_ref(256, ext_msg_cell)) {
     return td::Status::Error("external message is not a (Message Any) according to automated checks");
   }
-  if (!block::tlb::t_Message.validate_ref(256, ext_msg)) {
+  if (!block::tlb::t_Message.validate_ref(256, ext_msg_cell)) {
     return td::Status::Error("external message is not a (Message Any) according to hand-written checks");
   }
-  if (!block::tlb::validate_message_libs(ext_msg)) {
+  if (!block::tlb::validate_message_libs(ext_msg_cell)) {
     return td::Status::Error("external message has invalid libs in StateInit");
   }
   block::gen::CommonMsgInfo::Record_ext_in_msg_info info;
-  if (!tlb::unpack_cell_inexact(ext_msg, info)) {
+  if (!tlb::unpack_cell_inexact(ext_msg_cell, info)) {
     return td::Status::Error("cannot unpack external message header");
   }
-  auto dest_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.dest);
+  auto dest_prefix = block::tlb::MsgAddressInt::get_prefix(info.dest);
   if (!dest_prefix.is_valid()) {
     return td::Status::Error("destination of an inbound external message is an invalid blockchain address");
   }
@@ -5102,42 +6778,126 @@ td::Result<bool> Collator::register_external_message_cell(Ref<vm::Cell> ext_msg,
     return td::Status::Error("inbound external message has destination address not in this shard");
   }
   if (verbosity > 2) {
-    std::cerr << "registered external message: ";
-    block::gen::t_Message_Any.print_ref(std::cerr, ext_msg);
+    FLOG(INFO) {
+      sb << "registered external message: ";
+      block::gen::t_Message_Any.print_ref(sb, ext_msg_cell);
+    };
   }
-  ext_msg_map.emplace(hash, 1);
-  ext_msg_list_.emplace_back(std::move(ext_msg), ext_hash);
-  return true;
+  return td::Status::OK();
 }
 
 /**
- * Callback function called after retrieving external messages.
- *
- * @param res The result of the external message retrieval operation.
+ * Wait for an external message from the backpressure queue, or timeout.
  */
-void Collator::after_get_external_messages(td::Result<std::vector<Ref<ExtMessage>>> res) {
-  --pending;
-  if (res.is_error()) {
-    fatal_error(res.move_as_error());
+td::actor::Task<> Collator::wait_for_external_message(td::Timestamp timeout) {
+  auto result = co_await td::actor::await_with_timeout(ext_msg_queue_.pop(), timeout).wrap();
+  if (result.is_error()) {
+    co_return result.move_as_error();
+  }
+  pending_ext_msg_ = result.move_as_ok();
+  co_return {};
+}
+
+/**
+ * Checks if collation was cancelled via cancellation token
+ *
+ * @returns false if the collation was cancelled, true otherwise
+ */
+bool Collator::check_cancelled() {
+  if (cancellation_token_) {
+    return fatal_error(td::Status::Error(ErrorCode::cancelled, "cancelled"));
+  }
+  return true;
+}
+
+td::uint32 Collator::get_skip_externals_queue_size() {
+  return SKIP_EXTERNALS_QUEUE_SIZE;
+}
+
+void Collator::finalize_stats() {
+  auto work_time = stats_.work_time.total;
+  LOG(WARNING) << "Collate query work time = " << work_time.real << "s, cpu time = " << work_time.cpu << "s";
+  if (block_candidate) {
+    stats_.block_id = block_candidate->id;
+    stats_.collated_data_hash = block_candidate->collated_file_hash;
+    stats_.actual_bytes = (td::uint32)block_candidate->data.size();
+    stats_.actual_collated_data_bytes = (td::uint32)block_candidate->collated_data.size();
+  } else {
+    stats_.block_id.id = new_id;
+  }
+  stats_.cc_seqno = params_.validator_set.not_null() ? params_.validator_set->get_catchain_seqno() : 0;
+  stats_.collated_at = td::Clocks::system();
+  stats_.attempt = params_.attempt_idx;
+  stats_.first_in_window = params_.first_in_window;
+  stats_.is_validator = params_.collator_node_id.is_zero();
+  stats_.self = stats_.is_validator ? PublicKey(pubkeys::Ed25519(params_.creator)).compute_short_id()
+                                    : params_.collator_node_id.pubkey_hash();
+  if (block_limit_status_) {
+    stats_.estimated_bytes = (td::uint32)block_limit_status_->estimate_block_size();
+    stats_.gas = (td::uint32)block_limit_status_->gas_used;
+    stats_.lt_delta = (td::uint32)(block_limit_status_->cur_lt - block_limit_status_->limits.start_lt);
+    stats_.estimated_collated_data_bytes = (td::uint32)block_limit_status_->collated_data_size_estimate;
+    stats_.cat_bytes = block_limit_status_->limits.classify_size(stats_.estimated_bytes);
+    stats_.cat_gas = block_limit_status_->limits.classify_gas(stats_.gas);
+    stats_.cat_lt_delta = block_limit_status_->limits.classify_lt(block_limit_status_->cur_lt);
+    stats_.cat_collated_data_bytes =
+        block_limit_status_->limits.classify_collated_data_size(stats_.estimated_collated_data_bytes);
+  }
+  stats_.total_time = perf_timer_.elapsed();
+  stats_.wait_externals_time = wait_externals_total_time_;
+  stats_.time_stats = (PSTRING() << perf_log_);
+  if (is_masterchain() && shard_conf_) {
+    shard_conf_->process_shard_hashes([&](const block::McShardHash& shard) {
+      stats_.shard_configuration.push_back(shard.top_block_id());
+      return 0;
+    });
+  }
+  stats_.new_out_msg_queue_size = out_msg_queue_size_;
+
+  auto neighbors_stats = std::move(stats_.neighbors);
+  stats_.neighbors.clear();
+  for (size_t i = 0; i < neighbors_stats.size(); ++i) {
+    if (!neighbors_.at(i).is_disabled()) {
+      stats_.neighbors.push_back(std::move(neighbors_stats[i]));
+    }
+  }
+  stats_.mc_block_id = mc_block_id_;
+}
+
+/**
+ * This method is called when cell from shard state is loaded.
+ * Only if full_collated_data is set.
+ * When storage stat is calculated, StorageStatCalculationContext::calculating_storage_stat() returns true.
+ * In this case, loaded cell is stored in a separate StorageStat for the storage dict of the account (if it exists).
+ *
+ * @param loaded_cell Loaded cell
+ */
+void Collator::on_cell_loaded(const vm::LoadedCell& loaded_cell) {
+  auto context = block::StorageStatCalculationContext::get();
+  vm::ProofStorageStat* stat = (context && context->calculating_storage_stat() && current_tx_storage_dict_
+                                    ? &current_tx_storage_dict_->proof_stat
+                                    : &collated_data_stat);
+  if (block_limit_status_) {
+    block_limit_status_->collated_data_size_estimate -= stat->estimate_proof_size();
+  }
+  stat->add_loaded_cell(loaded_cell.data_cell, static_cast<td::uint8>(loaded_cell.effective_level));
+  if (block_limit_status_) {
+    block_limit_status_->collated_data_size_estimate += stat->estimate_proof_size();
+  }
+}
+
+/**
+ * Initializes current_tx_storage_dict_ to be used in on_cell_loaded.
+ *
+ * @param account Account of the current transaction
+ */
+void Collator::set_current_tx_storage_dict(const block::Account& account) {
+  if (!account.orig_storage_dict_hash) {
+    current_tx_storage_dict_ = nullptr;
     return;
   }
-  auto vect = res.move_as_ok();
-  for (auto&& ext_msg : vect) {
-    Ref<vm::Cell> ext_msg_cell = ext_msg->root_cell();
-    bool err = ext_msg_cell.is_null();
-    if (!err) {
-      auto reg_res = register_external_message_cell(std::move(ext_msg_cell), ext_msg->hash());
-      if (reg_res.is_error() || !reg_res.move_as_ok()) {
-        err = true;
-      }
-    }
-    if (err) {
-      bad_ext_msgs_.emplace_back(ext_msg->hash());
-    }
-  }
-  LOG(WARNING) << "got " << vect.size() << " external messages from mempool, " << bad_ext_msgs_.size()
-               << " bad messages";
-  check_pending();
+  auto it = account_storage_dicts_.find(account.orig_storage_dict_hash.value());
+  current_tx_storage_dict_ = it == account_storage_dicts_.end() ? nullptr : &it->second;
 }
 
 }  // namespace validator

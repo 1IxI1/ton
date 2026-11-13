@@ -18,14 +18,28 @@
 */
 #pragma once
 
-#include "adnl/adnl.h"
 #include "adnl/adnl-query.h"
+#include "adnl/adnl.h"
 
 namespace ton {
 
 namespace adnl {
 
 namespace adnlmessage {
+
+namespace detail {
+inline td::uint32 bytes_serialized_size(size_t size) {
+  // TlStorerCalcLength::store_string
+  if (size < 254) {
+    size += 1;
+  } else if (size < (1 << 24)) {
+    size += 4;
+  } else {
+    size += 8;
+  }
+  return static_cast<td::uint32>((size + 3) & -4);
+}
+}  // namespace detail
 
 class AdnlMessageCreateChannel {
  public:
@@ -84,7 +98,7 @@ class AdnlMessageCustom {
     return data_.clone();
   }
   td::uint32 size() const {
-    return static_cast<td::uint32>(data_.size()) + 12;
+    return 4 + detail::bytes_serialized_size(data_.size());
   }
   tl_object_ptr<ton_api::adnl_Message> tl() const {
     return create_tl_object<ton_api::adnl_message_custom>(data_.clone());
@@ -137,7 +151,7 @@ class AdnlMessageQuery {
     return data_.clone();
   }
   td::uint32 size() const {
-    return static_cast<td::uint32>(data_.size()) + 44;
+    return 36 + detail::bytes_serialized_size(data_.size());
   }
   tl_object_ptr<ton_api::adnl_Message> tl() const {
     return create_tl_object<ton_api::adnl_message_query>(query_id_, data_.clone());
@@ -159,7 +173,7 @@ class AdnlMessageAnswer {
     return data_.clone();
   }
   td::uint32 size() const {
-    return static_cast<td::uint32>(data_.size()) + 44;
+    return 36 + detail::bytes_serialized_size(data_.size());
   }
   tl_object_ptr<ton_api::adnl_Message> tl() const {
     return create_tl_object<ton_api::adnl_message_answer>(query_id_, data_.clone());
@@ -188,7 +202,7 @@ class AdnlMessagePart {
     return data_.clone();
   }
   td::uint32 size() const {
-    return static_cast<td::uint32>(data_.size()) + 48;
+    return 44 + detail::bytes_serialized_size(data_.size());
   }
   tl_object_ptr<ton_api::adnl_Message> tl() const {
     return create_tl_object<ton_api::adnl_message_part>(hash_, total_size_, offset_, data_.clone());
@@ -323,48 +337,6 @@ class AdnlMessageList {
 
  private:
   std::vector<AdnlMessage> messages_;
-};
-
-class OutboundAdnlMessageList {
- public:
-  OutboundAdnlMessageList() {
-  }
-  OutboundAdnlMessageList(tl_object_ptr<ton_api::adnl_Message> message, td::uint32 flags) {
-    auto msg = OutboundAdnlMessage{std::move(message), flags};
-    messages_.emplace_back(std::move(msg));
-  }
-  OutboundAdnlMessageList(std::vector<tl_object_ptr<ton_api::adnl_Message>> messages, td::uint32 flags) {
-    for (auto &message : messages) {
-      messages_.push_back(OutboundAdnlMessage{std::move(message), flags});
-    }
-  }
-  void push_back(OutboundAdnlMessage message) {
-    messages_.push_back(std::move(message));
-  }
-
-  td::uint32 size() const {
-    return static_cast<td::uint32>(messages_.size());
-  }
-  tl_object_ptr<ton_api::adnl_Message> one_message() const {
-    CHECK(size() == 1);
-    return messages_[0].tl();
-  }
-  std::vector<tl_object_ptr<ton_api::adnl_Message>> mult_messages() const {
-    std::vector<tl_object_ptr<ton_api::adnl_Message>> vec;
-    for (auto &m : messages_) {
-      vec.emplace_back(m.tl());
-    }
-    return vec;
-  }
-  static std::vector<tl_object_ptr<ton_api::adnl_Message>> empty_vector() {
-    return std::vector<tl_object_ptr<ton_api::adnl_Message>>{};
-  }
-  auto &vector() {
-    return messages_;
-  }
-
- private:
-  std::vector<OutboundAdnlMessage> messages_;
 };
 
 }  // namespace adnl

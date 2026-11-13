@@ -18,8 +18,9 @@
 */
 #pragma once
 
-#include "interfaces/validator-manager.h"
 #include "interfaces/db.h"
+#include "interfaces/validator-manager.h"
+
 #include "shard-client.hpp"
 
 namespace ton {
@@ -35,6 +36,9 @@ struct ValidatorManagerInitResult {
   td::Ref<MasterchainState> gc_state;
 
   BlockHandle last_key_block_handle_;
+
+  BlockSeqno start_groups_from_seqno;
+  td::Ref<MasterchainState> previous_rotation;
 };
 
 void validator_manager_init(td::Ref<ValidatorManagerOptions> opts, td::actor::ActorId<ValidatorManager> manager,

@@ -17,17 +17,17 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include "td/utils/buffer.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Span.h"
 #include "td/utils/Status.h"
+#include "td/utils/buffer.h"
 #include "td/utils/port/IoSlice.h"
 
 namespace td {
 // Generic stream interface
 // Will to hide implementations details.
 // CyclicBuffer, ChainBuffer, Bounded ChainBuffer, some clever writers. They all should be interchangable
-// Most implementaions will assume that reading and writing may happen concurrently
+// Most implementations will assume that reading and writing may happen concurrently
 
 class StreamReaderInterface {
  public:

@@ -17,18 +17,22 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <ostream>
+
 #include "common/refcnt.hpp"
+#include "td/utils/CancellationToken.h"
+#include "td/utils/StringBuilder.h"
+#include "td/utils/bits.h"
+#include "tl/tlblib.hpp"
+#include "ton/ton-types.h"
+#include "vm/boc.h"
 #include "vm/cells.h"
 #include "vm/cellslice.h"
 #include "vm/dict.h"
-#include "vm/boc.h"
 #include "vm/stack.hpp"
-#include <ostream>
-#include "tl/tlblib.hpp"
-#include "td/utils/bits.h"
-#include "td/utils/CancellationToken.h"
-#include "td/utils/StringBuilder.h"
-#include "ton/ton-types.h"
+
+#include "block-auto.h"
+#include "signature-set.h"
 
 namespace block {
 
@@ -132,6 +136,7 @@ struct EnqueuedMsgDescr {
   ton::Bits256 hash_;
   Ref<vm::Cell> msg_;
   Ref<vm::Cell> msg_env_;
+  td::RefInt256 fwd_fee_remaining_;
   EnqueuedMsgDescr() = default;
   EnqueuedMsgDescr(ton::AccountIdPrefixFull cur_pfx, ton::AccountIdPrefixFull next_pfx, ton::LogicalTime lt,
                    ton::LogicalTime enqueued_lt, td::ConstBitPtr hash)
@@ -216,6 +221,16 @@ static inline std::ostream& operator<<(std::ostream& os, const MsgProcessedUptoC
   return proc_coll.print(os);
 }
 
+struct ImportedMsgQueueLimits {
+  // Default values
+  td::uint32 max_bytes = 1 << 16;
+  td::uint32 max_msgs = 100;
+  bool deserialize(vm::CellSlice& cs);
+  ImportedMsgQueueLimits operator*(td::uint32 x) const {
+    return {max_bytes * x, max_msgs * x};
+  }
+};
+
 struct ParamLimits {
   enum { limits_cnt = 4 };
   enum { cl_underload = 0, cl_normal = 1, cl_soft = 2, cl_medium = 3, cl_hard = 4 };
@@ -232,6 +247,9 @@ struct ParamLimits {
   td::uint32 hard() const {
     return limits_[3];
   }
+  td::uint32 limit(unsigned cls) const {
+    return limits_[cls];
+  }
   bool compute_medium_limit() {
     limits_[2] = soft() + ((hard() - soft()) >> 1);
     return true;
@@ -239,21 +257,29 @@ struct ParamLimits {
   bool deserialize(vm::CellSlice& cs);
   int classify(td::uint64 value) const;
   bool fits(unsigned cls, td::uint64 value) const;
+  void multiply_by(double x) {
+    CHECK(x > 0.0);
+    for (td::uint32& y : limits_) {
+      y = (td::uint32)std::min<double>(y * x, 1e9);
+    }
+  }
 
  private:
   std::array<td::uint32, limits_cnt> limits_;
 };
 
 struct BlockLimits {
-  ParamLimits bytes, gas, lt_delta;
+  ParamLimits bytes, gas, lt_delta, collated_data;
   ton::LogicalTime start_lt{0};
-  const vm::CellUsageTree* usage_tree{nullptr};
+  ImportedMsgQueueLimits imported_msg_queue;
+  vm::CellUsageTree* usage_tree{nullptr};
   bool deserialize(vm::CellSlice& cs);
   int classify_size(td::uint64 size) const;
   int classify_gas(td::uint64 gas) const;
   int classify_lt(ton::LogicalTime lt) const;
-  int classify(td::uint64 size, td::uint64 gas, ton::LogicalTime lt) const;
-  bool fits(unsigned cls, td::uint64 size, td::uint64 gas, ton::LogicalTime lt) const;
+  int classify_collated_data_size(td::uint64 size) const;
+  int classify(td::uint64 size, td::uint64 gas, ton::LogicalTime lt, td::uint64 collated_size) const;
+  bool fits(unsigned cls, td::uint64 size, td::uint64 gas, ton::LogicalTime lt, td::uint64 collated_size) const;
 };
 
 struct BlockLimitStatus {
@@ -261,7 +287,9 @@ struct BlockLimitStatus {
   ton::LogicalTime cur_lt;
   td::uint64 gas_used{};
   vm::NewCellStorageStat st_stat;
+  vm::MerkleUpdateLeftStat merkle_update_left_stat;
   unsigned accounts{}, transactions{}, extra_out_msgs{};
+  td::uint64 collated_data_size_estimate = 0;
   unsigned public_library_diff{};
   BlockLimitStatus(const BlockLimits& limits_, ton::LogicalTime lt = 0)
       : limits(limits_), cur_lt(std::max(limits_.start_lt, lt)) {
@@ -273,18 +301,20 @@ struct BlockLimitStatus {
     gas_used = 0;
     extra_out_msgs = 0;
     public_library_diff = 0;
+    collated_data_size_estimate = 0;
   }
   td::uint64 estimate_block_size(const vm::NewCellStorageStat::Stat* extra = nullptr) const;
   int classify() const;
   bool fits(unsigned cls) const;
   bool would_fit(unsigned cls, ton::LogicalTime end_lt, td::uint64 more_gas,
                  const vm::NewCellStorageStat::Stat* extra = nullptr) const;
+  double load_fraction(unsigned cls) const;
   bool add_cell(Ref<vm::Cell> cell) {
     st_stat.add_cell(std::move(cell));
     return true;
   }
   bool add_proof(Ref<vm::Cell> cell) {
-    st_stat.add_proof(std::move(cell), limits.usage_tree);
+    st_stat.add_proof(std::move(cell), limits.usage_tree, &merkle_update_left_stat);
     return true;
   }
   bool update_lt(ton::LogicalTime lt) {
@@ -374,6 +404,9 @@ struct CurrencyCollection {
   CurrencyCollection operator-(const CurrencyCollection& other) const;
   CurrencyCollection operator-(CurrencyCollection&& other) const;
   CurrencyCollection operator-(td::RefInt256 other_grams) const;
+  bool clamp(const CurrencyCollection& other);
+  bool check_extra_currency_limit(td::uint32 max_currencies) const;
+  static bool remove_zero_extra_currencies(Ref<vm::Cell>& root, td::uint32 max_currencies);
   bool store(vm::CellBuilder& cb) const;
   bool store_or_zero(vm::CellBuilder& cb) const;
   bool fetch(vm::CellSlice& cs);
@@ -417,6 +450,8 @@ struct ShardState {
   std::unique_ptr<vm::Dictionary> ihr_pending_;
   std::unique_ptr<vm::Dictionary> block_create_stats_;
   std::shared_ptr<block::MsgProcessedUptoCollection> processed_upto_;
+  std::unique_ptr<vm::AugmentedDictionary> dispatch_queue_;
+  td::optional<td::uint64> out_msg_queue_size_;
 
   bool is_valid() const {
     return id_.is_valid();
@@ -433,11 +468,10 @@ struct ShardState {
                               ton::BlockSeqno prev_mc_block_seqno, bool after_split, bool clear_history,
                               std::function<bool(ton::BlockSeqno)> for_each_mcseqno);
   td::Status merge_with(ShardState& sib);
-  td::Result<std::unique_ptr<vm::AugmentedDictionary>> compute_split_out_msg_queue(ton::ShardIdFull subshard,
-                                                                                   td::uint32* queue_size = nullptr);
+  td::Result<std::unique_ptr<vm::AugmentedDictionary>> compute_split_out_msg_queue(ton::ShardIdFull subshard);
   td::Result<std::shared_ptr<block::MsgProcessedUptoCollection>> compute_split_processed_upto(
       ton::ShardIdFull subshard);
-  td::Status split(ton::ShardIdFull subshard, td::uint32* queue_size = nullptr);
+  td::Status split(ton::ShardIdFull subshard);
   td::Status unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_info);
   bool clear_load_history() {
     overload_history_ = underload_history_ = 0;
@@ -561,9 +595,7 @@ struct BlockProofLink {
   ton::BlockIdExt from, to;
   bool is_key{false}, is_fwd{false};
   Ref<vm::Cell> dest_proof, state_proof, proof;
-  ton::CatchainSeqno cc_seqno{0};
-  td::uint32 validator_set_hash{0};
-  std::vector<ton::BlockSignature> signatures;
+  Ref<BlockSignatureSet> sig_set;
   BlockProofLink(ton::BlockIdExt _from, ton::BlockIdExt _to, bool _iskey = false)
       : from(_from), to(_to), is_key(_iskey), is_fwd(to.seqno() > from.seqno()) {
   }
@@ -658,7 +690,7 @@ class MtCarloComputeShare {
 };
 
 int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull old_shard, ton::ShardIdFull subshard,
-                         td::uint32* queue_size = nullptr);
+                         td::uint64* queue_size = nullptr);
 
 std::ostream& operator<<(std::ostream& os, const ShardId& shard_id);
 
@@ -708,6 +740,13 @@ td::Status unpack_block_prev_blk_ext(Ref<vm::Cell> block_root, const ton::BlockI
 td::Status unpack_block_prev_blk_try(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
                                      std::vector<ton::BlockIdExt>& prev, ton::BlockIdExt& mc_blkid, bool& after_split,
                                      ton::BlockIdExt* fetch_blkid = nullptr);
+struct BlockHeaderInfo {
+  std::vector<ton::BlockIdExt> prev;
+  ton::BlockIdExt mc_blkid;
+  bool after_split;
+};
+td::Result<BlockHeaderInfo> get_block_header_info(Ref<vm::Cell> block_root, const ton::BlockIdExt& id);
+
 td::Status check_block_header(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
                               ton::Bits256* store_shard_hash_to = nullptr);
 
@@ -723,9 +762,9 @@ bool unpack_old_mc_block_id(Ref<vm::CellSlice> old_blk_info, ton::BlockSeqno seq
 bool check_old_mc_block_id(vm::AugmentedDictionary* prev_blocks_dict, const ton::BlockIdExt& blkid);
 bool check_old_mc_block_id(vm::AugmentedDictionary& prev_blocks_dict, const ton::BlockIdExt& blkid);
 
-td::Result<Ref<vm::Cell>> get_block_transaction(Ref<vm::Cell> block_root, ton::WorkchainId workchain,
+td::Result<Ref<vm::Cell>> get_block_transaction(Ref<vm::Cell> block_root, ton::BlockIdExt block_id,
                                                 const ton::StdSmcAddress& addr, ton::LogicalTime lt);
-td::Result<Ref<vm::Cell>> get_block_transaction_try(Ref<vm::Cell> block_root, ton::WorkchainId workchain,
+td::Result<Ref<vm::Cell>> get_block_transaction_try(Ref<vm::Cell> block_root, ton::BlockIdExt block_id,
                                                     const ton::StdSmcAddress& addr, ton::LogicalTime lt);
 
 bool get_transaction_in_msg(Ref<vm::Cell> trans_ref, Ref<vm::Cell>& in_msg);
@@ -748,5 +787,37 @@ bool parse_hex_hash(td::Slice str, td::Bits256& hash);
 
 bool parse_block_id_ext(const char* str, const char* end, ton::BlockIdExt& blkid);
 bool parse_block_id_ext(td::Slice str, ton::BlockIdExt& blkid);
+
+struct AccountDispatchQueue {
+  vm::Dictionary dict{64};
+  td::uint64 dict_size = 0;
+  CurrencyCollection total_balance = {};  // !is_valid() if not known
+
+  bool unpack(Ref<vm::CellSlice> csr);
+  bool pack(Ref<vm::CellSlice>& csr) const;
+};
+
+CurrencyCollection get_message_balance_for_dispatch_queue(const gen::CommonMsgInfo::Record_int_msg_info& info,
+                                                          int global_version);
+CurrencyCollection get_message_balance_for_dispatch_queue(Ref<vm::Cell> msg, int global_version);
+CurrencyCollection get_message_balance_for_dispatch_queue(Ref<vm::CellSlice> enqueued_msg, int global_version);
+Ref<vm::CellSlice> get_dispatch_queue_min_lt_account(const vm::AugmentedDictionary& dispatch_queue,
+                                                     ton::StdSmcAddress& addr);
+bool remove_dispatch_queue_entry(vm::AugmentedDictionary& dispatch_queue, const ton::StdSmcAddress& addr,
+                                 ton::LogicalTime lt, bool store_total_balance, int global_version);
+
+struct MsgMetadata {
+  td::uint32 depth;
+  ton::WorkchainId initiator_wc;
+  ton::StdSmcAddress initiator_addr;
+  ton::LogicalTime initiator_lt;
+
+  bool unpack(vm::CellSlice& cs);
+  bool pack(vm::CellBuilder& cb) const;
+  std::string to_str() const;
+
+  bool operator==(const MsgMetadata& other) const;
+  bool operator!=(const MsgMetadata& other) const;
+};
 
 }  // namespace block

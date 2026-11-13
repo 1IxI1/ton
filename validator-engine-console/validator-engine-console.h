@@ -1,4 +1,4 @@
-/* 
+/*
     This file is part of TON Blockchain source code.
 
     TON Blockchain is free software; you can redistribute it and/or
@@ -14,26 +14,27 @@
     You should have received a copy of the GNU General Public License
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
-    In addition, as a special exception, the copyright holders give permission 
-    to link the code of portions of this program with the OpenSSL library. 
-    You must obey the GNU General Public License in all respects for all 
-    of the code used other than OpenSSL. If you modify file(s) with this 
-    exception, you may extend this exception to your version of the file(s), 
-    but you are not obligated to do so. If you do not wish to do so, delete this 
-    exception statement from your version. If you delete this exception statement 
+    In addition, as a special exception, the copyright holders give permission
+    to link the code of portions of this program with the OpenSSL library.
+    You must obey the GNU General Public License in all respects for all
+    of the code used other than OpenSSL. If you modify file(s) with this
+    exception, you may extend this exception to your version of the file(s),
+    but you are not obligated to do so. If you do not wish to do so, delete this
+    exception statement from your version. If you delete this exception statement
     from all source files in the program, then also delete it here.
 
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <map>
+
 #include "adnl/adnl-ext-client.h"
+#include "terminal/terminal.h"
 #include "tl-utils/tl-utils.hpp"
 #include "ton/ton-types.h"
-#include "terminal/terminal.h"
 #include "vm/cells.h"
-#include "validator-engine-console-query.h"
 
-#include <map>
+#include "validator-engine-console-query.h"
 
 class ValidatorEngineConsole : public td::actor::Actor {
  private:
@@ -57,9 +58,23 @@ class ValidatorEngineConsole : public td::actor::Actor {
   std::unique_ptr<ton::adnl::AdnlExtClient::Callback> make_callback();
 
   std::map<std::string, std::unique_ptr<QueryRunner>> query_runners_;
+  std::map<std::string, std::string> alternate_names_;
+  static std::string simplify_name(std::string name) {
+    std::erase_if(name, [](char c) { return c == '-'; });
+    return name;
+  }
   void add_query_runner(std::unique_ptr<QueryRunner> runner) {
     auto name = runner->name();
     query_runners_[name] = std::move(runner);
+    alternate_names_[simplify_name(name)] = name;
+  }
+  QueryRunner* get_query(std::string name) {
+    auto it = alternate_names_.find(name);
+    if (it != alternate_names_.end()) {
+      name = it->second;
+    }
+    auto it2 = query_runners_.find(name);
+    return it2 == query_runners_.end() ? nullptr : it2->second.get();
   }
 
  public:
@@ -106,7 +121,7 @@ class ValidatorEngineConsole : public td::actor::Actor {
   }
   void tear_down() override {
     // FIXME: do not work in windows
-    //td::actor::SchedulerContext::get()->stop();
+    //td::actor::SchedulerContext::get().stop();
     io_.reset();
     std::_Exit(0);
   }

@@ -18,9 +18,10 @@
 */
 #pragma once
 
-#include "td/utils/Slice.h"
-
 #include <set>
+
+#include "td/utils/HashSet.h"
+#include "td/utils/Slice.h"
 
 namespace vm {
 template <class InfoT>
@@ -40,10 +41,21 @@ class CellHashTable {
     return res;
   }
 
+  template <class... ArgsT>
+  std::pair<InfoT &, bool> emplace(td::Slice hash, ArgsT &&...args) {
+    auto it = set_.find(hash);
+    if (it != set_.end()) {
+      return std::pair<InfoT &, bool>(const_cast<InfoT &>(*it), false);
+    }
+    auto res = set_.emplace(std::forward<ArgsT>(args)...);
+    CHECK(res.second);
+    return std::pair<InfoT &, bool>(const_cast<InfoT &>(*res.first), res.second);
+  }
+
   template <class F>
   void for_each(F &&f) {
     for (auto &info : set_) {
-      f(info);
+      f(const_cast<InfoT &>(info));
     }
   }
   template <class F>
@@ -64,7 +76,7 @@ class CellHashTable {
   size_t size() const {
     return set_.size();
   }
-  InfoT* get_if_exists(td::Slice hash) {
+  InfoT *get_if_exists(td::Slice hash) {
     auto it = set_.find(hash);
     if (it != set_.end()) {
       return &const_cast<InfoT &>(*it);
@@ -73,6 +85,6 @@ class CellHashTable {
   }
 
  private:
-  std::set<InfoT, std::less<>> set_;
+  td::NodeHashSet<InfoT, typename InfoT::Hash, typename InfoT::Eq> set_;
 };
 }  // namespace vm

@@ -16,13 +16,12 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "td/net/UdpServer.h"
+#include <map>
+
 #include "td/net/FdListener.h"
 #include "td/net/TcpListener.h"
-
+#include "td/net/UdpServer.h"
 #include "td/utils/BufferedFd.h"
-
-#include <map>
 
 namespace td {
 namespace {
@@ -32,6 +31,7 @@ namespace detail {
 class UdpServerImpl : public UdpServer {
  public:
   void send(td::UdpMessage &&message) override;
+  td::actor::Task<UdpServerStats> collect() override;
   static td::actor::ActorOwn<UdpServerImpl> create(td::Slice name, td::UdpSocketFd fd,
                                                    std::unique_ptr<Callback> callback);
 
@@ -58,6 +58,20 @@ void UdpServerImpl::send(td::UdpMessage &&message) {
   loop();  // TODO: some yield logic
 }
 
+td::actor::Task<UdpServerStats> UdpServerImpl::collect() {
+  UdpServerStats stats;
+#if TD_PORT_POSIX
+  stats.in = fd_.in_counters();
+  stats.in.dropped = fd_.get_rx_queue_drops();  // kernel-side, so the socket is the only source
+  stats.out = fd_.out_counters();
+#endif
+  auto syscall_stats = fd_.get_syscall_stats();
+  stats.in.syscalls = syscall_stats.receive;
+  stats.out.syscalls = syscall_stats.send;
+  stats.listening_sockets = is_closing_ ? 0 : 1;
+  co_return stats;
+}
+
 td::actor::ActorOwn<UdpServerImpl> UdpServerImpl::create(td::Slice name, td::UdpSocketFd fd,
                                                          std::unique_ptr<Callback> callback) {
   return td::actor::create_actor<UdpServerImpl>(
@@ -70,7 +84,7 @@ UdpServerImpl::UdpServerImpl(td::UdpSocketFd fd, std::unique_ptr<Callback> callb
 }
 
 void UdpServerImpl::start_up() {
-  //CHECK(td::actor::SchedulerContext::get()->has_poll() == false);
+  //CHECK(td::actor::SchedulerContext::get().has_poll() == false);
   class Observer : public td::ObserverBase, public Destructor {
    public:
     Observer(td::actor::ActorShared<UdpServerImpl> udp_server) : udp_server_(std::move(udp_server)) {
@@ -98,8 +112,8 @@ void UdpServerImpl::loop() {
   if (is_closing_) {
     return;
   }
-  //CHECK(td::actor::SchedulerContext::get()->has_poll() == false);
-  fd_.get_poll_info().get_flags();
+  //CHECK(td::actor::SchedulerContext::get().has_poll() == false);
+  sync_with_poll(fd_);
   VLOG(udp_server) << "loop " << td::tag("can read", can_read(fd_)) << " " << td::tag("can write", can_write(fd_));
   Status status;
   status = [&] {
@@ -170,8 +184,8 @@ class TcpClient : public td::actor::Actor, td::ObserverBase {
     LOG(INFO) << "Start";
     // Subscribe for socket updates
     // NB: Interface will be changed
-    td::actor::SchedulerContext::get()->get_poll().subscribe(buffered_fd_.get_poll_info().extract_pollable_fd(this),
-                                                             PollFlags::ReadWrite());
+    td::actor::SchedulerContext::get().get_poll().subscribe(buffered_fd_.get_poll_info().extract_pollable_fd(this),
+                                                            PollFlags::ReadWrite());
     alarm_timestamp() = Timestamp::in(10);
     notify();
   }
@@ -180,7 +194,7 @@ class TcpClient : public td::actor::Actor, td::ObserverBase {
     LOG(INFO) << "Close";
     // unsubscribe from socket updates
     // nb: interface will be changed
-    td::actor::SchedulerContext::get()->get_poll().unsubscribe(buffered_fd_.get_poll_info().get_pollable_fd_ref());
+    td::actor::SchedulerContext::get().get_poll().unsubscribe(buffered_fd_.get_poll_info().get_pollable_fd_ref());
     callback_->on_closed(actor_id(this));
   }
 
@@ -281,6 +295,10 @@ class UdpServerViaTcp : public UdpServer {
     refcnt_++;
     tcp_listener_ = actor::create_actor<TcpInfiniteListener>(PSLICE() << "TcpInfiniteListener" << port_, port_,
                                                              std::make_unique<TcpListenerCallback>(actor_shared(this)));
+  }
+
+  td::actor::Task<UdpServerStats> collect() override {
+    co_return UdpServerStats{};
   }
 
   void send(UdpMessage &&message) override {
@@ -390,6 +408,7 @@ class UdpServerViaTcp : public UdpServer {
 }  // namespace detail
 
 Result<actor::ActorOwn<UdpServer>> UdpServer::create(td::Slice name, int32 port, std::unique_ptr<Callback> callback) {
+  LOG(INFO) << "Start udp server on 0.0.0.0:" << port;
   td::IPAddress from_ip;
   TRY_STATUS(from_ip.init_ipv4_port("0.0.0.0", port));
   TRY_RESULT(fd, UdpSocketFd::open(from_ip));

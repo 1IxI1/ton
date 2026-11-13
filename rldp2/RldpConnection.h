@@ -19,6 +19,14 @@
 
 #pragma once
 
+#include <set>
+
+#include "common/bitstring.h"
+#include "metrics/well-known.h"
+#include "td/utils/Heap.h"
+#include "td/utils/VectorQueue.h"
+#include "td/utils/buffer.h"
+
 #include "Bbr.h"
 #include "InboundTransfer.h"
 #include "LossStats.h"
@@ -26,17 +34,49 @@
 #include "Pacer.h"
 #include "RttStats.h"
 
-#include "common/bitstring.h"
-
-#include "td/utils/buffer.h"
-#include "td/utils/Heap.h"
-#include "td/utils/VectorQueue.h"
-
-#include <set>
-
 namespace ton {
 namespace rldp2 {
 using TransferId = td::Bits256;
+
+// Per-connection metrics scraped by RldpIn (and accumulated into its historical aggregate when the
+// connection actor dies). Holds only what a connection itself produces — wire bytes/packets and the
+// inner protocol drops; transfers/app/gauges stay on RldpIn. Built from real metric nodes and merged
+// via operator+=, so RldpIn just sums (historical + active) and collects.
+struct RldpConnMetrics {
+  struct Wire {
+    metrics::Labeled<metrics::Counter, metrics::Direction> bytes;
+    metrics::Labeled<metrics::Counter, metrics::Direction> packets;
+
+    Wire &operator+=(const Wire &o) {
+      bytes += o.bytes;
+      packets += o.packets;
+      return *this;
+    }
+
+    void collect(metrics::Context ctx) const {
+      ctx.collect(bytes, "bytes");
+      ctx.collect(packets, "packets");
+    }
+  };
+
+  Wire wire;
+  metrics::Labeled<metrics::Counter, metrics::Direction, metrics::Reason> transport_dropped;
+
+  RldpConnMetrics &operator+=(const RldpConnMetrics &o) {
+    wire += o.wire;
+    transport_dropped += o.transport_dropped;
+    return *this;
+  }
+
+  void record_wire(metrics::Direction dir, td::uint64 bytes) {
+    wire.bytes.at(dir).inc(bytes);
+    wire.packets.at(dir).inc();
+  }
+  void record_dropped(metrics::Direction dir, metrics::Reason reason) {
+    transport_dropped.at(dir, reason).inc();
+  }
+};
+
 class ConnectionCallback {
  public:
   virtual ~ConnectionCallback() {
@@ -58,6 +98,15 @@ class RldpConnection {
 
   td::Timestamp run(ConnectionCallback &callback);
 
+  const RldpConnMetrics &stats() const {
+    return stats_;
+  }
+  // Hand off accumulated metrics: returns the delta since the last drain and resets the local
+  // counters to empty, so each increment is absorbed by RldpIn exactly once.
+  RldpConnMetrics drain() {
+    return std::exchange(stats_, RldpConnMetrics{});
+  }
+
   void set_default_mtu(td::uint64 mtu) {
     default_mtu_ = mtu;
   }
@@ -65,8 +114,10 @@ class RldpConnection {
     return default_mtu_;
   }
 
+  static constexpr td::uint64 DEFAULT_MTU = 7680;
+
  private:
-  td::uint64 default_mtu_ = 7680;
+  td::uint64 default_mtu_ = DEFAULT_MTU;
 
   std::map<TransferId, OutboundTransfer> outbound_transfers_;
   td::uint32 in_flight_count_{0};
@@ -77,7 +128,7 @@ class RldpConnection {
     td::uint64 max_size;
     bool is_inbound;
     bool operator<(const Limit &other) const {
-      return transfer_id < other.transfer_id;
+      return transfer_id == other.transfer_id ? is_inbound < other.is_inbound : transfer_id < other.transfer_id;
     }
   };
   td::KHeap<double> limits_heap_;
@@ -92,7 +143,7 @@ class RldpConnection {
 
   void add_limit(td::Timestamp timeout, Limit limit);
   td::Timestamp next_limit_expires_at();
-  void drop_limits(TransferId id);
+  void drop_limits(TransferId id, bool is_inbound);
   void on_inbound_completed(TransferId transfer_id, td::Timestamp now);
   td::Timestamp loop_limits(td::Timestamp now);
 
@@ -110,8 +161,11 @@ class RldpConnection {
   std::vector<std::pair<TransferId, td::Result<td::Unit>>> to_on_sent_;
 
   void send_packet(td::BufferSlice packet) {
+    stats_.record_wire(metrics::Direction::out, packet.size());
     to_send_raw_.push_back(std::move(packet));
   };
+
+  RldpConnMetrics stats_;
 
   td::Timestamp run(const TransferId &transfer_id, InboundTransfer &inbound);
   struct Guard {
@@ -119,7 +173,7 @@ class RldpConnection {
     const RldpSender &sender;
     td::uint32 before_in_flight{sender.get_inflight_symbols_count()};
 
-    Guard(td::uint32 &in_flight_count, const RldpSender &sender) : in_flight_count(in_flight_count), sender(sender){};
+    Guard(td::uint32 &in_flight_count, const RldpSender &sender) : in_flight_count(in_flight_count), sender(sender) {};
     ~Guard() {
       in_flight_count -= before_in_flight;
       in_flight_count += sender.get_inflight_symbols_count();

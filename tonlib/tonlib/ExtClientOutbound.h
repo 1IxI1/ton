@@ -17,12 +17,11 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include "lite-client/ext-client.h"
 #include "td/actor/actor.h"
 
-#include "ExtClientLazy.h"
-
 namespace tonlib {
-class ExtClientOutbound : public ExtClientLazy {
+class ExtClientOutbound : public liteclient::ExtClient {
  public:
   class Callback {
    public:

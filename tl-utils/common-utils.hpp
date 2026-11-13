@@ -17,10 +17,9 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include "tl/tl_object_parse.h"
-#include "td/utils/tl_parsers.h"
-
 #include "crypto/common/bitstring.h"
+#include "td/utils/tl_parsers.h"
+#include "tl/tl_object_parse.h"
 
 namespace ton {
 
@@ -148,6 +147,39 @@ td::Result<tl_object_ptr<std::enable_if_t<!std::is_constructible<T>::value, T>>>
   }
 }
 
+template <typename T>
+td::Result<tl_object_ptr<std::enable_if_t<std::is_constructible<T>::value, T>>> fetch_tl_prefix(td::Slice &data,
+                                                                                                bool boxed) {
+  td::TlParser p(data);
+  tl_object_ptr<T> R;
+  if (boxed) {
+    R = TlFetchBoxed<TlFetchObject<T>, T::ID>::parse(p);
+  } else {
+    R = move_tl_object_as<T>(T::fetch(p));
+  }
+  if (p.get_status().is_ok()) {
+    data.remove_prefix(data.size() - p.get_left_len());
+    return std::move(R);
+  } else {
+    return p.get_status();
+  }
+}
+
+template <typename T>
+td::Result<tl_object_ptr<std::enable_if_t<!std::is_constructible<T>::value, T>>> fetch_tl_prefix(td::Slice &data,
+                                                                                                 bool boxed) {
+  CHECK(boxed);
+  td::TlParser p(data);
+  tl_object_ptr<T> R;
+  R = move_tl_object_as<T>(T::fetch(p));
+  if (p.get_status().is_ok()) {
+    data.remove_prefix(data.size() - p.get_left_len());
+    return std::move(R);
+  } else {
+    return p.get_status();
+  }
+}
+
 template <class T>
 [[deprecated]] tl_object_ptr<T> clone_tl_object(const tl_object_ptr<T> &obj) {
   auto B = serialize_tl_object(obj, true);
@@ -191,19 +223,19 @@ td::Result<typename T::ReturnType> fetch_result(const td::BufferSlice &message, 
 }
 
 template <class Type, class... Args>
-td::BufferSlice create_serialize_tl_object(Args &&... args) {
+td::BufferSlice create_serialize_tl_object(Args &&...args) {
   Type object(std::forward<Args>(args)...);
   return serialize_tl_object(&object, true);
 }
 
 template <class Type, class... Args>
-td::BufferSlice create_serialize_tl_object_suffix(td::Slice suffix, Args &&... args) {
+td::BufferSlice create_serialize_tl_object_suffix(td::Slice suffix, Args &&...args) {
   Type object(std::forward<Args>(args)...);
   return serialize_tl_object(&object, true, suffix);
 }
 
 template <class Type, class... Args>
-auto create_hash_tl_object(Args &&... args) {
+auto create_hash_tl_object(Args &&...args) {
   Type object(std::forward<Args>(args)...);
   return get_tl_object_sha_bits256(&object);
 }

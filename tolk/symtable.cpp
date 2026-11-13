@@ -1,0 +1,341 @@
+/*
+    This file is part of TON Blockchain Library.
+
+    TON Blockchain Library is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 2 of the License, or
+    (at your option) any later version.
+
+    TON Blockchain Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#include "symtable.h"
+#include "ast.h"
+#include "compilation-errors.h"
+#include "compiler-state.h"
+#include "generics-helpers.h"
+
+namespace tolk {
+
+void Symbol::check_import_exists_when_used_from(FunctionPtr cur_f, AnyV usage) const {
+#ifdef TOLK_DEBUG
+  tolk_assert(ident_anchor != nullptr);
+#endif
+  SrcFilePtr declared_in = ident_anchor->range.get_src_file();
+  bool has_import = false;
+  for (const SrcFile::ImportDirective& import : usage->range.get_src_file()->imports) {
+    has_import |= import.imported_file == declared_in;
+  }
+  if (!has_import) {
+    err("Using a non-imported symbol `{}`\n""hint: forgot to import \"{}\"?", name, declared_in->extract_short_name())
+      .with_secondary(this, "declared here")
+      .collect(usage, cur_f);
+  }
+}
+
+std::string FunctionData::as_human_readable() const {
+  if (!is_generic_function()) {
+    return name;  // if it's generic instantiation like `f<int>`, its name is "f<int>", not "f"
+  }
+  return name + genericTs->as_human_readable();
+}
+
+std::string AliasDefData::as_human_readable() const {
+  if (!is_generic_alias()) {
+    return name;
+  }
+  return name + genericTs->as_human_readable();
+}
+
+std::string StructData::as_human_readable() const {
+  if (!is_generic_struct()) {
+    return name;
+  }
+  return name + genericTs->as_human_readable();
+}
+
+std::string EnumDefData::as_human_readable() const {
+  return name;
+}
+
+LocalVarPtr FunctionData::find_param(std::string_view name) const {
+  for (const LocalVarData& param_data : parameters) {
+    if (param_data.name == name) {
+      return &param_data;
+    }
+  }
+  return nullptr;
+}
+
+// detect `fun onInternalMessage(in: InMessage)`
+// we allow also FunC-style `onInternalMessage(msgCell: cell, msgBody: slice)`, then return false
+bool FunctionData::is_onInternalMessage() const {
+  if (get_num_params() == 1 && name == "onInternalMessage") {
+    const TypeDataStruct* t_param = parameters[0].declared_type->try_as<TypeDataStruct>();
+    if (t_param && t_param->struct_ref->name == "InMessage") {
+      return true;
+    }
+    // after transformation, `in:InMessage` becomes `in.body:slice`
+    if (parameters[0].declared_type == TypeDataSlice::create() && parameters[0].name == "in.body") {
+      return true;
+    }
+  }
+  // otherwise, we will output onInternalMessage without any transformations, `in.senderAddress` etc. are disallowed
+  return false;
+}
+
+// detect `fun onExternalMessage()` (may accept `slice` parameter, may not)
+bool FunctionData::is_onExternalMessage() const {
+  return name == "onExternalMessage";
+}
+
+// detect `fun onBouncedMessage(in: InMessageBounced)`
+bool FunctionData::is_onBouncedMessage() const {
+  return name == "onBouncedMessage";
+  // don't check signature, because unlike onInternalMessage, onBouncedMessage must be declared the only way
+}
+
+bool FunctionData::does_need_codegen() const {
+  // when a function is declared, but not referenced from code in any way, don't generate its body
+  if (!is_really_used()) {
+    return false;
+  }
+  // it's declared as `get fun smth(): T;` without body, for ABI only
+  if (is_prototype_only()) {
+    return false;
+  }
+  // functions with asm body don't need code generation
+  // (even if used as non-call: `var a = beginCell;` inserts TVM continuation inline)
+  if (is_asm_function() || is_builtin()) {
+    return false;
+  }
+  // when a function is referenced like `var a = some_fn;` (or in some other non-call way), its continuation should exist
+  if (is_used_as_noncall()) {
+    return true;
+  }
+  // generic functions also don't need code generation, only generic instantiations do
+  if (is_generic_function()) {
+    return false;
+  }
+  // if calls to this function were inlined in place, the function itself is omitted from fif
+  if (is_inlined_in_place()) {
+    return false;
+  }
+  // currently, there is no inlining, all functions are codegenerated
+  // (but actually, unused ones are later removed by Fift)
+  // in the future, we may want to implement a true AST inlining for "simple" functions
+  return true;
+}
+
+void FunctionData::assign_resolved_receiver_type(TypePtr receiver_type, std::string&& name_prefix) {
+  this->receiver_type = receiver_type;
+  if (!this->substitutedTs) {   // after receiver has been resolve, update name to "receiver.method"
+    this->name = name_prefix + "." + this->method_name;
+  }
+}
+
+void FunctionData::assign_resolved_genericTs(const GenericsDeclaration* genericTs) {
+  if (this->substitutedTs == nullptr) {
+    this->genericTs = genericTs;
+  }
+}
+
+void FunctionData::assign_resolved_type(TypePtr declared_return_type) {
+  this->declared_return_type = declared_return_type;
+}
+
+void FunctionData::assign_inferred_type(TypePtr inferred_return_type, TypePtr inferred_full_type) {
+  this->inferred_return_type = inferred_return_type;
+  this->inferred_full_type = inferred_full_type;
+}
+
+void FunctionData::assign_is_used_as_noncall() {
+  this->flags |= flagUsedAsNonCall;
+}
+
+void FunctionData::assign_is_implicit_return() {
+  this->flags |= flagImplicitReturn;
+}
+
+void FunctionData::assign_is_type_inferring_done() {
+  this->flags |= flagTypeInferringDone;
+}
+
+void FunctionData::assign_requires_callxargs() {
+  this->flags |= flagRequiresCallxargs;
+}
+
+void FunctionData::assign_is_really_used() {
+  this->flags |= flagReallyUsed;
+}
+
+void FunctionData::assign_inline_mode_in_place() {
+  this->inline_mode = FunctionInlineMode::inlineInPlace;
+}
+
+void FunctionData::assign_arg_order(std::vector<int>&& arg_order) {
+  this->arg_order = std::move(arg_order);
+}
+
+void FunctionData::assign_lazy_load_plan(const LazyLoadPlan* lazy_load_plan) {
+  this->lazy_load_plan = lazy_load_plan;
+}
+
+void GlobalVarData::assign_resolved_type(TypePtr declared_type) {
+  this->declared_type = declared_type;
+}
+
+void GlobalVarData::assign_is_really_used() {
+  this->flags |= flagReallyUsed;
+}
+
+void GlobalConstData::assign_resolved_type(TypePtr declared_type) {
+  this->declared_type = declared_type;
+}
+
+void GlobalConstData::assign_inferred_type(TypePtr inferred_type) {
+  this->inferred_type = inferred_type;
+}
+
+void GlobalConstData::assign_init_value(AnyExprV init_value) {
+  this->init_value = init_value;
+}
+
+void LocalVarData::assign_used_as_lval() {
+  this->flags |= flagUsedAsLVal;
+}
+
+void LocalVarData::assign_ir_idx(std::vector<int>&& ir_idx) {
+  this->ir_idx = std::move(ir_idx);
+}
+
+void LocalVarData::assign_resolved_type(TypePtr declared_type) {
+  this->declared_type = declared_type;
+}
+
+void LocalVarData::assign_inferred_type(TypePtr inferred_type) {
+  this->declared_type = inferred_type;
+}
+
+void LocalVarData::assign_default_value(AnyExprV default_value) {
+  this->default_value = default_value;
+}
+
+void AliasDefData::assign_resolved_genericTs(const GenericsDeclaration* genericTs) {
+  if (this->substitutedTs == nullptr) {
+    this->genericTs = genericTs;
+  }
+}
+
+void AliasDefData::assign_resolved_type(TypePtr underlying_type) {
+  this->underlying_type = underlying_type;
+}
+
+void EnumMemberData::assign_init_value(AnyExprV init_value) {
+  this->init_value = init_value;
+}
+
+void EnumMemberData::assign_computed_value(td::RefInt256 computed_value) {
+  this->computed_value = std::move(computed_value);
+}
+
+void StructFieldData::assign_resolved_type(TypePtr declared_type) {
+  this->declared_type = declared_type;
+}
+
+void StructFieldData::assign_resolved_abi_type(TypePtr abi_client_type) {
+  this->abi_client_type = abi_client_type;
+}
+
+void StructFieldData::assign_default_value(AnyExprV default_value) {
+  this->default_value = default_value;
+}
+
+void StructData::assign_resolved_genericTs(const GenericsDeclaration* genericTs) {
+  if (this->substitutedTs == nullptr) {
+    this->genericTs = genericTs;
+  }
+}
+
+void EnumDefData::assign_resolved_colon_type(TypePtr colon_type) {
+  this->colon_type = colon_type;
+}
+
+StructFieldPtr StructData::find_field(std::string_view field_name) const {
+  for (StructFieldPtr field : fields) {
+    if (field->name == field_name) {
+      return field;
+    }
+  }
+  return nullptr;
+}
+
+// formats opcode as hex-bin "0x..." / "0b..." or as a Fift slice "x{...}" / "b{...}"
+std::string StructData::PackOpcode::format_as_string(bool as_fift_slice) const {
+  const int base = prefix_len % 4 == 0 ? 16 : 2;
+  const int s_len = base == 16 ? prefix_len / 4 : prefix_len;
+  const char* digits = "0123456789abcdef";
+
+  std::string result(s_len + 2 + as_fift_slice, '0');
+  if (as_fift_slice) {
+    result[0] = base == 16 ? 'x' : 'b';
+    result[1] = '{';
+    result[s_len + 3 - 1] = '}';
+  } else {
+    result[0] = '0';
+    result[1] = base == 16 ? 'x' : 'b';
+  }
+  int64_t opcode = pack_prefix;
+  for (int i = s_len - 1; i >= 0 && opcode != 0; --i) {
+    result[2 + i] = digits[opcode % base];
+    opcode /= base;
+  }
+  return result;
+}
+
+EnumMemberPtr EnumDefData::find_member(std::string_view member_name) const {
+  for (EnumMemberPtr member_ref : members) {
+    if (member_ref->name == member_name) {
+      return member_ref;
+    }
+  }
+  return nullptr;
+}
+
+static Error err_redefinition_of_symbol(const Symbol* previous) {
+  return err("redefinition of symbol `{}`", previous->name)
+    .with_secondary(previous, "previous definition is here");
+}
+
+void GlobalSymbolTable::add_global_symbol(const Symbol* sym) {
+  auto key = key_hash(sym->name);
+  auto [it, inserted] = entries.emplace(key, sym);
+  if (!inserted) {
+    err_redefinition_of_symbol(it->second).fire(sym);
+  }
+}
+
+const Symbol* lookup_global_symbol(std::string_view name) {
+  return G.symtable.lookup(name);
+}
+
+FunctionPtr lookup_function(std::string_view name) {
+  return G.symtable.lookup(name)->try_as<FunctionPtr>();
+}
+
+std::vector<FunctionPtr> lookup_methods_with_name(std::string_view name) {
+  std::vector<FunctionPtr> result;
+  for (FunctionPtr method_ref : G.all_methods) {
+    if (method_ref->method_name == name) {
+      result.push_back(method_ref);
+    }
+  }
+  return result;
+}
+
+}  // namespace tolk

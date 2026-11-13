@@ -16,7 +16,10 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <set>
 #include <tl/tlblib.hpp>
+
+#include "vm/dict.h"
 
 namespace tlb {
 
@@ -45,7 +48,7 @@ bool Bool::print_skip(PrettyPrinter& pp, vm::CellSlice& cs) const {
 }
 
 bool NatWidth::print_skip(PrettyPrinter& pp, vm::CellSlice& cs) const {
-  long long value = (long long)cs.fetch_ulong(32);
+  long long value = (long long)cs.fetch_ulong(n);
   return value >= 0 && pp.out_int(value);
 }
 
@@ -125,6 +128,10 @@ bool TupleT::validate_skip(int* ops, vm::CellSlice& cs, bool weak) const {
 }
 
 bool TLB::validate_ref_internal(int* ops, Ref<vm::Cell> cell_ref, bool weak) const {
+  auto cache = ValidateCache::get();
+  if (cache && !(*cache)(this, cell_ref)) {
+    return true;
+  }
   if (ops) {
     if (*ops <= 0) {
       return false;
@@ -133,7 +140,13 @@ bool TLB::validate_ref_internal(int* ops, Ref<vm::Cell> cell_ref, bool weak) con
   }
   bool is_special;
   auto cs = load_cell_slice_special(std::move(cell_ref), is_special);
-  return always_special() ? is_special : (is_special ? weak : (validate_skip(ops, cs) && cs.empty_ext()));
+  if (cs.special_type() == vm::Cell::SpecialType::PrunnedBranch && weak) {
+    return true;
+  }
+  if (always_special() != is_special) {
+    return false;
+  }
+  return validate_skip(ops, cs, weak) && cs.empty_ext();
 }
 
 bool TLB::print_skip(PrettyPrinter& pp, vm::CellSlice& cs) const {
@@ -190,6 +203,13 @@ bool TLB::print_ref(std::ostream& os, Ref<vm::Cell> cell_ref, int indent, int re
   return pp.fail_unless(print_ref(pp, std::move(cell_ref)));
 }
 
+bool TLB::print_ref(td::StringBuilder& sb, Ref<vm::Cell> cell_ref, int indent, int rec_limit) const {
+  std::ostringstream ss;
+  auto result = print_ref(ss, std::move(cell_ref), indent, rec_limit);
+  sb << ss.str();
+  return result;
+}
+
 std::string TLB::as_string_skip(vm::CellSlice& cs, int indent) const {
   std::ostringstream os;
   print_skip(os, cs, indent);
@@ -206,6 +226,97 @@ std::string TLB::as_string_ref(Ref<vm::Cell> cell_ref, int indent) const {
   std::ostringstream os;
   print_ref(os, std::move(cell_ref), indent);
   return os.str();
+}
+
+namespace {
+
+struct PrintAug : vm::dict::AugmentationData {
+  const TLB& aug_type;
+  explicit PrintAug(const TLB& aug_type) : aug_type(aug_type) {
+  }
+  bool skip_extra(vm::CellSlice& cs) const override {
+    return aug_type.skip(cs);
+  }
+  bool eval_leaf(vm::CellBuilder&, vm::CellSlice&) const override {
+    return false;
+  }
+  bool eval_fork(vm::CellBuilder&, vm::CellSlice&, vm::CellSlice&) const override {
+    return false;
+  }
+  bool eval_empty(vm::CellBuilder&) const override {
+    return false;
+  }
+  bool check_empty(vm::CellSlice& cs) const override {
+    return true;
+  }
+  bool check_fork(vm::CellSlice& cs, vm::CellSlice& left_cs, vm::CellSlice& right_cs) const override {
+    return true;
+  }
+  bool check_leaf(vm::CellSlice& cs, vm::CellSlice& val_cs) const override {
+    return true;
+  }
+};
+
+}  // namespace
+
+bool print_hashmap(PrettyPrinter& pp, vm::CellSlice& cs, unsigned n, const TLB& dict_type, const TLB& value_type,
+                   bool non_empty) {
+  try {
+    vm::CellSlice dict_cs{cs};
+    if (!dict_type.skip(cs)) {
+      return pp.fail("invalid Hashmap");
+    }
+    dict_cs.cut_tail(cs);
+    vm::Dictionary dict{(int)n};
+    if (non_empty) {
+      dict = vm::Dictionary{vm::DictNonEmpty{}, dict_cs, (int)n, false};
+    } else {
+      dict = vm::Dictionary{dict_cs, (int)n, false};
+    }
+    pp.open(non_empty ? "Hashmap" : "HashmapE");
+    return dict.check_for_each([&](Ref<vm::CellSlice> value, td::ConstBitPtr key, int key_len) {
+      if (!pp.register_recursive_call()) {
+        return pp.fail("too many recursive calls while printing a TL-B value");
+      }
+      pp.mode_nl();
+      pp.os << "x" << key.to_hex(key_len) << ":";
+      return (value_type.print_skip(pp, value.write()) && value->empty_ext()) || pp.fail("invalid hashmap value");
+    }) && pp.close();
+  } catch (vm::VmError&) {
+    return pp.fail("invalid Hashmap");
+  }
+}
+
+bool print_hashmap_aug(PrettyPrinter& pp, vm::CellSlice& cs, unsigned n, const TLB& dict_type, const TLB& value_type,
+                       const TLB& aug_type, bool non_empty) {
+  try {
+    vm::CellSlice dict_cs{cs};
+    if (!dict_type.skip(cs)) {
+      return pp.fail("invalid HashmapAug");
+    }
+    dict_cs.cut_tail(cs);
+    PrintAug aug{aug_type};
+    std::unique_ptr<vm::AugmentedDictionary> dict;
+    if (non_empty) {
+      dict = std::make_unique<vm::AugmentedDictionary>(vm::DictNonEmpty{}, Ref<vm::CellSlice>{true, std::move(dict_cs)},
+                                                       (int)n, aug, false);
+    } else {
+      dict =
+          std::make_unique<vm::AugmentedDictionary>(Ref<vm::CellSlice>{true, std::move(dict_cs)}, (int)n, aug, false);
+    }
+    pp.open(non_empty ? "HashmapAug" : "HashmapAugE");
+    return dict->check_for_each_extra([&](Ref<vm::CellSlice> value, Ref<vm::CellSlice>, td::ConstBitPtr key,
+                                          int key_len) {
+      if (!pp.register_recursive_call()) {
+        return pp.fail("too many recursive calls while printing a TL-B value");
+      }
+      pp.mode_nl();
+      pp.os << "x" << key.to_hex(key_len) << ":";
+      return (value_type.print_skip(pp, value.write()) && value->empty_ext()) || pp.fail("invalid hashmapAug value");
+    }) && pp.close();
+  } catch (vm::VmError&) {
+    return pp.fail("invalid HashmapAug");
+  }
 }
 
 PrettyPrinter::~PrettyPrinter() {
@@ -382,6 +493,16 @@ const TLB* TypenameLookup::lookup(td::Slice str) const {
   auto it = std::lower_bound(types.begin(), types.end(), str,
                              [](const auto& x, const auto& y) { return td::Slice(x.first) < y; });
   return it != types.end() && td::Slice(it->first) == str ? it->second : nullptr;
+}
+
+TLB::ValidateCache TLB::ValidateCache::create_for_type(const TLB* type) {
+  return ValidateCache{
+      [s = td::HashSet<vm::CellHash>(), type](const TLB* t, const td::Ref<vm::Cell>& cell) mutable -> bool {
+        if (type != t) {
+          return true;
+        }
+        return s.insert(cell->get_hash()).second;
+      }};
 }
 
 }  // namespace tlb

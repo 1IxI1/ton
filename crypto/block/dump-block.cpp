@@ -25,16 +25,19 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "block/block.h"
-#include "vm/boc.h"
-#include <iostream>
-#include "block-db.h"
-#include "block-auto.h"
-#include "block-parse.h"
-#include "mc-config.h"
-#include "vm/cp0.h"
 #include <getopt.h>
+#include <iostream>
+
+#include "block/block.h"
+#include "ton/ton-io.hpp"
+#include "vm/boc.h"
+#include "vm/cp0.h"
+
+#include "block-auto.h"
+#include "block-db.h"
+#include "block-parse.h"
 #include "git.h"
+#include "mc-config.h"
 
 using td::Ref;
 using namespace std::literals::string_literals;
@@ -66,7 +69,7 @@ td::Ref<vm::Cell> load_boc(std::string filename) {
   if (res.is_error()) {
     throw IntError{PSTRING() << "cannot deserialize bag-of-cells " << res.move_as_error()};
   }
-  if (res.move_as_ok() <= 0 || boc.get_root_cell().is_null()) {
+  if (boc.get_root_cell().is_null()) {
     throw IntError{"cannot deserialize bag-of-cells "};
   }
   return boc.get_root_cell();
@@ -231,10 +234,10 @@ td::Status test_vset() {
   if (cc_seqno == ~0U) {
     return td::Status::Error("cannot compute cc_seqno for shard "s + shard.to_str());
   }
-  auto nodes = config->compute_validator_set(shard, *cur_validators, now, cc_seqno);
+  auto nodes = config->compute_validator_set(shard, *cur_validators, cc_seqno);
   if (nodes.empty()) {
-    return td::Status::Error(PSTRING() << "compute_validator_set() for " << shard.to_str() << "," << now << ","
-                                       << cc_seqno << " returned empty list");
+    return td::Status::Error(PSTRING() << "compute_validator_set() for " << shard << "," << cc_seqno
+                                       << " returned empty list");
   }
   for (auto& x : nodes) {
     std::cout << "weight=" << x.weight << " key=" << x.key.as_bits256().to_hex() << " addr=" << x.addr.to_hex()
@@ -260,7 +263,6 @@ int main(int argc, char* const argv[]) {
   bool vset_compute_test = false;
   bool store_loaded = false;
   int dump = 3;
-  auto zerostate = std::make_unique<block::ZerostateInfo>();
   while ((i = getopt(argc, argv, "CSt:hqv:V")) != -1) {
     switch (i) {
       case 'C':
@@ -283,7 +285,8 @@ int main(int argc, char* const argv[]) {
         dump = 0;
         break;
       case 'V':
-        std::cout << "dump-block build information: [ Commit: " << GitMetadata::CommitSHA1() << ", Date: " << GitMetadata::CommitDate() << "]\n";
+        std::cout << "dump-block build information: [ Commit: " << GitMetadata::CommitSHA1()
+                  << ", Date: " << GitMetadata::CommitDate() << "]\n";
         std::exit(0);
         break;
       case 'h':

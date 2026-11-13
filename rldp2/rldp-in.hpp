@@ -18,16 +18,20 @@
 */
 #pragma once
 
-#include "rldp.hpp"
-
-#include "tl-utils/tl-utils.hpp"
-#include "adnl/adnl-query.h"
-#include "adnl/adnl-peer-table.h"
-
-#include "td/utils/List.h"
-
 #include <map>
 #include <set>
+
+#include "adnl/adnl-peer-table.h"
+#include "adnl/adnl-query.h"
+#include "metrics/collectors.h"
+#include "metrics/well-known.h"
+#include "td/utils/List.h"
+#include "td/utils/Timer.h"
+#include "tl-utils/tl-utils.hpp"
+
+#include "RldpConnection.h"
+#include "rldp-metrics.h"
+#include "rldp.hpp"
 
 namespace ton {
 
@@ -90,28 +94,68 @@ class RldpIn : public RldpImpl {
 
   void add_id(adnl::AdnlNodeIdShort local_id) override;
 
-  void get_conn_ip_str(adnl::AdnlNodeIdShort l_id, adnl::AdnlNodeIdShort p_id, td::Promise<td::string> promise) override;
+  void get_conn_ip_str(adnl::AdnlNodeIdShort l_id, adnl::AdnlNodeIdShort p_id,
+                       td::Promise<td::string> promise) override;
 
-  void set_default_mtu(td::uint64 mtu) override;
+  td::actor::Task<> collect(metrics::Context ctx) override;
+  // Absorb a connection's drained metrics delta into the cumulative aggregate (called both from the
+  // collect() drain round-trip and from a connection's tear_down). Each delta is counted once, so
+  // the aggregate stays monotonic across connection churn. `done` is fulfilled after the merge.
+  void absorb(RldpConnMetrics delta, td::Promise<td::Unit> done);
+  void on_outbound_answer_dropped();
 
-  RldpIn(td::actor::ActorId<adnl::AdnlPeerTable> adnl) : adnl_(adnl) {
+  explicit RldpIn(td::actor::ActorId<adnl::AdnlPeerTable> adnl) : adnl_(adnl) {
   }
+
+ protected:
+  void on_mtu_updated(td::optional<adnl::AdnlNodeIdShort> local_id,
+                      td::optional<adnl::AdnlNodeIdShort> peer_id) override;
+
+  void alarm() override;
 
  private:
   std::unique_ptr<adnl::Adnl::Callback> make_adnl_callback();
 
   td::actor::ActorId<adnl::AdnlPeerTable> adnl_;
 
-  std::map<std::pair<adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>, td::actor::ActorOwn<RldpConnectionActor>>
-      connections_;
+  struct Connection;
+  std::map<std::pair<adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>, Connection> connections_;
+  std::set<std::tuple<td::Timestamp, adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>> timeout_set_;
 
-  std::map<TransferId, td::Promise<td::BufferSlice>> queries_;
+  struct OutQuery {
+    td::Promise<td::BufferSlice> promise;
+    td::uint64 max_answer_size;
+    adnl::AdnlNodeIdShort dst;
+    td::int32 magic;
+    td::Timer timer;
+  };
+  std::map<TransferId, OutQuery> queries_;
+
+  struct OutMessage {
+    adnl::AdnlNodeIdShort dst;
+    td::int32 magic;
+    td::Timer timer;
+  };
+  // Outbound messages awaiting their transfer's on_sent. Every transfer sent with a timeout gets one
+  // (RldpConnection::loop_limits fails it at the deadline at the latest), and the connection outlives
+  // that deadline by CONNECTION_TIMEOUT, so entries do not accumulate.
+  std::map<TransferId, OutMessage> messages_;
+
+  // Fulfils an outbound query's promise and records its round trip. Every completion path goes
+  // through here, and they all run on this actor.
+  void finish_query(std::map<TransferId, OutQuery>::iterator it, td::Result<td::BufferSlice> result);
 
   std::set<adnl::AdnlNodeIdShort> local_ids_;
 
-  td::optional<td::uint64> custom_default_mtu_;
+  RldpMetrics metrics_;
+  // Cumulative per-connection metrics, drained from connections (live scrapes + on tear_down).
+  RldpConnMetrics aggregate_;
 
-  td::actor::ActorId<RldpConnectionActor> create_connection(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst);
+  td::actor::ActorId<RldpConnectionActor> get_or_create_connection(adnl::AdnlNodeIdShort local_id,
+                                                                   adnl::AdnlNodeIdShort peer_id, bool incoming,
+                                                                   td::Timestamp timeout = {});
+
+  static constexpr double CONNECTION_TIMEOUT = 120.0;
 };
 
 }  // namespace rldp2

@@ -16,15 +16,37 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "wait-block-data.hpp"
-#include "fabric.h"
 #include "adnl/utils.hpp"
-#include "ton/ton-io.hpp"
 #include "common/delay.h"
+#include "crypto/block/mc-config.h"
+#include "ton/ton-io.hpp"
+#include "vm/cells/MerkleProof.h"
+
+#include "block-auto.h"
+#include "block-parse.h"
+#include "fabric.h"
+#include "wait-block-data.hpp"
 
 namespace ton {
 
 namespace validator {
+
+static td::Result<td::BufferSlice> serialize_block_proof(BlockIdExt id, td::Ref<vm::Cell> proof, bool has_signatures,
+                                                         td::Ref<vm::Cell> signatures_cell = {}) {
+  vm::CellBuilder cb;
+  td::Ref<vm::Cell> proof_cell;
+  if (!(cb.store_long_bool(0xc3, 8)               // block_proof#c3
+        && block::tlb::t_BlockIdExt.pack(cb, id)  // proof_for:BlockIdExt
+        && cb.store_ref_bool(std::move(proof))    // proof:^Cell
+        && cb.store_bool_bool(has_signatures)     // signatures:(Maybe ^BlockSignatures)
+        && (!has_signatures || cb.store_ref_bool(std::move(signatures_cell))) && cb.finalize_to(proof_cell))) {
+    return td::Status::Error("cannot serialize BlockProof");
+  }
+  if (!block::gen::t_BlockProof.validate_ref(proof_cell)) {
+    return td::Status::Error("created BlockProof failed automated consistency checks");
+  }
+  return std_boc_serialize(proof_cell, 0);
+}
 
 void WaitBlockData::alarm() {
   abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
@@ -102,13 +124,24 @@ void WaitBlockData::start() {
     });
 
     td::actor::send_closure(manager_, &ValidatorManager::try_get_static_file, handle_->id().file_hash, std::move(P));
+  } else if (try_get_candidate_ && !handle_->id().is_masterchain()) {
+    try_get_candidate_ = false;
+    td::actor::send_closure(manager_, &ValidatorManager::get_cached_candidate_data, handle_->id(),
+                            [SelfId = actor_id(this), id = handle_->id()](td::Result<td::BufferSlice> R) {
+                              if (R.is_error()) {
+                                td::actor::send_closure(SelfId, &WaitBlockData::start);
+                              } else {
+                                td::actor::send_closure(SelfId, &WaitBlockData::loaded_data,
+                                                        ReceivedBlock{id, R.move_as_ok()});
+                              }
+                            });
   } else {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<ReceivedBlock> R) {
       if (R.is_error()) {
         td::actor::send_closure(SelfId, &WaitBlockData::failed_to_get_block_data_from_net,
                                 R.move_as_error_prefix("net error: "));
       } else {
-        td::actor::send_closure(SelfId, &WaitBlockData::got_block_data_from_net, R.move_as_ok());
+        td::actor::send_closure(SelfId, &WaitBlockData::loaded_data, R.move_as_ok());
       }
     });
 
@@ -133,13 +166,50 @@ void WaitBlockData::failed_to_get_block_data_from_net(td::Status reason) {
                td::Timestamp::in(0.1));
 }
 
-void WaitBlockData::got_block_data_from_net(ReceivedBlock block) {
+void WaitBlockData::loaded_data(ReceivedBlock block) {
   auto X = create_block(std::move(block));
   if (X.is_error()) {
     failed_to_get_block_data_from_net(X.move_as_error_prefix("bad block from net: "));
     return;
   }
-  data_ = X.move_as_ok();
+  loaded_block_data(X.move_as_ok());
+}
+
+void WaitBlockData::loaded_block_data(td::Ref<BlockData> block) {
+  if (data_.not_null()) {
+    return;
+  }
+  data_ = std::move(block);
+  if (handle_->received()) {
+    finish_query();
+    return;
+  }
+  if (!handle_->id().is_masterchain() && !handle_->inited_proof_link()) {
+    // This can happen if we get block from candidates cache.
+    // Proof link can be derived from the block (but not for masterchain block).
+    auto r_proof_link = generate_proof_link(handle_->id(), data_->root_cell());
+    if (r_proof_link.is_error()) {
+      abort_query(r_proof_link.move_as_error_prefix("failed to create proof link for block: "));
+      return;
+    }
+    td::actor::send_closure(manager_, &ValidatorManager::validate_block_proof_link, handle_->id(),
+                            r_proof_link.move_as_ok(),
+                            [id = handle_->id().id, SelfId = actor_id(this)](td::Result<td::Unit> R) {
+                              if (R.is_error()) {
+                                td::actor::send_closure(SelfId, &WaitBlockData::abort_query,
+                                                        R.move_as_error_prefix("validate proof link error: "));
+                                return;
+                              }
+                              LOG(DEBUG) << "Created and validated proof link for " << id;
+                              td::actor::send_closure(SelfId, &WaitBlockData::checked_proof_link);
+                            });
+    return;
+  }
+  // After send_get_block_request, inited_proof() == true for masterchain (see DownloadBlockNew)
+  checked_proof_link();
+}
+
+void WaitBlockData::checked_proof_link() {
   CHECK(handle_->id().is_masterchain() ? handle_->inited_proof() : handle_->inited_proof_link());
   if (!handle_->received()) {
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Unit> R) {
@@ -196,6 +266,41 @@ void WaitBlockData::got_static_file(td::BufferSlice data) {
     }
   });
   run_hardfork_accept_block_query(handle_->id(), data_, manager_, std::move(P));
+}
+
+td::Result<td::BufferSlice> WaitBlockData::generate_proof(BlockIdExt id, td::Ref<vm::Cell> block_root,
+                                                          td::Ref<block::BlockSignatureSet> signatures,
+                                                          td::Ref<MasterchainState> state) {
+  if (!id.is_masterchain()) {
+    return td::Status::Error("cannot create proof for non-masterchain block");
+  }
+  if (signatures.is_null()) {
+    return td::Status::Error("block signatures are null");
+  }
+  if (!signatures->is_final()) {
+    return td::Status::Error("cannot create masterchain proof with non-final signatures");
+  }
+  if (state.is_null()) {
+    return td::Status::Error(ErrorCode::notready, "masterchain state is not ready");
+  }
+
+  TRY_RESULT(proof_root, generate_block_proof_root(id, std::move(block_root)));
+  TRY_RESULT(config, state->get_config_holder());
+  auto vset = config->get_validator_set(id.shard_full(), signatures->get_catchain_seqno());
+  if (vset.is_null()) {
+    return td::Status::Error(ErrorCode::notready, "failed to compute validator set for masterchain proof");
+  }
+  TRY_RESULT(signatures_cell, signatures->serialize(vset));
+  return serialize_block_proof(id, std::move(proof_root), true, std::move(signatures_cell));
+}
+
+td::Result<td::BufferSlice> WaitBlockData::generate_proof_link(BlockIdExt id, td::Ref<vm::Cell> block_root) {
+  // Creating proof link. Similar to accept-block.cpp
+  if (id.is_masterchain()) {
+    return td::Status::Error("cannot create proof link for masterchain block");
+  }
+  TRY_RESULT(proof_root, generate_block_proof_root(id, std::move(block_root)));
+  return serialize_block_proof(id, std::move(proof_root), false);
 }
 
 }  // namespace validator

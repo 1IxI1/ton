@@ -18,14 +18,14 @@
 */
 
 #pragma once
-#include "MerkleTree.h"
-#include "TorrentMeta.h"
-
-#include "td/utils/buffer.h"
-#include "td/db/utils/BlobView.h"
-
 #include <map>
 #include <set>
+
+#include "td/db/utils/BlobView.h"
+#include "td/utils/buffer.h"
+
+#include "MerkleTree.h"
+#include "TorrentMeta.h"
 
 namespace ton {
 class Torrent {
@@ -159,7 +159,7 @@ class Torrent {
 
   void load_from_files(std::string files_path);
 
-  td::Status copy_to(const std::string& new_root_dir);
+  td::Status copy_to(const std::string &new_root_dir);
 
  private:
   td::Bits256 hash_;
@@ -173,7 +173,7 @@ class Torrent {
   size_t not_ready_pending_piece_count_{0};
   size_t header_pieces_count_{0};
   std::map<td::uint64, td::string> pending_pieces_;
-  bool enabled_wirte_to_files_ = false;
+  bool enabled_write_to_files_ = false;
   struct InMemoryPiece {
     std::string data;
     std::set<size_t> pending_chunks;

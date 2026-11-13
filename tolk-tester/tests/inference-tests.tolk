@@ -1,0 +1,292 @@
+// the goal of this file is not only to @testcase results —
+// but to check that this file compiles
+
+fun eq<X>(value: X): X { return value; }
+
+fun test1(x: int, y: int) {
+    __expect_type(0, "int");
+    __expect_type(stringCrc32("0"), "int");
+    __expect_type(x, "int");
+    __expect_type(x + y, "int");
+    __expect_type(x * y, "int");
+    __expect_type(x & y, "int");
+    __expect_type(x << y, "int");
+    __expect_type((((x))), "int");
+    __expect_type(x = x, "int");
+    __expect_type(x += x, "int");
+    __expect_type(x &= x, "int");
+    __expect_type(random.uint256() != 0 ? x : y, "int");
+    __expect_type(eq(x), "int");
+    __expect_type(eq<int>(x), "int");
+    __expect_type(eq<int?>(null), "int?");
+    __expect_type(x as int, "int");
+    __expect_type(+x, "int");
+    __expect_type(~x, "int");
+    __expect_type(x!, "int");
+    __expect_type(x!!!, "int");
+    {
+        var x: slice = beginCell().endCell().beginParse();
+        __expect_type(x, "slice");
+        __expect_type(beginCell(), "builder");
+        __expect_type(beginCell().endCell(), "cell");
+    }
+    __expect_type((1, 2), "(int, int)");
+    __expect_type((1, 2, ), "(int, int)");
+    __expect_type((1, ), "int");
+    __expect_type((((1,)),), "int");
+    __expect_type([((1, ), ), ], "array<int>");
+    __expect_type([[[1, ], ], ], "array<array<array<int>>>");
+    __expect_type(true ? 5 : null, "int?");
+    __expect_type(false ? beginCell() : null, "builder?");
+}
+
+fun test2(x: int, y: bool) {
+    __expect_type(x == 0, "bool");
+    __expect_type(x != x, "bool");
+    __expect_type(x <= x, "bool");
+    __expect_type(x <=> x, "int");
+    __expect_type(x <=> x, "int");
+    __expect_type(random.uint256() == 0, "bool");
+    __expect_type(!!(x != null), "bool");
+    __expect_type(x != 0 ? x != null : null == x, "bool");
+    __expect_type(y & true, "bool");
+    __expect_type(y ^= false, "bool");
+    __expect_type(x && y, "bool");
+    __expect_type(true && false && true, "bool");
+    __expect_type(x || x, "bool");
+    __expect_type(x || x == 0 || (true & false), "bool");
+}
+
+fun test3() {
+    __expect_type(true as int, "int");
+    __expect_type((random.uint256() == 0) as int, "int");
+}
+
+fun test4(x: int) {
+    __expect_type((), "()");
+    __expect_type((x, x), "(int, int)");
+    __expect_type((x, (x, x), x), "(int, (int, int), int)");
+}
+
+fun test5(x: int) {
+    __expect_type([], "array<unknown>");
+    __expect_type([x], "array<int>");
+    __expect_type([x, null], "array<int?>");
+    __expect_type([null], "array<null>");
+    __expect_type([x, x >= 1] as tuple, "tuple");
+    __expect_type([x, x >= 1] as array<unknown>, "array<unknown>");
+    __expect_type([x as unknown, (x >= 1) as unknown], "array<unknown>");
+    __expect_type([x] as [int], "[int]");
+    __expect_type(contract.getOriginalBalanceWithExtraCurrencies(), "[coins, ExtraCurrenciesMap]");
+}
+
+fun test6() {
+    var t = createEmptyTuple();
+    __expect_type(t, "array<unknown>");
+    t.push(1);
+    __expect_type(t, "array<unknown>");
+}
+
+fun test7() {
+    __expect_type(test3(), "void");
+    __expect_type(test3, "() -> void");
+    var cb = test1;
+    __expect_type(cb, "(int, int) -> void");
+    var t = createEmptyTuple();
+    __expect_type(beginCell().endCell, "(builder) -> cell");
+    // __expect_type(eq<(int, slice)>, "(int, slice) -> (int, slice)");
+}
+
+fun unnamed_args(_: int, _: string, _: int) {
+    return true;
+}
+
+@method_id(108)
+fun test8(x: int, z: int) {
+    return unnamed_args(x, "asdf", z);
+}
+
+fun alwaysThrows(): never { throw 123; }
+fun alwaysThrowsNotAnnotated() { throw 123; }
+fun alwaysThrowsNotAnnotated2() { alwaysThrows(); }
+
+fun test9() {
+    __expect_type(alwaysThrows(), "never");
+    __expect_type(alwaysThrows, "() -> never");
+    __expect_type(alwaysThrowsNotAnnotated(), "never");
+    __expect_type(alwaysThrowsNotAnnotated2(), "never");
+}
+
+fun test10(i: int) {
+    var tail: slice? = null;
+    __expect_type(tail, "null");
+    repeat (10) {
+        __expect_type(tail, "slice?");
+        if (tail == null) {
+            tail = createEmptySlice();
+        } else {
+            tail = null;
+        }
+        __expect_type(tail, "slice?");
+        tail!.remainingBitsCount();
+    }
+    __expect_type(tail, "slice?");
+}
+
+fun test11() {
+    var x: string? = "A";
+    var y: string? = "B";
+
+    repeat (3) {
+        x = y;
+        y = null;
+    }
+
+    __expect_type(x, "string?");
+    __expect_type(y, "string?");
+    return x == null;
+}
+
+@method_id(112)
+fun test12(): int {
+    var x: string? = "A";
+    var y: string? = "B";
+    var i = 0;
+
+    __expect_type(y, "string");
+    __expect_type(x, "string");
+
+    while (x != null) {
+        __expect_type(y, "string?");
+        __expect_type(x, "string");
+        x = y;
+        __expect_type(x, "string?");
+        y = null;
+        i += 1;
+        if (i == 3) {
+            return 777;
+        }
+    }
+    __expect_type(x, "null");
+    return 1;
+}
+
+fun test13(c: cell) {
+    while (c == null) {
+        var x = c;
+        __expect_type(x, "never");
+    }
+}
+
+@method_id(114)
+fun test14() {
+    var a: string? = "A";
+    var b: string? = "B";
+    var c: string? = "C";
+    var i = 0;
+
+    while (a != null) {
+        i += 1;
+        if (i == 5) {
+            __expect_type(a, "string");
+            __expect_type(b, "string?");
+            __expect_type(c, "string?");
+            throw 99;
+        }
+        a = b;
+        b = c;
+        c = null;
+    }
+
+    __expect_type(a, "null");
+    __expect_type(b, "string?");
+    __expect_type(c, "string?");
+    return (a, b, c, i);
+}
+
+type IntAlias1 = int
+type IntAlias2 = int
+
+fun int.method(self): int { return 0 }
+fun IntAlias1.method(self): int1 { return 1 }
+fun IntAlias2.method(self): int2 { return 2 }
+
+@method_id(115)
+fun test15(i: IntAlias1, j: IntAlias2) {
+    // all these are ok due to manual hint
+    var ok1: (int, IntAlias1, IntAlias2) = (i ?? j, i ?? j, i ?? j);
+    var ok2: (int?, IntAlias1?, IntAlias2?) = (i ?? j, i ?? j, i ?? j);
+    __expect_type(((i ?? j) as IntAlias1).method, "(IntAlias1) -> int1");
+    __expect_type(((i == 0 ? i : j) as IntAlias2).method, "(IntAlias2) -> int2");
+    if (i is int) {
+        __expect_type(i.method, "(int) -> int");
+    }
+    match (j) {
+        int => { __expect_type(j.method, "(int) -> int") }
+    }
+    match (j) {
+        IntAlias2 => { __expect_type(j.method, "(IntAlias2) -> int2") }
+    }
+    return (i is IntAlias1, i is int, match (i) { int => i.method() })
+}
+
+fun test16() {
+    var x: int? = 1;
+    while (true) {
+        if (x == null) {
+            __expect_type(x, "null");
+            break;
+        }
+        __expect_type(x, "int");
+        x = null;
+    }
+    __expect_type(x, "null");
+}
+
+fun test17(x: int?, y: int?) {
+    while (x != null) {
+        __expect_type(x, "int");
+        if (y == null) {
+            __expect_type(y, "null");
+            continue;
+        }
+        __expect_type(y, "int");
+        if (x > 0) {
+            break;
+        }
+        x = y;
+        y = null;
+    }
+    __expect_type(x, "int?");
+    __expect_type(y, "int?");
+}
+
+fun test18(x: int | slice | null) {
+    do {
+        if (x is int) {
+            __expect_type(x, "int");
+            break;
+        }
+        if (x is slice) {
+            __expect_type(x, "slice");
+            x = 0;
+            continue;
+        }
+        __expect_type(x, "null");
+        x = 1;
+    } while (true);
+    __expect_type(x, "int");
+}
+
+
+fun main() {
+    return 0;
+}
+
+/**
+@testcase | 0   |      | 0
+@testcase | 108 | 1 10 | -1
+@testcase | 112 |      | 1
+@testcase | 114 |      | (null) (null) (null) 3
+@testcase | 115 | 0 0  | -1 -1 0
+*/

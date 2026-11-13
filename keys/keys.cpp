@@ -16,12 +16,14 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "keys.hpp"
 #include "auto/tl/ton_api.hpp"
+#include "crypto/Ed25519.h"
 #include "td/utils/overloaded.h"
 #include "tl-utils/tl-utils.hpp"
+
 #include "encryptor.h"
-#include "crypto/Ed25519.h"
+#include "encryptor.hpp"
+#include "keys.hpp"
 
 namespace ton {
 
@@ -63,12 +65,31 @@ td::Result<PublicKey> PublicKey::import(td::Slice s) {
   return PublicKey{x};
 }
 
+td::Result<std::unique_ptr<Encryptor>> pubkeys::Ed25519::create_encryptor() const {
+  return std::make_unique<EncryptorEd25519>(data_);
+}
+
+td::Result<std::unique_ptr<Encryptor>> pubkeys::AES::create_encryptor() const {
+  return std::make_unique<EncryptorAES>(data_);
+}
+
+td::Result<std::unique_ptr<Encryptor>> pubkeys::Unenc::create_encryptor() const {
+  return std::make_unique<EncryptorNone>();
+}
+
+td::Result<std::unique_ptr<Encryptor>> pubkeys::Overlay::create_encryptor() const {
+  return std::make_unique<EncryptorOverlay>();
+}
+
 td::Result<std::unique_ptr<Encryptor>> PublicKey::create_encryptor() const {
-  return Encryptor::create(tl().get());
+  td::Result<std::unique_ptr<Encryptor>> res;
+  pub_key_.visit([&](auto &obj) { res = obj.create_encryptor(); });
+  return res;
 }
 
 td::Result<td::actor::ActorOwn<EncryptorAsync>> PublicKey::create_encryptor_async() const {
-  return EncryptorAsync::create(tl().get());
+  TRY_RESULT(encryptor, create_encryptor());
+  return td::actor::create_actor<EncryptorAsync>("encryptor", std::move(encryptor));
 }
 
 bool PublicKey::empty() const {
@@ -109,6 +130,22 @@ privkeys::Ed25519::Ed25519(td::Ed25519::PrivateKey key) {
   data_.as_slice().copy_from(td::Slice(s));
 }
 
+td::Result<std::unique_ptr<Decryptor>> privkeys::Ed25519::create_decryptor() const {
+  return std::make_unique<DecryptorEd25519>(data_);
+}
+
+td::Result<std::unique_ptr<Decryptor>> privkeys::AES::create_decryptor() const {
+  return std::make_unique<DecryptorAES>(data_);
+}
+
+td::Result<std::unique_ptr<Decryptor>> privkeys::Unenc::create_decryptor() const {
+  return std::make_unique<DecryptorNone>();
+}
+
+td::Result<std::unique_ptr<Decryptor>> privkeys::Overlay::create_decryptor() const {
+  return std::make_unique<DecryptorFail>();
+}
+
 pubkeys::Ed25519::Ed25519(td::Ed25519::PublicKey key) {
   auto s = key.as_octet_string();
   CHECK(s.length() == 32);
@@ -144,6 +181,13 @@ td::SecureString PrivateKey::export_as_slice() const {
   td::SecureString res;
   priv_key_.visit([&](auto &obj) { res = obj.export_as_slice(); });
   return res;
+}
+
+td::Result<td::Ed25519::PrivateKey> PrivateKey::export_as_ed25519() const {
+  if (!priv_key_.has<privkeys::Ed25519>()) {
+    return td::Status::Error("Key is not Ed25519");
+  }
+  return priv_key_.get<privkeys::Ed25519>().export_key();
 }
 
 bool PrivateKey::exportable() const {
@@ -188,11 +232,14 @@ tl_object_ptr<ton_api::PrivateKey> PrivateKey::tl() const {
 }
 
 td::Result<std::unique_ptr<Decryptor>> PrivateKey::create_decryptor() const {
-  return Decryptor::create(tl().get());
+  td::Result<std::unique_ptr<Decryptor>> res;
+  priv_key_.visit([&](auto &obj) { res = obj.create_decryptor(); });
+  return res;
 }
 
 td::Result<td::actor::ActorOwn<DecryptorAsync>> PrivateKey::create_decryptor_async() const {
-  return DecryptorAsync::create(tl().get());
+  TRY_RESULT(decryptor, create_decryptor());
+  return td::actor::create_actor<DecryptorAsync>("decryptor", std::move(decryptor));
 }
 
 }  // namespace ton

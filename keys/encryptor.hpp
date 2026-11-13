@@ -18,10 +18,11 @@
 */
 #pragma once
 
-#include "encryptor.h"
-#include "crypto/Ed25519.h"
 #include "auto/tl/ton_api.h"
+#include "crypto/Ed25519.h"
 #include "tl-utils/tl-utils.hpp"
+
+#include "encryptor.h"
 
 namespace ton {
 
@@ -83,7 +84,7 @@ class EncryptorEd25519 : public Encryptor {
   td::Result<td::BufferSlice> encrypt(td::Slice data) override;
   td::Status check_signature(td::Slice message, td::Slice signature) override;
 
-  EncryptorEd25519(td::Bits256 key) : pub_(td::SecureString(as_slice(key))) {
+  EncryptorEd25519(const td::Bits256& key) : pub_(td::SecureString(as_slice(key))) {
   }
 };
 
@@ -94,7 +95,7 @@ class DecryptorEd25519 : public Decryptor {
  public:
   td::Result<td::BufferSlice> decrypt(td::Slice data) override;
   td::Result<td::BufferSlice> sign(td::Slice data) override;
-  DecryptorEd25519(td::Bits256 key) : pk_(td::SecureString(as_slice(key))) {
+  DecryptorEd25519(const td::Bits256& key) : pk_(td::SecureString(as_slice(key))) {
   }
 };
 
@@ -129,12 +130,15 @@ class EncryptorAES : public Encryptor {
   td::Bits256 shared_secret_;
 
  public:
+  ~EncryptorAES() override {
+    shared_secret_.set_zero_s();
+  }
   td::Result<td::BufferSlice> encrypt(td::Slice data) override;
   td::Status check_signature(td::Slice message, td::Slice signature) override {
     return td::Status::Error("can no sign channel messages");
   }
 
-  EncryptorAES(td::Bits256 shared_secret) : shared_secret_(shared_secret) {
+  EncryptorAES(const td::Bits256& shared_secret) : shared_secret_(shared_secret) {
   }
 };
 
@@ -143,11 +147,14 @@ class DecryptorAES : public Decryptor {
   td::Bits256 shared_secret_;
 
  public:
+  ~DecryptorAES() override {
+    shared_secret_.set_zero_s();
+  }
   td::Result<td::BufferSlice> decrypt(td::Slice data) override;
   td::Result<td::BufferSlice> sign(td::Slice data) override {
     return td::Status::Error("can no sign channel messages");
   }
-  DecryptorAES(td::Bits256 shared_secret) : shared_secret_(shared_secret) {
+  DecryptorAES(const td::Bits256& shared_secret) : shared_secret_(shared_secret) {
   }
 };
 

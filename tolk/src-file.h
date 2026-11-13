@@ -1,0 +1,171 @@
+/*
+    This file is part of TON Blockchain Library.
+
+    TON Blockchain Library is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 2 of the License, or
+    (at your option) any later version.
+
+    TON Blockchain Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#pragma once
+
+#include <string>
+#include <vector>
+#include "fwd-declarations.h"
+#include "symtable.h"
+
+namespace tolk {
+
+struct ContractDirective;
+
+struct SrcFile {
+  struct SrcPosition {
+    int line_no;
+    int char_no;
+    int line_offset;
+    std::string_view line_str;
+  };
+
+  struct ImportDirective {
+    SrcFilePtr imported_file;
+  };
+
+  int file_id;                          // an incremental counter through all parsed files
+  bool is_stdlib_file;                  // is a part of Tolk distribution, imported via "@stdlib/..."
+  std::string realpath;                 // what "realpath" returned to locate (either abs path or what tolk-js returns)
+  std::string text;                     // file contents loaded into memory, every Token::str_val points inside it
+  int text_len;                         // length (size) of text
+  std::vector<int> line_offsets;        // offset of each line start in text; built once on load for convert_offset
+  AnyV ast = nullptr;                   // when a file has been parsed, its ast_tolk_file is kept here
+  std::vector<ImportDirective> imports; // to check strictness (can't use a symbol without importing its file)
+  ContractDirective* contract_directive;
+
+  SrcFile(int file_id, bool is_stdlib_file, std::string realpath, std::string&& file_text);
+
+  SrcFile(const SrcFile& other) = delete;
+  SrcFile &operator=(const SrcFile&) = delete;
+
+  bool is_offset_valid(int offset) const {
+    return offset >= 0 && offset <= text_len;
+  }
+  SrcPosition convert_offset(int offset) const;
+
+  SrcFile* mutate() const { return const_cast<SrcFile*>(this); }
+
+  void assign_contract_directive(ContractDirective* contract_directive);
+  bool has_contract_directive() const { return contract_directive != nullptr; }
+
+  std::string extract_short_name() const;
+  std::string extract_dirname() const;
+};
+
+class AllRegisteredSrcFiles {
+  std::vector<SrcFilePtr> all_src_files;
+  int last_parsed_file_id = -1;
+
+public:
+  SrcFilePtr get_file(int file_id) const { return all_src_files.at(file_id); }
+  SrcFilePtr find_file(const std::string& realpath) const;
+  SrcFilePtr get_stdlib_common_file() const { return all_src_files.at(0); }
+  SrcFilePtr get_entrypoint_file() const { return all_src_files.at(1); }
+
+  SrcFilePtr locate_and_register_source_file(const std::string& filename, AnyV v_import_filename);
+  SrcFile* get_next_unparsed_file();
+
+  auto begin() const { return all_src_files.begin(); }
+  auto end() const { return all_src_files.end(); }
+  auto size() const { return all_src_files.size(); }
+};
+
+// SrcRange is a "substring" in some loaded .tolk source SrcFile.
+// Note, that instead of storing src_file, line_no, etc., only 3 ints are stored.
+// When decoding SrcRange into human-readable format, it's converted to SrcFile::SrcPosition via offset.
+class SrcRange {
+  int file_id;        // SrcFile::file_id (note, that get_src_file() does linear search)
+  int start_offset;   // offset from SrcFile::text
+  int end_offset;     // >= start_offset, otherwise "invalid range"
+
+  SrcRange(int file_id, int start_offset, int end_offset)
+    : file_id(file_id)
+    , start_offset(start_offset)
+    , end_offset(end_offset) {
+  }
+
+public:
+  static SrcRange undefined() {
+    return SrcRange(-1, 0, -1);
+  }
+
+  static SrcRange overlap(SrcRange start, SrcRange end) {
+    return SrcRange(start.file_id, start.start_offset, end.end_offset);
+  }
+  
+  static SrcRange empty_at_start(SrcRange range) {
+    return SrcRange(range.file_id, range.start_offset, range.start_offset);
+  }
+  
+  static SrcRange empty_at_end(SrcRange range) {
+    return SrcRange(range.file_id, range.end_offset, range.end_offset);
+  }
+
+  static SrcRange span(SrcRange start, int len) {
+    return SrcRange(start.file_id, start.start_offset, start.start_offset + len);
+  }
+
+  static SrcRange span(int file_id, int start_offset, int len) {
+    return SrcRange(file_id, start_offset, start_offset + len);
+  }
+
+  static SrcRange span_at_end(SrcRange end, int len) {
+    return SrcRange(end.file_id, end.end_offset - len, end.end_offset);
+  }
+
+  static SrcRange unclosed_range(int file_id, int start_offset) {
+    return SrcRange(file_id, start_offset, 0);    // in dev mode, there is `assert` that range is closed before used
+  }
+
+  void end(SrcRange end) {
+    end_offset = end.end_offset;
+  }
+
+  bool is_defined() const {
+    return file_id != -1;
+  }
+  bool is_valid() const {
+    return end_offset >= start_offset;
+  }
+  bool is_file_id_same_or_stdlib_common(SrcRange other) const {
+    return file_id == 0 || file_id == other.file_id;
+  }
+
+  bool operator<(SrcRange other) const {
+    return file_id != other.file_id ? file_id < other.file_id : start_offset < other.start_offset;
+  }
+
+  SrcFilePtr get_src_file() const;
+  std::string stringify_start_location(bool output_char_no) const;
+
+  void output_underlined(std::ostream& os, const char* ansi_gutter, const char* ansi_underline, const char* ansi_reset) const;
+
+
+  struct DecodedRange {
+    int file_id;
+    int start_line_no;
+    int start_char_no;
+    int end_line_no;
+    int end_char_no;
+    std::string_view start_line_str;
+    std::string_view end_line_str;
+    std::string_view text_inside;
+  };
+  DecodedRange decode_offsets() const;
+};
+
+}  // namespace tolk

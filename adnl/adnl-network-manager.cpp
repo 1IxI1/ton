@@ -16,19 +16,17 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "td/actor/coro_utils.h"
+
 #include "adnl-network-manager.hpp"
 #include "adnl-peer-table.h"
-
-#include "auto/tl/ton_api.hpp"
-
-#include "td/utils/overloaded.h"
 
 namespace ton {
 
 namespace adnl {
 
-td::actor::ActorOwn<AdnlNetworkManager> AdnlNetworkManager::create(td::uint16 port) {
-  return td::actor::create_actor<AdnlNetworkManagerImpl>("NetworkManager", port);
+td::actor::ActorOwn<AdnlNetworkManager> AdnlNetworkManager::create() {
+  return td::actor::create_actor<AdnlNetworkManagerImpl>("NetworkManager");
 }
 
 AdnlNetworkManagerImpl::OutDesc *AdnlNetworkManagerImpl::choose_out_iface(td::uint8 cat, td::uint32 priority) {
@@ -79,8 +77,8 @@ size_t AdnlNetworkManagerImpl::add_listening_udp_port(td::uint16 port) {
 void AdnlNetworkManagerImpl::add_self_addr(td::IPAddress addr, AdnlCategoryMask cat_mask, td::uint32 priority) {
   auto port = td::narrow_cast<td::uint16>(addr.get_port());
   size_t idx = add_listening_udp_port(port);
-  add_in_addr(InDesc{port, nullptr, cat_mask}, idx);
-  auto d = OutDesc{port, td::IPAddress{}, nullptr, idx};
+  add_in_addr(InDesc{port, cat_mask}, idx);
+  auto d = OutDesc{port, idx};
   for (auto &it : out_desc_[priority]) {
     if (it == d) {
       it.cat_mask |= cat_mask;
@@ -89,133 +87,48 @@ void AdnlNetworkManagerImpl::add_self_addr(td::IPAddress addr, AdnlCategoryMask 
   }
 
   d.cat_mask = cat_mask;
-  out_desc_[priority].push_back(std::move(d));
-}
-
-void AdnlNetworkManagerImpl::add_proxy_addr(td::IPAddress addr, td::uint16 local_port, std::shared_ptr<AdnlProxy> proxy,
-                                            AdnlCategoryMask cat_mask, td::uint32 priority) {
-  size_t idx = add_listening_udp_port(local_port);
-  add_in_addr(InDesc{local_port, proxy, cat_mask}, idx);
-  auto d = OutDesc{local_port, addr, proxy, idx};
-  for (auto &it : out_desc_[priority]) {
-    if (it == d) {
-      it.cat_mask |= cat_mask;
-      return;
-    }
-  }
-  d.cat_mask = cat_mask;
-  proxy_register(d);
   out_desc_[priority].push_back(std::move(d));
 }
 
 void AdnlNetworkManagerImpl::receive_udp_message(td::UdpMessage message, size_t idx) {
   if (!callback_) {
+    record_dropped(metrics::Direction::in, metrics::Reason::internal);
     LOG(ERROR) << this << ": dropping IN message [?->?]: peer table unitialized";
     return;
   }
   if (message.error.is_error()) {
-    VLOG(ADNL_WARNING) << this << ": dropping ERROR message: " << message.error;
+    record_dropped(metrics::Direction::in, metrics::Reason::internal);
+    VLOG(adnl, WARNING) << this << ": dropping ERROR message: " << message.error;
     return;
   }
   if (message.data.size() < 32) {
-    VLOG(ADNL_WARNING) << this << ": received too small proxy packet of size " << message.data.size();
+    record_dropped(metrics::Direction::in, metrics::Reason::invalid);
+    VLOG(adnl, WARNING) << this << ": received too small packet of size " << message.data.size();
     return;
   }
   if (message.data.size() >= get_mtu() + 128) {
-    VLOG(ADNL_NOTICE) << this << ": received huge packet of size " << message.data.size();
+    VLOG(adnl, INFO) << this << ": received huge packet of size " << message.data.size();
   }
-  CHECK(idx < udp_sockets_.size());
+  if (idx >= udp_sockets_.size()) {
+    VLOG(adnl, ERROR) << this << ": dropping message to unknown socket #" << idx;
+    return;
+  }
   auto &socket = udp_sockets_[idx];
-  AdnlCategoryMask cat_mask;
-  bool from_proxy = false;
-  if (socket.allow_proxy) {
-    td::Bits256 x;
-    x.as_slice().copy_from(message.data.as_slice().truncate(32));
-    auto it = proxy_addrs_.find(x);
-    if (it != proxy_addrs_.end()) {
-      from_proxy = true;
-      CHECK(it->second < in_desc_.size());
-      auto &proxy_iface = in_desc_[it->second];
-      CHECK(proxy_iface.is_proxy());
-      auto R = in_desc_[it->second].proxy->decrypt(std::move(message.data));
-      if (R.is_error()) {
-        VLOG(ADNL_WARNING) << this << ": failed to decrypt proxy mesage: " << R.move_as_error();
-        return;
-      }
-      auto packet = R.move_as_ok();
-      if (packet.flags & 1) {
-        message.address.init_host_port(td::IPAddress::ipv4_to_str(packet.ip), packet.port).ensure();
-      } else {
-        message.address = td::IPAddress{};
-      }
-      if ((packet.flags & 6) == 6) {
-        if (proxy_iface.received.packet_is_delivered(packet.adnl_start_time, packet.seqno)) {
-          VLOG(ADNL_WARNING) << this << ": dropping duplicate proxy packet";
-          return;
-        }
-      }
-      if (packet.flags & 8) {
-        if (packet.date < td::Clocks::system() - 60 || packet.date > td::Clocks::system() + 60) {
-          VLOG(ADNL_WARNING) << this << ": dropping proxy packet: bad time " << packet.date;
-          return;
-        }
-      }
-      if (!(packet.flags & (1 << 16))) {
-        VLOG(ADNL_WARNING) << this << ": dropping proxy packet: packet has outbound flag";
-        return;
-      }
-      if (packet.flags & (1 << 17)) {
-        auto F = fetch_tl_object<ton_api::adnl_ProxyControlPacket>(std::move(packet.data), true);
-        if (F.is_error()) {
-          VLOG(ADNL_WARNING) << this << ": dropping proxy packet: bad control packet";
-          return;
-        }
-        ton_api::downcast_call(*F.move_as_ok().get(),
-                               td::overloaded(
-                                   [&](const ton_api::adnl_proxyControlPacketPing &f) {
-                                     auto &v = *proxy_iface.out_desc;
-                                     auto data =
-                                         create_serialize_tl_object<ton_api::adnl_proxyControlPacketPong>(f.id_);
-                                     AdnlProxy::Packet p;
-                                     p.flags = 6 | (1 << 17);
-                                     p.ip = 0;
-                                     p.port = 0;
-                                     p.data = std::move(data);
-                                     p.adnl_start_time = Adnl::adnl_start_time();
-                                     p.seqno = ++v.out_seqno;
-
-                                     auto enc = v.proxy->encrypt(std::move(p));
-
-                                     td::UdpMessage M;
-                                     M.address = v.proxy_addr;
-                                     M.data = std::move(enc);
-
-                                     td::actor::send_closure(socket.server, &td::UdpServer::send, std::move(M));
-                                   },
-                                   [&](const ton_api::adnl_proxyControlPacketPong &f) {},
-                                   [&](const ton_api::adnl_proxyControlPacketRegister &f) {}));
-        return;
-      }
-      message.data = std::move(packet.data);
-      cat_mask = in_desc_[it->second].cat_mask;
-    }
+  if (socket.in_desc == std::numeric_limits<size_t>::max()) {
+    record_dropped(metrics::Direction::in, metrics::Reason::internal);
+    VLOG(adnl, WARNING) << this << ": received packet to port without InDesc";
+    return;
   }
-  if (!from_proxy) {
-    if (socket.in_desc == std::numeric_limits<size_t>::max()) {
-      VLOG(ADNL_WARNING) << this << ": received bad packet to proxy-only listenung port";
-      return;
-    }
-    cat_mask = in_desc_[socket.in_desc].cat_mask;
-  }
+  AdnlCategoryMask cat_mask = in_desc_[socket.in_desc].cat_mask;
   if (message.data.size() >= get_mtu()) {
-    VLOG(ADNL_NOTICE) << this << ": received huge packet of size " << message.data.size();
+    VLOG(adnl, INFO) << this << ": received huge packet of size " << message.data.size();
   }
   received_messages_++;
   if (received_messages_ % 64 == 0) {
-    VLOG(ADNL_DEBUG) << this << ": received " << received_messages_ << " udp messages";
+    VLOG(adnl, DEBUG) << this << ": received " << received_messages_ << " udp messages";
   }
 
-  VLOG(ADNL_EXTRA_DEBUG) << this << ": received message of size " << message.data.size();
+  VLOG(adnl, DEBUG) << this << ": received message of size " << message.data.size();
   callback_->receive_packet(message.address, cat_mask, std::move(message.data));
 }
 
@@ -223,75 +136,80 @@ void AdnlNetworkManagerImpl::send_udp_packet(AdnlNodeIdShort src_id, AdnlNodeIdS
                                              td::uint32 priority, td::BufferSlice data) {
   auto it = adnl_id_2_cat_.find(src_id);
   if (it == adnl_id_2_cat_.end()) {
-    VLOG(ADNL_WARNING) << this << ": dropping OUT message [" << src_id << "->" << dst_id << "]: unknown src";
+    record_dropped(metrics::Direction::out, metrics::Reason::internal);
+    VLOG(adnl, WARNING) << this << ": dropping OUT message [" << src_id << "->" << dst_id << "]: unknown src";
     return;
   }
 
   auto out = choose_out_iface(it->second, priority);
   if (!out) {
-    VLOG(ADNL_WARNING) << this << ": dropping OUT message [" << src_id << "->" << dst_id << "]: no out rules";
+    record_dropped(metrics::Direction::out, metrics::Reason::internal);
+    VLOG(adnl, WARNING) << this << ": dropping OUT message [" << src_id << "->" << dst_id << "]: no out rules";
     return;
   }
 
   auto &v = *out;
   auto &socket = udp_sockets_[v.socket_idx];
 
-  if (!v.is_proxy()) {
-    td::UdpMessage M;
-    M.address = dst_addr;
-    M.data = std::move(data);
-
-    CHECK(M.data.size() <= get_mtu());
-
-    td::actor::send_closure(socket.server, &td::UdpServer::send, std::move(M));
-  } else {
-    AdnlProxy::Packet p;
-    p.flags = 7;
-    p.ip = dst_addr.get_ipv4();
-    p.port = static_cast<td::uint16>(dst_addr.get_port());
-    p.data = std::move(data);
-    p.adnl_start_time = Adnl::adnl_start_time();
-    p.seqno = ++v.out_seqno;
-
-    auto enc = v.proxy->encrypt(std::move(p));
-
-    td::UdpMessage M;
-    M.address = v.proxy_addr;
-    M.data = std::move(enc);
-
-    td::actor::send_closure(socket.server, &td::UdpServer::send, std::move(M));
-  }
-}
-
-void AdnlNetworkManagerImpl::proxy_register(OutDesc &desc) {
-  auto data = create_serialize_tl_object<ton_api::adnl_proxyControlPacketRegister>(0, 0);
-  AdnlProxy::Packet p;
-  p.flags = 6 | (1 << 17);
-  p.ip = 0;
-  p.port = 0;
-  p.data = std::move(data);
-  p.adnl_start_time = Adnl::adnl_start_time();
-  p.seqno = ++desc.out_seqno;
-
-  auto enc = desc.proxy->encrypt(std::move(p));
-
   td::UdpMessage M;
-  M.address = desc.proxy_addr;
-  M.data = std::move(enc);
+  M.address = dst_addr;
+  M.data = std::move(data);
 
-  auto &socket = udp_sockets_[desc.socket_idx];
+  if (M.data.size() > get_mtu()) {
+    VLOG(adnl, ERROR) << this << ": dropping OUT message [" << src_id << "->" << dst_id
+                      << "]: too big: size=" << M.data.size() << " mtu=" << get_mtu();
+    return;
+  }
+
   td::actor::send_closure(socket.server, &td::UdpServer::send, std::move(M));
 }
 
-void AdnlNetworkManagerImpl::alarm() {
-  alarm_timestamp() = td::Timestamp::in(60.0);
-  for (auto &vec : out_desc_) {
-    for (auto &desc : vec.second) {
-      if (desc.is_proxy()) {
-        proxy_register(desc);
-      }
-    }
+td::actor::Task<> AdnlNetworkManagerImpl::collect(metrics::Context ctx) {
+  // Fold the socket-level counters (send/receive calls, kernel drops) into the wire tier as deltas
+  // against the last scrape. Sockets are only ever appended, so indexing by position is stable
+  // across the suspension.
+  std::vector<td::actor::StartedTask<td::UdpServerStats>> asks;
+  for (auto &socket : udp_sockets_) {
+    asks.push_back(td::actor::ask(socket.server.get(), &td::UdpServer::collect));
   }
+  auto stats = co_await td::actor::all_wrap(std::move(asks));
+  // Socket counters only grow, so an inversion means this ask completed out of order against a newer
+  // one. Such a snapshot is stale as a whole: folding nothing but keeping it as `reflected` would
+  // re-fold the difference against the newer one on the next scrape.
+  auto regressed = [](const td::UdpDirCounters &cur, const td::UdpDirCounters &prev) {
+    return cur.syscalls < prev.syscalls || cur.dropped < prev.dropped || cur.bytes < prev.bytes ||
+           cur.packets < prev.packets;
+  };
+  CO_TRY_BOOL(stats.size() <= udp_sockets_.size());
+  for (size_t i = 0; i < stats.size(); i++) {
+    if (stats[i].is_error()) {
+      continue;
+    }
+    const auto &cur = stats[i].ok();
+    auto &prev = udp_sockets_[i].reflected;
+    if (regressed(cur.in, prev.in) || regressed(cur.out, prev.out)) {
+      continue;
+    }
+    auto &in = metrics_.dir.at(metrics::Direction::in);
+    auto &out = metrics_.dir.at(metrics::Direction::out);
+    // The socket is the only honest source for what actually crossed it: it counts bytes/packets for
+    // the datagrams the kernel accepted, and a datagram it refuses is a drop, not wire traffic.
+    in.data.bytes.inc(cur.in.bytes - prev.in.bytes);
+    in.data.packets.inc(cur.in.packets - prev.in.packets);
+    out.data.bytes.inc(cur.out.bytes - prev.out.bytes);
+    out.data.packets.inc(cur.out.packets - prev.out.packets);
+    in.syscalls.inc(cur.in.syscalls - prev.in.syscalls);
+    out.syscalls.inc(cur.out.syscalls - prev.out.syscalls);
+    // Inbound loss is the kernel's receive queue overflowing; outbound loss is the kernel refusing
+    // a datagram we handed it (EMSGSIZE/EACCES/EPERM).
+    in.dropped.at(metrics::Reason::limited).inc(cur.in.dropped - prev.in.dropped);
+    out.dropped.at(metrics::Reason::internal).inc(cur.out.dropped - prev.out.dropped);
+    prev = cur;
+  }
+
+  metrics_.listening_sockets.set(udp_sockets_.size());
+  ctx.with_name("adnl").with_name("wire").collect(metrics_);
+  co_return {};
 }
 
 }  // namespace adnl

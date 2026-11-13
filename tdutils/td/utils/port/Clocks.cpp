@@ -16,12 +16,17 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "td/utils/port/Clocks.h"
-
 #include <chrono>
 #include <ctime>
 
+#include "td/utils/Time.h"
+#include "td/utils/port/Clocks.h"
+
 namespace td {
+int64 Clocks::monotonic_nano() {
+  auto duration = std::chrono::steady_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+}
 
 double Clocks::monotonic() {
   // TODO write system specific functions, because std::chrono::steady_clock is steady only under Windows
@@ -30,8 +35,7 @@ double Clocks::monotonic() {
 }
 
 double Clocks::system() {
-  auto duration = std::chrono::system_clock::now().time_since_epoch();
-  return static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()) * 1e-9;
+  return td::Time::system_now();
 }
 
 int Clocks::tz_offset() {

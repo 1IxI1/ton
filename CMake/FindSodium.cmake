@@ -37,12 +37,14 @@ if (NOT DEFINED SODIUM_USE_STATIC_LIBS)
   option(SODIUM_USE_STATIC_LIBS "enable to statically link against sodium" OFF)
 endif()
 if(NOT (SODIUM_USE_STATIC_LIBS EQUAL SODIUM_USE_STATIC_LIBS_LAST))
-  unset(sodium_LIBRARY CACHE)
-  unset(SODIUM_LIBRARY_DEBUG CACHE)
-  unset(SODIUM_LIBRARY_RELEASE CACHE)
-  unset(sodium_DLL_DEBUG CACHE)
-  unset(sodium_DLL_RELEASE CACHE)
-  set(SODIUM_USE_STATIC_LIBS_LAST ${SODIUM_USE_STATIC_LIBS} CACHE INTERNAL "internal change tracking variable")
+  if (NOT SODIUM_LIBRARY_RELEASE)
+    unset(sodium_LIBRARY CACHE)
+    unset(SODIUM_LIBRARY_DEBUG CACHE)
+    unset(SODIUM_LIBRARY_RELEASE CACHE)
+    unset(sodium_DLL_DEBUG CACHE)
+    unset(sodium_DLL_RELEASE CACHE)
+    set(SODIUM_USE_STATIC_LIBS_LAST ${SODIUM_USE_STATIC_LIBS} CACHE INTERNAL "internal change tracking variable")
+  endif()
 endif()
 
 
@@ -105,7 +107,7 @@ elseif (WIN32)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/arch.cpp" [=[
             #if defined _M_IX86
             #error ARCH_VALUE x86_32
-            #elif defined _M_X64
+            #elif defined _M_X64 || defined _M_AMD64
             #error ARCH_VALUE x86_64
             #endif
             #error ARCH_VALUE unknown
@@ -114,6 +116,16 @@ elseif (WIN32)
       OUTPUT_VARIABLE _COMPILATION_LOG
       )
     string(REGEX REPLACE ".*ARCH_VALUE ([a-zA-Z0-9_]+).*" "\\1" _TARGET_ARCH "${_COMPILATION_LOG}")
+
+    # Fall back to pointer-size based detection when compiler output format
+    # prevents ARCH_VALUE extraction (e.g. some clang-cl diagnostics modes).
+    if (_TARGET_ARCH STREQUAL "unknown")
+      if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_TARGET_ARCH "x86_64")
+      elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(_TARGET_ARCH "x86_32")
+      endif()
+    endif()
 
     # construct library path
     if (_TARGET_ARCH STREQUAL "x86_32")
@@ -125,10 +137,16 @@ elseif (WIN32)
     endif()
     string(APPEND _PLATFORM_PATH "/$$CONFIG$$")
 
+    message(STATUS "MSVC_VERSION ${MSVC_VERSION}")
     if (MSVC_VERSION LESS 1900)
       math(EXPR _VS_VERSION "${MSVC_VERSION} / 10 - 60")
     else()
-      math(EXPR _VS_VERSION "${MSVC_VERSION} / 10 - 50")
+      if (MSVC_VERSION EQUAL 1941)
+        math(EXPR _VS_VERSION "${MSVC_VERSION} / 10 - 51")
+      else()
+        math(EXPR _VS_VERSION "${MSVC_VERSION} / 10 - 50")
+      endif()
+
     endif()
     string(APPEND _PLATFORM_PATH "/v${_VS_VERSION}")
 

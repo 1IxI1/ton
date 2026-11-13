@@ -20,12 +20,10 @@
 
 #include <map>
 
-#include "td/actor/actor.h"
-#include "td/utils/BufferedUdp.h"
 #include "auto/tl/ton_api.h"
-#include "keys/encryptor.h"
-#include "adnl-peer-table.h"
 #include "dht/dht.h"
+#include "td/actor/coro_utils.h"
+#include "td/utils/BufferedUdp.h"
 
 #include "adnl-peer-table.h"
 #include "utils.hpp"
@@ -38,9 +36,12 @@ class AdnlLocalId : public td::actor::Actor {
  public:
   AdnlNodeIdFull get_id() const;
   AdnlNodeIdShort get_short_id() const;
-  AdnlAddressList get_addr_list() const;
   void get_addr_list_async(td::Promise<AdnlAddressList> P) {
-    P.set_value(get_addr_list());
+    if (addr_list_.empty()) {
+      P.set_error(td::Status::Error(ErrorCode::notready, "address list is empty"));
+      return;
+    }
+    P.set_result(addr_list_);
   }
 
   void update_dht_node(td::actor::ActorId<dht::Dht> dht_node) {
@@ -49,12 +50,11 @@ class AdnlLocalId : public td::actor::Actor {
     publish_address_list();
   }
 
-  void decrypt(td::BufferSlice data, td::Promise<AdnlPacket> promise);
-  void decrypt_continue(td::BufferSlice data, td::Promise<AdnlPacket> promise);
   void decrypt_message(td::BufferSlice data, td::Promise<td::BufferSlice> promise);
   void deliver(AdnlNodeIdShort src, td::BufferSlice data);
   void deliver_query(AdnlNodeIdShort src, td::BufferSlice data, td::Promise<td::BufferSlice> promise);
   void receive(td::IPAddress addr, td::BufferSlice data);
+  td::actor::Task<> receive_coro(td::IPAddress addr, td::BufferSlice data);
 
   void subscribe(std::string prefix, std::unique_ptr<AdnlPeerTable::Callback> callback);
   void unsubscribe(std::string prefix);
@@ -76,6 +76,8 @@ class AdnlLocalId : public td::actor::Actor {
 
   void update_packet(AdnlPacket packet, bool update_id, bool sign, td::int32 update_addr_list_if,
                      td::int32 update_priority_addr_list_if, td::Promise<AdnlPacket> promise);
+
+  void get_stats(bool all, td::Promise<tl_object_ptr<ton_api::adnl_stats_localId>> promise);
 
   td::uint32 get_mode() {
     return mode_;
@@ -101,7 +103,41 @@ class AdnlLocalId : public td::actor::Actor {
 
   td::uint32 mode_;
 
+  struct InboundRateLimiter {
+    RateLimiter rate_limiter = RateLimiter(75, 0.33);
+    td::uint64 currently_decrypting_packets = 0;
+    std::set<AdnlNodeIdShort> recent_inbound_peers;
+  };
+  std::map<td::IPAddress, InboundRateLimiter> inbound_rate_limiter_;
+  struct PacketStats {
+    double ts_start = 0.0, ts_end = 0.0;
+
+    struct Counter {
+      td::uint64 packets = 0;
+      double last_packet_ts = 0.0;
+
+      void inc() {
+        ++packets;
+        last_packet_ts = td::Clocks::system();
+      }
+    };
+    std::map<td::IPAddress, Counter> decrypted_packets;
+    std::map<td::IPAddress, Counter> dropped_packets;
+
+    tl_object_ptr<ton_api::adnl_stats_localIdPackets> tl(bool all = true) const;
+  } packet_stats_cur_, packet_stats_prev_;
+  void add_decrypted_packet_stats(td::IPAddress addr);
+  void add_dropped_packet_stats(td::IPAddress addr);
+  void prepare_packet_stats();
+
   void publish_address_list();
+
+  td::Timestamp publish_address_list_at_ = td::Timestamp::now();
+  td::Timestamp cleanup_rate_limiter_at_ = td::Timestamp::never();
+  td::Timestamp cleanup_recent_inbound_peers_at_ = td::Timestamp::never();
+
+  static constexpr size_t UNIQUE_PEERS_PER_IP_LIMIT = 60;
+  static constexpr double UNIQUE_PEERS_PER_IP_WINDOW = 60.0;
 };
 
 inline td::StringBuilder &operator<<(td::StringBuilder &sb, const AdnlLocalId::PrintId &id) {

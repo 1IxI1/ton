@@ -18,15 +18,15 @@
 */
 #pragma once
 
-#include "td/actor/actor.h"
+#include <bitset>
 
+#include "metrics/collectors.h"
 #include "td/actor/PromiseFuture.h"
+#include "td/actor/actor.h"
+#include "td/actor/coro_task.h"
 #include "td/utils/port/IPAddress.h"
 
 #include "adnl-node-id.hpp"
-#include "adnl-proxy-types.h"
-
-#include <bitset>
 
 namespace td {
 class UdpServer;
@@ -64,15 +64,13 @@ class AdnlNetworkManager : public td::actor::Actor {
     //virtual void receive_packet(td::IPAddress addr, ConnHandle conn_handle, td::BufferSlice data) = 0;
     virtual void receive_packet(td::IPAddress addr, AdnlCategoryMask cat_mask, td::BufferSlice data) = 0;
   };
-  static td::actor::ActorOwn<AdnlNetworkManager> create(td::uint16 out_port);
+  static td::actor::ActorOwn<AdnlNetworkManager> create();
 
   virtual ~AdnlNetworkManager() = default;
 
   virtual void install_callback(std::unique_ptr<Callback> callback) = 0;
 
   virtual void add_self_addr(td::IPAddress addr, AdnlCategoryMask cat_mask, td::uint32 priority) = 0;
-  virtual void add_proxy_addr(td::IPAddress addr, td::uint16 local_port, std::shared_ptr<AdnlProxy> proxy,
-                              AdnlCategoryMask cat_mask, td::uint32 priority) = 0;
   virtual void send_udp_packet(AdnlNodeIdShort src_id, AdnlNodeIdShort dst_id, td::IPAddress dst_addr,
                                td::uint32 priority, td::BufferSlice data) = 0;
   //virtual void send_tcp_packet(AdnlNodeIdShort src_id, AdnlNodeIdShort dst_id, td::IPAddress dst_addr,
@@ -80,6 +78,10 @@ class AdnlNetworkManager : public td::actor::Actor {
   //virtual void send_answer_packet(AdnlNodeIdShort src_id, AdnlNodeIdShort dst_id, td::IPAddress dst_addr,
   //                             ConnHandle conn_handle, td::uint32 priority, td::BufferSlice data) = 0;
   virtual void set_local_id_category(AdnlNodeIdShort id, td::uint8 cat) = 0;
+
+  virtual td::actor::Task<> collect(metrics::Context ctx) {
+    co_return {};
+  }
 
   static constexpr td::uint32 get_mtu() {
     return 1440;

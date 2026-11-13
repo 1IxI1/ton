@@ -1,6 +1,17 @@
 name: Emscripten TON build (wasm)
 
-on: [push,workflow_dispatch,workflow_call]
+on:
+  pull_request:
+    branches: [master, testnet]
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [master, testnet]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -8,23 +19,41 @@ jobs:
 
     steps:
     - name: Check out repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         submodules: 'recursive'
 
     - name: Install system libraries
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential git openssl cmake ninja-build zlib1g-dev libssl-dev libsecp256k1-dev libmicrohttpd-dev libsodium-dev
+        sudo apt-get install -y build-essential git cmake ninja-build libjemalloc-dev
+        mkdir -p 3pp_emscripten
+
+    - name: Install clang-22
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 22 clang
+
+    - name: Cache 3pp Emscripten
+      id: cache-3pp-emscripten
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: 3pp_emscripten
+        key: ${{ runner.os }}-${{ runner.arch }}-ubuntu-22.04-3pp_em-${{ hashFiles('**/assembly/wasm/fift-func-wasm-build-ubuntu.sh') }}
 
     - name: Build TON WASM artifacts
       run: |
-        cd assembly/wasm
+        git submodule sync --recursive
+        git submodule update
+        cp assembly/wasm/fift-func-wasm-build-ubuntu.sh .
         chmod +x fift-func-wasm-build-ubuntu.sh
         ./fift-func-wasm-build-ubuntu.sh -a
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@master
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
       with:
-        name: ton-wasm-binaries
+        name: ton-wasm
         path: artifacts
+        retention-days: 14
+        if-no-files-found: error

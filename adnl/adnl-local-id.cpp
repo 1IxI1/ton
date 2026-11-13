@@ -16,16 +16,22 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "td/utils/crypto.h"
+#include "keys/encryptor.h"
+#include "metrics/tl-traffic-bucket.h"
 #include "td/utils/Random.h"
+#include "td/utils/Timer.h"
 
 #include "adnl-local-id.h"
-#include "keys/encryptor.h"
 #include "utils.hpp"
 
 namespace ton {
 
 namespace adnl {
+
+static td::IPAddress remove_port(td::IPAddress addr) {
+  addr.set_port(0);
+  return addr;
+}
 
 AdnlNodeIdFull AdnlLocalId::get_id() const {
   return id_;
@@ -35,24 +41,55 @@ AdnlNodeIdShort AdnlLocalId::get_short_id() const {
   return short_id_;
 }
 
-AdnlAddressList AdnlLocalId::get_addr_list() const {
-  CHECK(!addr_list_.empty());
-  return addr_list_;
+void AdnlLocalId::receive(td::IPAddress addr, td::BufferSlice data) {
+  [](AdnlLocalId *self, td::IPAddress addr, td::BufferSlice data) -> td::actor::Task<> {
+    auto R = co_await self->receive_coro(addr, std::move(data)).wrap();
+    if (R.is_error()) {
+      VLOG(adnl, INFO) << self << ": dropping IN message from " << addr << ": " << R.move_as_error();
+    }
+    co_return {};
+  }(this, std::move(addr), std::move(data))
+                                                                         .start()
+                                                                         .detach();
 }
 
-void AdnlLocalId::receive(td::IPAddress addr, td::BufferSlice data) {
-  auto P = td::PromiseCreator::lambda(
-      [peer_table = peer_table_, dst = short_id_, addr, id = print_id()](td::Result<AdnlPacket> R) {
-        if (R.is_error()) {
-          VLOG(ADNL_WARNING) << id << ": dropping IN message: cannot decrypt: " << R.move_as_error();
-        } else {
-          auto packet = R.move_as_ok();
-          packet.set_remote_addr(addr);
-          td::actor::send_closure(peer_table, &AdnlPeerTable::receive_decrypted_packet, dst, std::move(packet));
-        }
-      });
+td::actor::Task<> AdnlLocalId::receive_coro(td::IPAddress addr, td::BufferSlice data) {
+  InboundRateLimiter &rate_limiter = inbound_rate_limiter_[remove_port(addr)];
+  if (!cleanup_rate_limiter_at_) {
+    alarm_timestamp().relax(cleanup_rate_limiter_at_ = td::Timestamp::in(1.0));
+  }
+  if (!rate_limiter.rate_limiter.take()) {
+    add_dropped_packet_stats(addr);
+    co_return td::Status::Error("rate limit exceeded");
+  }
+  ++rate_limiter.currently_decrypting_packets;
 
-  decrypt(std::move(data), std::move(P));
+  size_t data_size = data.size();
+  auto r_decrypted_data =
+      co_await td::actor::ask(keyring_, &keyring::Keyring::decrypt_message, short_id_.pubkey_hash(), std::move(data))
+          .wrap();
+
+  // rate_limiter cannot be deleted from map while currently_decrypting_packets > 0
+  --rate_limiter.currently_decrypting_packets;
+  add_decrypted_packet_stats(addr);
+
+  auto tl = co_await fetch_tl_object<ton_api::adnl_packetContents>(co_await std::move(r_decrypted_data), true);
+  auto packet = co_await AdnlPacket::create(std::move(tl));
+  packet.set_remote_addr(addr);
+  if (rate_limiter.recent_inbound_peers.size() >= UNIQUE_PEERS_PER_IP_LIMIT) {
+    if (!rate_limiter.recent_inbound_peers.contains(packet.from_short())) {
+      co_return td::Status::Error("too many unique peer ids from a single ip");
+    }
+  } else {
+    rate_limiter.recent_inbound_peers.insert(packet.from_short());
+    if (!cleanup_recent_inbound_peers_at_) {
+      alarm_timestamp().relax(cleanup_recent_inbound_peers_at_ = td::Timestamp::in(UNIQUE_PEERS_PER_IP_WINDOW));
+    }
+  }
+
+  td::actor::send_closure(peer_table_, &AdnlPeerTable::receive_decrypted_packet, short_id_, std::move(packet),
+                          data_size);
+  co_return {};
 }
 
 void AdnlLocalId::deliver(AdnlNodeIdShort src, td::BufferSlice data) {
@@ -64,12 +101,21 @@ void AdnlLocalId::deliver(AdnlNodeIdShort src, td::BufferSlice data) {
       return;
     }
   }
-  VLOG(ADNL_INFO) << this << ": dropping IN message from " << src
-                  << ": no callbacks for custom message. firstint=" << td::TlParser(s.as_slice()).fetch_int();
+  VLOG(adnl, INFO) << this << ": dropping IN message from " << src
+                   << ": no callbacks for custom message. firstint=" << td::TlParser(s.as_slice()).fetch_int();
 }
 
 void AdnlLocalId::deliver_query(AdnlNodeIdShort src, td::BufferSlice data, td::Promise<td::BufferSlice> promise) {
   auto s = std::move(data);
+  // Every transport (peer pairs, RLDP2, QUIC, the ext server) funnels its queries through here, so
+  // this is the one place that times dispatch-to-answer. A dropped promise still runs the lambda
+  // ("Lost promise"), so an abandoned query is recorded as failed instead of vanishing.
+  // The answer may complete on any thread, so the recording happens on the peer table's own thread.
+  promise = [timer = td::Timer(), magic = metrics::resolve_tl_magic(s.as_slice()), src, peer_table = peer_table_,
+             promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+    td::actor::send_closure(peer_table, &AdnlPeerTable::record_query_duration, src, magic, timer.elapsed(), R.is_ok());
+    promise.set_result(std::move(R));
+  };
   for (auto &cb : cb_) {
     auto f = cb.first;
     if (f.length() <= s.length() && s.as_slice().substr(0, f.length()) == f) {
@@ -77,8 +123,8 @@ void AdnlLocalId::deliver_query(AdnlNodeIdShort src, td::BufferSlice data, td::P
       return;
     }
   }
-  VLOG(ADNL_INFO) << this << ": dropping IN message from " << src
-                  << ": no callbacks for custom query. firstint=" << td::TlParser(s.as_slice()).fetch_int();
+  VLOG(adnl, INFO) << this << ": dropping IN message from " << src
+                   << ": no callbacks for custom query. firstint=" << td::TlParser(s.as_slice()).fetch_int();
   promise.set_error(td::Status::Error(ErrorCode::warning, PSTRING() << "dropping IN message from " << src
                                                                     << ": no callbacks for custom query. firstint="
                                                                     << td::TlParser(s.as_slice()).fetch_int()));
@@ -89,9 +135,9 @@ void AdnlLocalId::subscribe(std::string prefix, std::unique_ptr<AdnlPeerTable::C
   for (auto &cb : cb_) {
     auto G = td::Slice(cb.first);
     if (S.size() < G.size()) {
-      LOG_CHECK(G.substr(0, S.size()) != S) << this << ": duplicate subscribe prefix";
+      LOG_CHECK(G.substr(0, S.size()) != S) << this << ": duplicate subscribe prefix " << td::buffer_to_hex(prefix);
     } else {
-      LOG_CHECK(S.substr(0, G.size()) != G) << this << ": duplicate subscribe prefix";
+      LOG_CHECK(S.substr(0, G.size()) != G) << this << ": duplicate subscribe prefix " << td::buffer_to_hex(prefix);
     }
   }
   cb_.emplace_back(prefix, std::move(callback));
@@ -107,7 +153,7 @@ void AdnlLocalId::unsubscribe(std::string prefix) {
       it++;
     }
   }
-  LOG_CHECK(deleted) << this << ": cannot unsubscribe: prefix not found";
+  LOG_CHECK(deleted) << this << ": cannot unsubscribe: prefix " << td::buffer_to_hex(prefix) << " not found";
 }
 
 void AdnlLocalId::update_address_list(AdnlAddressList addr_list) {
@@ -115,14 +161,14 @@ void AdnlLocalId::update_address_list(AdnlAddressList addr_list) {
   addr_list_.set_reinit_date(Adnl::adnl_start_time());
   addr_list_.set_version(static_cast<td::int32>(td::Clocks::system()));
 
-  VLOG(ADNL_INFO) << this << ": updated addr list. New version set to " << addr_list_.version();
+  VLOG(adnl, INFO) << this << ": updated addr list. New version set to " << addr_list_.version();
 
   publish_address_list();
 }
 
 void AdnlLocalId::publish_address_list() {
   if (dht_node_.empty() || addr_list_.empty() || (addr_list_.size() == 0 && !addr_list_.has_reverse())) {
-    VLOG(ADNL_NOTICE) << this << ": skipping public addr list, because localid (or dht node) not fully initialized";
+    VLOG(adnl, INFO) << this << ": skipping public addr list, because localid (or dht node) not fully initialized";
     return;
   }
 
@@ -137,12 +183,15 @@ void AdnlLocalId::publish_address_list() {
                                        dht_key_description = std::move(dht_key_description),
                                        print_id = print_id()](td::Result<td::BufferSlice> R) mutable {
     if (R.is_error()) {
-      LOG(ERROR) << print_id << ": cannot sign: " << R.move_as_error();
+      VLOG(adnl, ERROR) << print_id << ": cannot sign: " << R.move_as_error();
       return;
     }
 
     dht_key_description.update_signature(R.move_as_ok());
-    dht_key_description.check().ensure();
+    if (auto S = dht_key_description.check(); S.is_error()) {
+      VLOG(adnl, ERROR) << print_id << ": dht key: " << S;
+      return;
+    }
 
     auto ttl = static_cast<td::uint32>(td::Clocks::system() + 3600);
     dht::DhtValue dht_value{std::move(dht_key_description), serialize_tl_object(addr_list, true), ttl,
@@ -153,17 +202,20 @@ void AdnlLocalId::publish_address_list() {
     auto Q = td::PromiseCreator::lambda(
         [dht_node, dht_value = std::move(dht_value), print_id](td::Result<td::BufferSlice> R) mutable {
           if (R.is_error()) {
-            LOG(ERROR) << print_id << ": cannot sign: " << R.move_as_error();
+            VLOG(adnl, ERROR) << print_id << ": cannot sign: " << R.move_as_error();
             return;
           }
           dht_value.update_signature(R.move_as_ok());
-          dht_value.check().ensure();
+          if (auto S = dht_value.check(); S.is_error()) {
+            VLOG(adnl, ERROR) << print_id << ": dht value: " << S;
+            return;
+          }
 
           auto E = td::PromiseCreator::lambda([print_id](td::Result<td::Unit> R) {
             if (R.is_error()) {
-              VLOG(ADNL_NOTICE) << print_id << ": failed to update addr list in DHT: " << R.move_as_error();
+              VLOG(adnl, INFO) << print_id << ": failed to update addr list in DHT: " << R.move_as_error();
             } else {
-              VLOG(ADNL_INFO) << print_id << ": updated dht addr list";
+              VLOG(adnl, INFO) << print_id << ": updated dht addr list";
             }
           });
 
@@ -180,9 +232,9 @@ void AdnlLocalId::publish_address_list() {
     td::actor::send_closure(
         dht_node_, &dht::Dht::register_reverse_connection, id_, [print_id = print_id()](td::Result<td::Unit> R) {
           if (R.is_error()) {
-            VLOG(ADNL_NOTICE) << print_id << ": failed to register reverse connection in DHT: " << R.move_as_error();
+            VLOG(adnl, INFO) << print_id << ": failed to register reverse connection in DHT: " << R.move_as_error();
           } else {
-            VLOG(ADNL_INFO) << print_id << ": registered reverse connection";
+            VLOG(adnl, INFO) << print_id << ": registered reverse connection";
           }
         });
   }
@@ -203,7 +255,7 @@ AdnlLocalId::AdnlLocalId(AdnlNodeIdFull id, AdnlAddressList addr_list, td::uint3
     addr_list_.set_version(static_cast<td::int32>(td::Clocks::system()));
   }
 
-  VLOG(ADNL_INFO) << this << ": created local id " << short_id_;
+  VLOG(adnl, INFO) << this << ": created local id " << short_id_;
 }
 
 void AdnlLocalId::get_self_node(td::Promise<AdnlNode> promise) {
@@ -214,34 +266,6 @@ void AdnlLocalId::get_self_node(td::Promise<AdnlNode> promise) {
 void AdnlLocalId::decrypt_message(td::BufferSlice data, td::Promise<td::BufferSlice> promise) {
   td::actor::send_closure(keyring_, &keyring::Keyring::decrypt_message, short_id_.pubkey_hash(), std::move(data),
                           std::move(promise));
-}
-
-void AdnlLocalId::decrypt(td::BufferSlice data, td::Promise<AdnlPacket> promise) {
-  auto P = td::PromiseCreator::lambda(
-      [SelfId = actor_id(this), p = std::move(promise)](td::Result<td::BufferSlice> res) mutable {
-        if (res.is_error()) {
-          p.set_error(res.move_as_error());
-        } else {
-          td::actor::send_closure_later(SelfId, &AdnlLocalId::decrypt_continue, res.move_as_ok(), std::move(p));
-        }
-      });
-  td::actor::send_closure(keyring_, &keyring::Keyring::decrypt_message, short_id_.pubkey_hash(), std::move(data),
-                          std::move(P));
-}
-
-void AdnlLocalId::decrypt_continue(td::BufferSlice data, td::Promise<AdnlPacket> promise) {
-  auto R = fetch_tl_object<ton_api::adnl_packetContents>(std::move(data), true);
-  if (R.is_error()) {
-    promise.set_error(R.move_as_error());
-    return;
-  }
-
-  auto packetR = AdnlPacket::create(R.move_as_ok());
-  if (packetR.is_error()) {
-    promise.set_error(packetR.move_as_error());
-    return;
-  }
-  promise.set_value(packetR.move_as_ok());
 }
 
 void AdnlLocalId::sign_async(td::BufferSlice data, td::Promise<td::BufferSlice> promise) {
@@ -256,13 +280,40 @@ void AdnlLocalId::sign_batch_async(std::vector<td::BufferSlice> data,
 }
 
 void AdnlLocalId::start_up() {
-  publish_address_list();
-  alarm_timestamp() = td::Timestamp::in(AdnlPeerTable::republish_addr_list_timeout() * td::Random::fast(1.0, 2.0));
+  alarm();
 }
 
 void AdnlLocalId::alarm() {
-  publish_address_list();
-  alarm_timestamp() = td::Timestamp::in(AdnlPeerTable::republish_addr_list_timeout() * td::Random::fast(1.0, 2.0));
+  if (publish_address_list_at_.is_in_past()) {
+    publish_address_list();
+    publish_address_list_at_ =
+        td::Timestamp::in(AdnlPeerTable::republish_addr_list_timeout() * td::Random::fast(1.0, 2.0));
+  }
+  alarm_timestamp().relax(publish_address_list_at_);
+  if (cleanup_recent_inbound_peers_at_ && cleanup_recent_inbound_peers_at_.is_in_past()) {
+    cleanup_recent_inbound_peers_at_ = td::Timestamp::never();
+    for (auto &[_, limiter] : inbound_rate_limiter_) {
+      limiter.recent_inbound_peers.clear();
+    }
+  }
+  if ((cleanup_rate_limiter_at_ && cleanup_rate_limiter_at_.is_in_past())) {
+    for (auto it = inbound_rate_limiter_.begin(); it != inbound_rate_limiter_.end();) {
+      auto &limiter = it->second;
+      if (limiter.currently_decrypting_packets == 0 && limiter.rate_limiter.is_full() &&
+          limiter.recent_inbound_peers.empty()) {
+        it = inbound_rate_limiter_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (inbound_rate_limiter_.empty()) {
+      cleanup_rate_limiter_at_ = td::Timestamp::never();
+    } else {
+      cleanup_rate_limiter_at_ = td::Timestamp::in(1.0);
+    }
+  }
+  alarm_timestamp().relax(cleanup_rate_limiter_at_);
+  alarm_timestamp().relax(cleanup_recent_inbound_peers_at_);
 }
 
 void AdnlLocalId::update_packet(AdnlPacket packet, bool update_id, bool sign, td::int32 update_addr_list_if,
@@ -290,6 +341,66 @@ void AdnlLocalId::update_packet(AdnlPacket packet, bool update_id, bool sign, td
     td::actor::send_closure(keyring_, &keyring::Keyring::sign_message, short_id_.pubkey_hash(), std::move(to_sign),
                             std::move(P));
   }
+}
+
+void AdnlLocalId::get_stats(bool all, td::Promise<tl_object_ptr<ton_api::adnl_stats_localId>> promise) {
+  auto stats = create_tl_object<ton_api::adnl_stats_localId>();
+  stats->short_id_ = short_id_.bits256_value();
+  for (auto &[ip, x] : inbound_rate_limiter_) {
+    if (x.currently_decrypting_packets != 0) {
+      stats->current_decrypt_.push_back(create_tl_object<ton_api::adnl_stats_ipPackets>(
+          ip.is_valid() ? ip.get_ip_str().str() : "", x.currently_decrypting_packets));
+    }
+  }
+  prepare_packet_stats();
+  stats->packets_recent_ = packet_stats_prev_.tl();
+  promise.set_result(std::move(stats));
+}
+
+void AdnlLocalId::add_decrypted_packet_stats(td::IPAddress addr) {
+  prepare_packet_stats();
+  packet_stats_cur_.decrypted_packets[remove_port(addr)].inc();
+}
+
+void AdnlLocalId::add_dropped_packet_stats(td::IPAddress addr) {
+  prepare_packet_stats();
+  packet_stats_cur_.dropped_packets[remove_port(addr)].inc();
+}
+
+void AdnlLocalId::prepare_packet_stats() {
+  double now = td::Clocks::system();
+  if (now >= packet_stats_cur_.ts_end) {
+    packet_stats_prev_ = std::move(packet_stats_cur_);
+    packet_stats_cur_ = {};
+    auto now_int = (int)td::Clocks::system();
+    packet_stats_cur_.ts_start = (double)(now_int / 60 * 60);
+    packet_stats_cur_.ts_end = packet_stats_cur_.ts_start + 60.0;
+    if (packet_stats_prev_.ts_end < now - 60.0) {
+      packet_stats_prev_ = {};
+      packet_stats_prev_.ts_end = packet_stats_cur_.ts_start;
+      packet_stats_prev_.ts_start = packet_stats_prev_.ts_end - 60.0;
+    }
+  }
+}
+
+tl_object_ptr<ton_api::adnl_stats_localIdPackets> AdnlLocalId::PacketStats::tl(bool all) const {
+  double threshold = all ? -1.0 : td::Clocks::system() - 600.0;
+  auto obj = create_tl_object<ton_api::adnl_stats_localIdPackets>();
+  obj->ts_start_ = ts_start;
+  obj->ts_end_ = ts_end;
+  for (const auto &[ip, packets] : decrypted_packets) {
+    if (packets.last_packet_ts >= threshold) {
+      obj->decrypted_packets_.push_back(create_tl_object<ton_api::adnl_stats_ipPackets>(
+          ip.is_valid() ? PSTRING() << ip.get_ip_str() << ":" << ip.get_port() : "", packets.packets));
+    }
+  }
+  for (const auto &[ip, packets] : dropped_packets) {
+    if (packets.last_packet_ts >= threshold) {
+      obj->dropped_packets_.push_back(create_tl_object<ton_api::adnl_stats_ipPackets>(
+          ip.is_valid() ? PSTRING() << ip.get_ip_str() << ":" << ip.get_port() : "", packets.packets));
+    }
+  }
+  return obj;
 }
 
 }  // namespace adnl

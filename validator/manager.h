@@ -17,9 +17,9 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
-#include "validator/validator.h"
 #include "adnl/adnl.h"
-#include "rldp/rldp.h"
+#include "quic/quic-sender.h"
+#include "validator/validator.h"
 
 namespace ton {
 
@@ -31,7 +31,7 @@ class ValidatorManagerFactory {
                                                                std::string db_root,
                                                                td::actor::ActorId<keyring::Keyring> keyring,
                                                                td::actor::ActorId<adnl::Adnl> adnl,
-                                                               td::actor::ActorId<rldp::Rldp> rldp,
+                                                               td::actor::ActorId<quic::QuicSender> quic,
                                                                td::actor::ActorId<overlay::Overlays> overlays);
 };
 

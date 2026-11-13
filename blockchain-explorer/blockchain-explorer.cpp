@@ -1,4 +1,4 @@
-/* 
+/*
     This file is part of TON Blockchain source code.
 
     TON Blockchain is free software; you can redistribute it and/or
@@ -13,56 +13,53 @@
 
     You should have received a copy of the GNU General Public License
 
-    In addition, as a special exception, the copyright holders give permission 
-    to link the code of portions of this program with the OpenSSL library. 
-    You must obey the GNU General Public License in all respects for all 
-    of the code used other than OpenSSL. If you modify file(s) with this 
-    exception, you may extend this exception to your version of the file(s), 
-    but you are not obligated to do so. If you do not wish to do so, delete this 
-    exception statement from your version. If you delete this exception statement 
+    In addition, as a special exception, the copyright holders give permission
+    to link the code of portions of this program with the OpenSSL library.
+    You must obey the GNU General Public License in all respects for all
+    of the code used other than OpenSSL. If you modify file(s) with this
+    exception, you may extend this exception to your version of the file(s),
+    but you are not obligated to do so. If you do not wish to do so, delete this
+    exception statement from your version. If you delete this exception statement
     from all source files in the program, then also delete it here.
     along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <microhttpd.h>
+
 #include "adnl/adnl-ext-client.h"
 #include "adnl/utils.hpp"
+#include "auto/tl/lite_api.h"
 #include "auto/tl/ton_api_json.h"
-#include "td/utils/OptionParser.h"
-#include "td/utils/Time.h"
-#include "td/utils/filesystem.h"
-#include "td/utils/format.h"
-#include "td/utils/Random.h"
-#include "td/utils/crypto.h"
-#include "td/utils/port/signals.h"
-#include "td/utils/port/user.h"
-#include "td/utils/port/FileFd.h"
-#include "ton/ton-tl.hpp"
+#include "block/block-auto.h"
 #include "block/block-db.h"
 #include "block/block.h"
-#include "block/block-auto.h"
-#include "vm/boc.h"
-#include "vm/cellops.h"
-#include "vm/cells/MerkleProof.h"
 #include "block/mc-config.h"
-#include "blockchain-explorer.hpp"
-#include "blockchain-explorer-http.hpp"
-#include "blockchain-explorer-query.hpp"
-
+#include "lite-client/ext-client.h"
+#include "td/utils/OptionParser.h"
+#include "td/utils/Random.h"
+#include "td/utils/Time.h"
+#include "td/utils/crypto.h"
+#include "td/utils/filesystem.h"
+#include "td/utils/format.h"
+#include "td/utils/port/FileFd.h"
+#include "td/utils/port/signals.h"
+#include "td/utils/port/user.h"
+#include "tl-utils/lite-utils.hpp"
+#include "ton/lite-tl.hpp"
+#include "ton/ton-tl.hpp"
 #include "vm/boc.h"
 #include "vm/cellops.h"
 #include "vm/cells/MerkleProof.h"
 #include "vm/vm.h"
 
-#include "auto/tl/lite_api.h"
-#include "ton/lite-tl.hpp"
-#include "tl-utils/lite-utils.hpp"
-
-#include <microhttpd.h>
+#include "blockchain-explorer-http.hpp"
+#include "blockchain-explorer-query.hpp"
+#include "blockchain-explorer.hpp"
 
 #if TD_DARWIN || TD_LINUX
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 #endif
 #include <iostream>
 #include <sstream>
@@ -103,31 +100,32 @@ class HttpQueryRunner {
         Self->finish(nullptr);
       }
     });
-    scheduler_ptr->run_in_context_external([&]() { func(std::move(P)); });
+    scheduler_ptr->run_in_context([&]() { func(std::move(P)); });
   }
   void finish(MHD_Response* response) {
     std::unique_lock<std::mutex> lock(mutex_);
     response_ = response;
-    cond.notify_all();
+    done_ = true;
+    cond_.notify_all();
   }
   MHD_Response* wait() {
     std::unique_lock<std::mutex> lock(mutex_);
-    cond.wait(lock, [&]() { return response_ != nullptr; });
+    cond_.wait(lock, [&]() { return done_; });
     return response_;
   }
 
  private:
-  std::function<void(td::Promise<MHD_Response*>)> func_;
   MHD_Response* response_ = nullptr;
+  bool done_ = false;
   std::mutex mutex_;
-  std::condition_variable cond;
+  std::condition_variable cond_;
 };
 
 class CoreActor : public CoreActorInterface {
  private:
   std::string global_config_ = "ton-global.config";
 
-  std::vector<td::actor::ActorOwn<ton::adnl::AdnlExtClient>> clients_;
+  td::actor::ActorOwn<liteclient::ExtClient> client_;
 
   td::uint32 http_port_ = 80;
   MHD_Daemon* daemon_ = nullptr;
@@ -137,35 +135,29 @@ class CoreActor : public CoreActorInterface {
 
   bool hide_ips_ = false;
 
-  std::unique_ptr<ton::adnl::AdnlExtClient::Callback> make_callback(td::uint32 idx) {
-    class Callback : public ton::adnl::AdnlExtClient::Callback {
+  td::unique_ptr<liteclient::ExtClient::Callback> make_callback() {
+    class Callback : public liteclient::ExtClient::Callback {
      public:
-      void on_ready() override {
-        td::actor::send_closure(id_, &CoreActor::conn_ready, idx_);
-      }
-      void on_stop_ready() override {
-        td::actor::send_closure(id_, &CoreActor::conn_closed, idx_);
-      }
-      Callback(td::actor::ActorId<CoreActor> id, td::uint32 idx) : id_(std::move(id)), idx_(idx) {
+      Callback(td::actor::ActorId<CoreActor> id) : id_(std::move(id)) {
       }
 
      private:
       td::actor::ActorId<CoreActor> id_;
-      td::uint32 idx_;
     };
 
-    return std::make_unique<Callback>(actor_id(this), idx);
+    return td::make_unique<Callback>(actor_id(this));
   }
 
   std::shared_ptr<RemoteNodeStatus> new_result_;
   td::int32 attempt_ = 0;
   td::int32 waiting_ = 0;
 
-  std::vector<bool> ready_;
+  size_t n_servers_ = 0;
 
   void run_queries();
-  void got_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> data);
-  void send_query(td::uint32 idx);
+  void got_servers_ready(td::int32 attempt, std::vector<bool> ready);
+  void send_ping(td::uint32 idx);
+  void got_ping_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> data);
 
   void add_result() {
     if (new_result_) {
@@ -192,16 +184,10 @@ class CoreActor : public CoreActorInterface {
   std::mutex queue_mutex_;
   std::mutex res_mutex_;
   std::map<td::int32, std::shared_ptr<RemoteNodeStatus>> results_;
-  std::vector<td::IPAddress> addrs_;
+  std::vector<std::string> addrs_;
   static CoreActor* instance_;
   td::actor::ActorId<CoreActor> self_id_;
 
-  void conn_ready(td::uint32 idx) {
-    ready_.at(idx) = true;
-  }
-  void conn_closed(td::uint32 idx) {
-    ready_.at(idx) = false;
-  }
   void set_global_config(std::string str) {
     global_config_ = str;
   }
@@ -226,15 +212,12 @@ class CoreActor : public CoreActorInterface {
     hide_ips_ = value;
   }
 
-  void send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promise<td::BufferSlice> promise);
-  void send_lite_query(td::BufferSlice data, td::Promise<td::BufferSlice> promise) override {
-    return send_lite_query(0, std::move(data), std::move(promise));
-  }
+  void send_lite_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) override;
   void get_last_result(td::Promise<std::shared_ptr<RemoteNodeStatus>> promise) override {
   }
   void get_results(td::uint32 max, td::Promise<RemoteNodeStatusList> promise) override {
     RemoteNodeStatusList r;
-    r.ips = hide_ips_ ? std::vector<td::IPAddress>{addrs_.size()} : addrs_;
+    r.addrs = hide_ips_ ? std::vector<std::string>{addrs_.size()} : addrs_;
     auto it = results_.rbegin();
     while (it != results_.rend() && r.results.size() < max) {
       r.results.push_back(it->second);
@@ -279,8 +262,8 @@ class CoreActor : public CoreActorInterface {
       MHD_destroy_post_processor(postprocessor);
     }
     static MHD_RESULT iterate_post(void* coninfo_cls, enum MHD_ValueKind kind, const char* key, const char* filename,
-                            const char* content_type, const char* transfer_encoding, const char* data, uint64_t off,
-                            size_t size) {
+                                   const char* content_type, const char* transfer_encoding, const char* data,
+                                   uint64_t off, size_t size) {
       auto ptr = static_cast<HttpRequestExtra*>(coninfo_cls);
       ptr->total_size += strlen(key) + size;
       if (ptr->total_size > MAX_POST_SIZE) {
@@ -306,8 +289,9 @@ class CoreActor : public CoreActorInterface {
     }
   }
 
-  static MHD_RESULT process_http_request(void* cls, struct MHD_Connection* connection, const char* url, const char* method,
-                                  const char* version, const char* upload_data, size_t* upload_data_size, void** ptr) {
+  static MHD_RESULT process_http_request(void* cls, struct MHD_Connection* connection, const char* url,
+                                         const char* method, const char* version, const char* upload_data,
+                                         size_t* upload_data_size, void** ptr) {
     struct MHD_Response* response = nullptr;
     MHD_RESULT ret;
 
@@ -449,33 +433,27 @@ class CoreActor : public CoreActorInterface {
   }
 
   void run() {
+    std::vector<liteclient::LiteServerConfig> servers;
     if (remote_public_key_.empty()) {
       auto G = td::read_file(global_config_).move_as_ok();
       auto gc_j = td::json_decode(G.as_slice()).move_as_ok();
       ton::ton_api::liteclient_config_global gc;
       ton::ton_api::from_json(gc, gc_j.get_object()).ensure();
-
-      CHECK(gc.liteservers_.size() > 0);
-      td::uint32 size = static_cast<td::uint32>(gc.liteservers_.size());
-      ready_.resize(size, false);
-
-      for (td::uint32 i = 0; i < size; i++) {
-        auto& cli = gc.liteservers_[i];
-        td::IPAddress addr;
-        addr.init_host_port(td::IPAddress::ipv4_to_str(cli->ip_), cli->port_).ensure();
-        addrs_.push_back(addr);
-        clients_.emplace_back(ton::adnl::AdnlExtClient::create(ton::adnl::AdnlNodeIdFull::create(cli->id_).move_as_ok(),
-                                                               addr, make_callback(i)));
+      auto r_servers = liteclient::LiteServerConfig::parse_global_config(gc);
+      r_servers.ensure();
+      servers = r_servers.move_as_ok();
+      for (const auto& serv : servers) {
+        addrs_.push_back(serv.hostname);
       }
     } else {
       if (!remote_addr_.is_valid()) {
         LOG(FATAL) << "remote addr not set";
       }
-      ready_.resize(1, false);
-      addrs_.push_back(remote_addr_);
-      clients_.emplace_back(ton::adnl::AdnlExtClient::create(ton::adnl::AdnlNodeIdFull{remote_public_key_},
-                                                             remote_addr_, make_callback(0)));
+      servers.push_back(liteclient::LiteServerConfig{ton::adnl::AdnlNodeIdFull{remote_public_key_}, remote_addr_});
+      addrs_.push_back(servers.back().hostname);
     }
+    n_servers_ = servers.size();
+    client_ = liteclient::ExtClient::create(std::move(servers), make_callback(), true);
     daemon_ = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, static_cast<td::uint16>(http_port_), nullptr, nullptr,
                                &process_http_request, nullptr, MHD_OPTION_NOTIFY_COMPLETED, request_completed, nullptr,
                                MHD_OPTION_THREAD_POOL_SIZE, 16, MHD_OPTION_END);
@@ -483,7 +461,46 @@ class CoreActor : public CoreActorInterface {
   }
 };
 
-void CoreActor::got_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> R) {
+void CoreActor::run_queries() {
+  waiting_ = 0;
+  new_result_ = std::make_shared<RemoteNodeStatus>(n_servers_, td::Timestamp::at_unix(attempt_ * 60));
+  td::actor::send_closure(client_, &liteclient::ExtClient::get_servers_status,
+                          [SelfId = actor_id(this), attempt = attempt_](td::Result<std::vector<bool>> R) {
+                            R.ensure();
+                            td::actor::send_closure(SelfId, &CoreActor::got_servers_ready, attempt, R.move_as_ok());
+                          });
+}
+
+void CoreActor::got_servers_ready(td::int32 attempt, std::vector<bool> ready) {
+  if (attempt != attempt_) {
+    return;
+  }
+  CHECK(ready.size() == n_servers_);
+  for (td::uint32 i = 0; i < n_servers_; i++) {
+    if (ready[i]) {
+      send_ping(i);
+    }
+  }
+  CHECK(waiting_ >= 0);
+  if (waiting_ == 0) {
+    add_result();
+  }
+}
+
+void CoreActor::send_ping(td::uint32 idx) {
+  waiting_++;
+  auto query = ton::create_tl_object<ton::lite_api::liteServer_getMasterchainInfo>();
+  auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(serialize_tl_object(query, true));
+
+  auto P =
+      td::PromiseCreator::lambda([SelfId = actor_id(this), idx, attempt = attempt_](td::Result<td::BufferSlice> R) {
+        td::actor::send_closure(SelfId, &CoreActor::got_ping_result, idx, attempt, std::move(R));
+      });
+  td::actor::send_closure(client_, &liteclient::ExtClient::send_query_to_server, "query", serialize_tl_object(q, true),
+                          idx, td::Timestamp::in(10.0), std::move(P));
+}
+
+void CoreActor::got_ping_result(td::uint32 idx, td::int32 attempt, td::Result<td::BufferSlice> R) {
   if (attempt != attempt_) {
     return;
   }
@@ -524,39 +541,7 @@ void CoreActor::got_result(td::uint32 idx, td::int32 attempt, td::Result<td::Buf
   }
 }
 
-void CoreActor::send_query(td::uint32 idx) {
-  if (!ready_[idx]) {
-    return;
-  }
-  waiting_++;
-  auto query = ton::create_tl_object<ton::lite_api::liteServer_getMasterchainInfo>();
-  auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(serialize_tl_object(query, true));
-
-  auto P =
-      td::PromiseCreator::lambda([SelfId = actor_id(this), idx, attempt = attempt_](td::Result<td::BufferSlice> R) {
-        td::actor::send_closure(SelfId, &CoreActor::got_result, idx, attempt, std::move(R));
-      });
-  td::actor::send_closure(clients_[idx], &ton::adnl::AdnlExtClient::send_query, "query", serialize_tl_object(q, true),
-                          td::Timestamp::in(10.0), std::move(P));
-}
-
-void CoreActor::run_queries() {
-  waiting_ = 0;
-  new_result_ = std::make_shared<RemoteNodeStatus>(ready_.size(), td::Timestamp::at_unix(attempt_ * 60));
-  for (td::uint32 i = 0; i < ready_.size(); i++) {
-    send_query(i);
-  }
-  CHECK(waiting_ >= 0);
-  if (waiting_ == 0) {
-    add_result();
-  }
-}
-
-void CoreActor::send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promise<td::BufferSlice> promise) {
-  if (!ready_[idx]) {
-    promise.set_error(td::Status::Error(ton::ErrorCode::notready, "ext conn not ready"));
-    return;
-  }
+void CoreActor::send_lite_query(td::BufferSlice query, td::Promise<td::BufferSlice> promise) {
   auto P = td::PromiseCreator::lambda([promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
     if (R.is_error()) {
       promise.set_error(R.move_as_error());
@@ -574,7 +559,7 @@ void CoreActor::send_lite_query(td::uint32 idx, td::BufferSlice query, td::Promi
     promise.set_value(std::move(B));
   });
   auto q = ton::create_tl_object<ton::lite_api::liteServer_query>(std::move(query));
-  td::actor::send_closure(clients_[idx], &ton::adnl::AdnlExtClient::send_query, "query", serialize_tl_object(q, true),
+  td::actor::send_closure(client_, &liteclient::ExtClient::send_query, "query", serialize_tl_object(q, true),
                           td::Timestamp::in(10.0), std::move(P));
 }
 

@@ -18,10 +18,10 @@
 */
 #pragma once
 
+#include <set>
+
 #include "td/actor/actor.h"
 #include "validator/interfaces/validator-manager.h"
-
-#include <set>
 
 namespace ton {
 
@@ -31,26 +31,29 @@ class TokenManager : public td::actor::Actor {
  public:
   TokenManager() {
   }
+  explicit TokenManager(td::uint32 max_tokens)
+      : free_tokens_(max_tokens), free_priority_tokens_(max_tokens), max_priority_tokens_(max_tokens) {
+  }
   void alarm() override;
 
-  void get_download_token(size_t download_size, td::uint32 priority, td::Timestamp timeout,
-                          td::Promise<std::unique_ptr<DownloadToken>> promise);
-  void download_token_cleared(size_t download_size, td::uint32 priority);
+  void get_token(size_t size, td::uint32 priority, td::Timestamp timeout,
+                 td::Promise<std::unique_ptr<ActionToken>> promise);
+  void token_cleared(size_t size, td::uint32 priority);
 
  private:
-  std::unique_ptr<DownloadToken> gen_token(size_t download_size, td::uint32 priority);
+  std::unique_ptr<ActionToken> gen_token(size_t size, td::uint32 priority);
   struct PendingPromiseKey {
-    size_t download_size;
+    size_t size;
     td::uint32 priority;
     td::uint64 seqno;
 
     bool operator<(const PendingPromiseKey &with) const {
-      return priority < with.priority || (priority == with.priority && seqno < with.seqno);
+      return priority > with.priority || (priority == with.priority && seqno < with.seqno);
     }
   };
   struct PendingPromise {
     td::Timestamp timeout;
-    td::Promise<std::unique_ptr<DownloadToken>> promise;
+    td::Promise<std::unique_ptr<ActionToken>> promise;
   };
   td::uint64 seqno_ = 0;
   std::map<PendingPromiseKey, PendingPromise> pending_;

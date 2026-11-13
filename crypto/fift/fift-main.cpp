@@ -25,35 +25,36 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "vm/stack.hpp"
-#include <cassert>
 #include <algorithm>
-#include <string>
-#include <vector>
-#include <iostream>
-#include <sstream>
-#include <fstream>
-#include <memory>
-#include <cstring>
-#include <cstdlib>
+#include <cassert>
 #include <cmath>
-#include <map>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <getopt.h>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
 
-#include "Fift.h"
-#include "Dictionary.h"
-#include "SourceLookup.h"
-#include "words.h"
-
-#include "vm/db/TonDb.h"
-
+#include "td/utils/Parser.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
-#include "td/utils/Parser.h"
 #include "td/utils/port/path.h"
+#include "vm/stack.hpp"
 
+#include "Dictionary.h"
+#include "Fift.h"
+#include "SourceLookup.h"
 #include "git.h"
+#include "words.h"
+
+extern "C" const char* __asan_default_options() {
+  return "detect_leaks=0";
+}
 
 void usage(const char* progname) {
   std::cerr << "A simple Fift interpreter. Type `bye` to quit, or `words` to get a list of all commands\n";
@@ -62,10 +63,10 @@ void usage(const char* progname) {
       << " [-i] [-n] [-I <source-include-path>] {-L <library-fif-file>} <source-file1-fif> <source-file2-fif> ...\n";
   std::cerr << "\t-n\tDo not preload standard preamble file `Fift.fif`\n"
                "\t-i\tForce interactive mode even if explicit source file names are indicated\n"
-               "\t-I<source-search-path>\tSets colon-separated library source include path. If not indicated, "
+               "\t-I<source-search-path>\tSets colon-separated (unix) or at-separated (windows) library source include "
+               "path. If not indicated, "
                "$FIFTPATH is used instead.\n"
                "\t-L<library-fif-file>\tPre-loads a library source file\n"
-               "\t-d<ton-db-path>\tUse a ton database\n"
                "\t-s\tScript mode: use first argument as a fift source file and import remaining arguments as $n)\n"
                "\t-v<verbosity-level>\tSet verbosity level\n"
                "\t-V<version>\tShow fift build information\n";
@@ -75,11 +76,16 @@ void usage(const char* progname) {
 void parse_include_path_set(std::string include_path_set, std::vector<std::string>& res) {
   td::Parser parser(include_path_set);
   while (!parser.empty()) {
-    auto path = parser.read_till_nofail(':');
+#if TD_WINDOWS
+    auto path_separator = '@';
+#else
+    auto path_separator = ':';
+#endif
+    auto path = parser.read_till_nofail(path_separator);
     if (!path.empty()) {
       res.push_back(path.str());
     }
-    parser.skip_nofail(':');
+    parser.skip_nofail(path_separator);
   }
 }
 
@@ -89,13 +95,12 @@ int main(int argc, char* const argv[]) {
   bool script_mode = false;
   std::vector<std::string> library_source_files, source_list;
   std::vector<std::string> source_include_path;
-  std::string ton_db_path;
 
   fift::Fift::Config config;
 
   int i;
   int new_verbosity_level = VERBOSITY_NAME(INFO);
-  while (!script_mode && (i = getopt(argc, argv, "hinI:L:d:sv:V")) != -1) {
+  while (!script_mode && (i = getopt(argc, argv, "hinI:L:sv:V")) != -1) {
     switch (i) {
       case 'i':
         interactive = true;
@@ -110,9 +115,6 @@ int main(int argc, char* const argv[]) {
       case 'L':
         library_source_files.emplace_back(optarg);
         break;
-      case 'd':
-        ton_db_path = optarg;
-        break;
       case 's':
         script_mode = true;
         break;
@@ -120,7 +122,8 @@ int main(int argc, char* const argv[]) {
         new_verbosity_level = VERBOSITY_NAME(FATAL) + td::to_integer<int>(td::Slice(optarg));
         break;
       case 'V':
-        std::cout << "Fift build information: [ Commit: " << GitMetadata::CommitSHA1() << ", Date: " << GitMetadata::CommitDate() << "]\n";
+        std::cout << "Fift build information: [ Commit: " << GitMetadata::CommitSHA1()
+                  << ", Date: " << GitMetadata::CommitDate() << "]\n";
         std::exit(0);
         break;
 
@@ -151,16 +154,6 @@ int main(int argc, char* const argv[]) {
   config.source_lookup = fift::SourceLookup(std::make_unique<fift::OsFileLoader>());
   for (auto& path : source_include_path) {
     config.source_lookup.add_include_path(path);
-  }
-
-  if (!ton_db_path.empty()) {
-    auto r_ton_db = vm::TonDbImpl::open(ton_db_path);
-    if (r_ton_db.is_error()) {
-      LOG(ERROR) << "Error opening ton database: " << r_ton_db.error().to_string();
-      std::exit(2);
-    }
-    config.ton_db = r_ton_db.move_as_ok();
-    // FIXME //std::atexit([&] { config.ton_db.reset(); });
   }
 
   fift::init_words_common(config.dictionary);

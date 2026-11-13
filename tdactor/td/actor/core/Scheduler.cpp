@@ -16,10 +16,11 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "td/actor/core/Scheduler.h"
+#include <coroutine>
 
 #include "td/actor/core/CpuWorker.h"
 #include "td/actor/core/IoWorker.h"
+#include "td/actor/core/Scheduler.h"
 
 namespace td {
 namespace actor {
@@ -43,10 +44,10 @@ Scheduler::Scheduler(std::shared_ptr<SchedulerGroupInfo> scheduler_group_info, S
   info_->id = id;
   if (cpu_threads_count != 0) {
     info_->cpu_threads_count = cpu_threads_count;
-    info_->cpu_queue = std::make_unique<MpmcQueue<SchedulerMessage::Raw *>>(1024, max_thread_count());
+    info_->cpu_queue = std::make_unique<MpmcQueue<SchedulerToken>>(1024, max_thread_count());
     info_->cpu_queue_waiter = std::make_unique<MpmcWaiter>();
 
-    info_->cpu_local_queue = std::vector<LocalQueue<SchedulerMessage::Raw *>>(cpu_threads_count);
+    info_->cpu_local_queue = std::vector<LocalQueue<SchedulerToken>>(cpu_threads_count);
   }
   info_->io_queue = std::make_unique<MpscPollableQueue<SchedulerMessage>>();
   info_->io_queue->init();
@@ -54,10 +55,10 @@ Scheduler::Scheduler(std::shared_ptr<SchedulerGroupInfo> scheduler_group_info, S
   info_->cpu_workers.resize(cpu_threads_count);
   td::uint8 cpu_worker_id = 0;
   for (auto &worker : info_->cpu_workers) {
-    worker = std::make_unique<WorkerInfo>(WorkerInfo::Type::Cpu, true, CpuWorkerId{cpu_worker_id});
+    worker = std::make_unique<WorkerInfo>(WorkerKind::Cpu, true, CpuWorkerId{cpu_worker_id});
     cpu_worker_id++;
   }
-  info_->io_worker = std::make_unique<WorkerInfo>(WorkerInfo::Type::Io, !info_->cpu_workers.empty(), CpuWorkerId{});
+  info_->io_worker = std::make_unique<WorkerInfo>(WorkerKind::Io, !info_->cpu_workers.empty(), CpuWorkerId{});
 
   poll_.init();
   io_worker_ = std::make_unique<IoWorker>(*info_->io_queue);
@@ -89,7 +90,7 @@ void Scheduler::start() {
   if (info_->id.value() == 0) {
     scheduler_group_info_->iocp_thread = td::thread([this] {
       WorkerInfo info;
-      info.type = WorkerInfo::Type::Cpu;
+      info.kind = WorkerKind::Cpu;
       this->run_in_context_impl(info, [this] { scheduler_group_info_->iocp.loop(); });
     });
   }
@@ -100,7 +101,7 @@ void Scheduler::start() {
 bool Scheduler::run(double timeout) {
   bool res;
   run_in_context_impl(*info_->io_worker, [this, timeout, &res] {
-    if (SchedulerContext::get()->is_stop_requested()) {
+    if (SchedulerContext::get().is_stop_requested()) {
       res = false;
     } else {
       res = io_worker_->run_once(timeout, skip_timeouts_);
@@ -139,7 +140,8 @@ void Scheduler::do_stop() {
 }
 
 Scheduler::ContextImpl::ContextImpl(ActorInfoCreator *creator, SchedulerId scheduler_id, CpuWorkerId cpu_worker_id,
-                                    SchedulerGroupInfo *scheduler_group, Poll *poll, KHeap<double> *heap, Debug *debug)
+                                    SchedulerGroupInfo *scheduler_group, Poll *poll, KHeap<Timestamp> *heap,
+                                    Debug *debug)
     : creator_(creator)
     , scheduler_id_(scheduler_id)
     , cpu_worker_id_(cpu_worker_id)
@@ -161,20 +163,35 @@ void Scheduler::ContextImpl::add_to_queue(ActorInfoPtr actor_info_ptr, Scheduler
   if (need_poll || !info.cpu_queue) {
     info.io_queue->writer_put(std::move(actor_info_ptr));
   } else {
+    auto token = static_cast<SchedulerToken>(actor_info_ptr.release());
     if (scheduler_id == get_scheduler_id() && cpu_worker_id_.is_valid()) {
-      // may push local
-      CHECK(actor_info_ptr);
-      auto raw = actor_info_ptr.release();
       auto should_notify = info.cpu_local_queue[cpu_worker_id_.value()].push(
-          raw, [&](auto value) { info.cpu_queue->push(value, get_thread_id()); });
+          token, [&](auto value) { info.cpu_queue->push(value, get_thread_id()); });
       if (should_notify) {
         info.cpu_queue_waiter->notify();
       }
       return;
     }
-    info.cpu_queue->push(actor_info_ptr.release(), get_thread_id());
+    info.cpu_queue->push(token, get_thread_id());
     info.cpu_queue_waiter->notify();
   }
+}
+
+void Scheduler::ContextImpl::add_token_to_cpu_queue(SchedulerToken token, SchedulerId scheduler_id) {
+  if (!scheduler_id.is_valid()) {
+    scheduler_id = get_scheduler_id();
+  }
+  auto &info = scheduler_group()->schedulers.at(scheduler_id.value());
+  if (scheduler_id == get_scheduler_id() && cpu_worker_id_.is_valid()) {
+    auto should_notify = info.cpu_local_queue[cpu_worker_id_.value()].push(
+        token, [&](auto value) { info.cpu_queue->push(value, get_thread_id()); });
+    if (should_notify) {
+      info.cpu_queue_waiter->notify();
+    }
+    return;
+  }
+  info.cpu_queue->push(token, get_thread_id());
+  info.cpu_queue_waiter->notify();
 }
 
 ActorInfoCreator &Scheduler::ContextImpl::get_actor_info_creator() {
@@ -192,12 +209,19 @@ Poll &Scheduler::ContextImpl::get_poll() {
 bool Scheduler::ContextImpl::has_heap() {
   return heap_ != nullptr;
 }
-KHeap<double> &Scheduler::ContextImpl::get_heap() {
+KHeap<Timestamp> &Scheduler::ContextImpl::get_heap() {
   CHECK(has_heap());
   return *heap_;
 }
 Debug &Scheduler::ContextImpl::get_debug() {
   return *debug_;
+}
+ActorTypeStatTable *Scheduler::ContextImpl::actor_type_stats() {
+  if (!actor_type_stats_) {
+    auto kind = has_poll() ? WorkerKind::Io : WorkerKind::Cpu;
+    actor_type_stats_ = &scheduler_group_->actor_type_stats.thread_table(kind);
+  }
+  return actor_type_stats_;
 }
 
 void Scheduler::ContextImpl::set_alarm_timestamp(const ActorInfoPtr &actor_info_ptr) {
@@ -216,10 +240,10 @@ void Scheduler::ContextImpl::set_alarm_timestamp(const ActorInfoPtr &actor_info_
   auto timestamp = actor_info_ptr->get_alarm_timestamp();
   if (timestamp) {
     if (heap_node->in_heap()) {
-      heap.fix(timestamp.at(), heap_node);
+      heap.fix(timestamp, heap_node);
     } else {
       actor_info_ptr->pin(actor_info_ptr);
-      heap.insert(timestamp.at(), heap_node);
+      heap.insert(timestamp, heap_node);
     }
   } else {
     if (heap_node->in_heap()) {
@@ -245,7 +269,7 @@ void Scheduler::ContextImpl::stop() {
   for (auto &scheduler_info : group.schedulers) {
     scheduler_info.io_queue->writer_put({});
     for (size_t i = 0; i < scheduler_info.cpu_threads_count; i++) {
-      scheduler_info.cpu_queue->push({}, get_thread_id());
+      scheduler_info.cpu_queue->push(nullptr, get_thread_id());
       scheduler_info.cpu_queue_waiter->notify();
     }
   }
@@ -294,11 +318,18 @@ void Scheduler::close_scheduler_group(SchedulerGroupInfo &group_info) {
       for (auto &q : scheduler_info.cpu_local_queue) {
         auto &cpu_queue = q;
         while (true) {
-          SchedulerMessage::Raw *raw_message;
+          SchedulerToken raw_message;
           if (!cpu_queue.try_pop(raw_message)) {
             break;
           }
-          SchedulerMessage(SchedulerMessage::acquire_t{}, raw_message);
+          auto encoded = reinterpret_cast<uintptr_t>(raw_message);
+          if ((encoded & 1u) == 0u) {
+            SchedulerMessage::Raw *raw = reinterpret_cast<SchedulerMessage::Raw *>(raw_message);
+            SchedulerMessage(SchedulerMessage::acquire_t{}, raw);
+          } else {
+            auto h = std::coroutine_handle<>::from_address(reinterpret_cast<void *>(encoded & ~uintptr_t(1)));
+            h.destroy();
+          }
           // message's destructor is called
           queues_are_empty = false;
         }
@@ -306,11 +337,18 @@ void Scheduler::close_scheduler_group(SchedulerGroupInfo &group_info) {
       if (scheduler_info.cpu_queue) {
         auto &cpu_queue = *scheduler_info.cpu_queue;
         while (true) {
-          SchedulerMessage::Raw *raw_message;
+          SchedulerToken raw_message;
           if (!cpu_queue.try_pop(raw_message, get_thread_id())) {
             break;
           }
-          SchedulerMessage(SchedulerMessage::acquire_t{}, raw_message);
+          auto encoded = reinterpret_cast<uintptr_t>(raw_message);
+          if ((encoded & 1u) == 0u) {
+            SchedulerMessage::Raw *raw = reinterpret_cast<SchedulerMessage::Raw *>(raw_message);
+            SchedulerMessage(SchedulerMessage::acquire_t{}, raw);
+          } else {
+            auto h = std::coroutine_handle<>::from_address(reinterpret_cast<void *>(encoded & ~uintptr_t(1)));
+            h.destroy();
+          }
           // message's destructor is called
           queues_are_empty = false;
         }

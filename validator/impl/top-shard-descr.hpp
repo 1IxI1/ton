@@ -18,9 +18,9 @@
 */
 #pragma once
 
+#include "block/mc-config.h"
 #include "interfaces/shard-block.h"
 #include "interfaces/validator-manager.h"
-#include "block/mc-config.h"
 
 namespace ton {
 
@@ -54,7 +54,7 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
                     Ref<MasterchainState> last_masterchain_block_state) const override;
   td::Result<int> prevalidate(BlockIdExt last_mc_block_id, Ref<MasterchainState> last_mc_state, int mode,
                               int& res_flags) const;
-  td::Result<int> validate(BlockIdExt last_mc_block_id, Ref<MasterchainState> last_mc_state, int mode, int& res_flags);
+  td::Result<int> validate(BlockIdExt last_mc_block_id, Ref<MasterchainState> last_mc_state, int mode);
 
   td::BufferSlice serialize() const override {
     return data_.clone();
@@ -73,6 +73,9 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
   }
   std::size_t size() const {
     return chain_blk_ids_.size();
+  }
+  const std::vector<BlockIdExt>& get_chain_blocks() const override {
+    return chain_blk_ids_;
   }
   UnixTime generated_at() const override {
     return gen_utime_;
@@ -127,10 +130,8 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
   CatchainSeqno catchain_seqno_{0};
   td::uint32 validator_set_hash_{0};
   BlockSeqno vert_seqno_{~0U};
-  td::uint32 sig_count_;
-  ValidatorWeight sig_weight_;
-  Ref<vm::Cell> sig_root_;
-  Ref<BlockSignatureSet> sig_set_;
+  ValidatorWeight sig_weight_{0};
+  td::Ref<block::BlockSignatureSet> sig_set_;
   std::vector<Ref<vm::Cell>> proof_roots_;
   std::vector<BlockIdExt> chain_blk_ids_;
   std::vector<BlockIdExt> chain_mc_blk_ids_;
@@ -145,6 +146,8 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
   td::Status unpack_one_proof(BlockIdExt& cur_id, Ref<vm::Cell> proof_root, bool is_head);
   td::Result<int> validate_internal(BlockIdExt last_mc_block_id, Ref<MasterchainState> last_mc_state, int& res_flags,
                                     int mode) const;
+
+  enum ResFlags { invalid = 1, vset_cur = 4, vset_next = 8, sig_ok = 16, sig_bad = 32 };
 };
 
 class ValidateShardTopBlockDescr : public td::actor::Actor {

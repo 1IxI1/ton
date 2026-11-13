@@ -1,19 +1,21 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
 #SOURCE SETS
 set(TDACTOR_SOURCE
   td/actor/core/ActorExecutor.cpp
+  td/actor/core/ActorTypeStat.cpp
   td/actor/core/CpuWorker.cpp
   td/actor/core/IoWorker.cpp
   td/actor/core/Scheduler.cpp
 
+  td/actor/ActorStats.cpp
   td/actor/MultiPromise.cpp
 
   td/actor/actor.h
   td/actor/ActorId.h
   td/actor/ActorOwn.h
   td/actor/ActorShared.h
+  td/actor/ActorStats.h
   td/actor/common.h
+  td/actor/coro.h
   td/actor/PromiseFuture.h
   td/actor/MultiPromise.h
 
@@ -27,6 +29,7 @@ set(TDACTOR_SOURCE
   td/actor/core/ActorMessage.h
   td/actor/core/ActorSignals.h
   td/actor/core/ActorState.h
+  td/actor/core/ActorTypeStat.h
   td/actor/core/CpuWorker.h
   td/actor/core/Context.h
   td/actor/core/IoWorker.h
@@ -50,8 +53,12 @@ add_library(tdactor STATIC ${TDACTOR_SOURCE})
 target_include_directories(tdactor PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
 target_link_libraries(tdactor PUBLIC tdutils)
 
+add_executable(tdactor-example-coroutines example/actor-example-coroutines.cpp)
+target_link_libraries(tdactor-example-coroutines PUBLIC tdactor tdnet)
+
 # BEGIN-INTERNAL
 add_subdirectory(benchmark)
+add_subdirectory(test)
 
 # END-INTERNAL
 install(TARGETS tdactor EXPORT TdTargets

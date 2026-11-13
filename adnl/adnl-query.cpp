@@ -16,16 +16,17 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "adnl-query.h"
 #include "common/errorcode.h"
 #include "td/utils/Random.h"
+
+#include "adnl-query.h"
 
 namespace ton {
 
 namespace adnl {
 
 void AdnlQuery::alarm() {
-  set_error(td::Status::Error(ErrorCode::timeout, "adnl query timeout"));
+  set_error(td::Status::Error(ErrorCode::timeout, PSTRING() << "timeout for adnl query " << name_));
 }
 void AdnlQuery::result(td::BufferSlice data) {
   promise_.set_value(std::move(data));

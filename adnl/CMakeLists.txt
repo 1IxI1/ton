@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
 #BEGIN internal
 if (NOT TON_ONLY_TONLIB)
 set(ADNL_HEADERS
@@ -25,10 +23,7 @@ set(ADNL_HEADERS
   adnl-peer.h
   adnl-peer.hpp
   adnl-query.h
-  adnl-static-nodes.h
-  adnl-static-nodes.hpp
-  adnl-proxy-types.h
-  adnl-proxy-types.hpp
+  adnl-sender-ex.h
   adnl.h
   utils.hpp
 )
@@ -48,8 +43,7 @@ set(ADNL_SOURCE
   adnl-peer.cpp
   adnl-query.cpp
   adnl-channel.cpp
-  adnl-static-nodes.cpp
-  adnl-proxy-types.cpp
+  adnl-sender-ex.cpp
   utils.cpp
   ${ADNL_HEADERS}
 )
@@ -57,13 +51,6 @@ set(ADNL_SOURCE
 set(ADNL_TEST_SOURCE
   adnl-test-loopback-implementation.h
   adnl-test-loopback-implementation.cpp
-)
-
-set(ADNL_PROXY_SOURCE
-  adnl-proxy.cpp
-  adnl-proxy-types.h
-  adnl-proxy-types.hpp
-  adnl-proxy-types.cpp
 )
 
 #FIXME
@@ -84,23 +71,16 @@ if (NOT TON_ONLY_TONLIB)
 add_library(adnl STATIC ${ADNL_SOURCE})
 
 target_include_directories(adnl PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnl PUBLIC tdactor ton_crypto tl_api tdnet tddb keys keyring )
-
-add_executable(adnl-proxy ${ADNL_PROXY_SOURCE})
-target_include_directories(adnl-proxy PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnl-proxy PUBLIC tdactor ton_crypto tl_api tdnet common
-  tl-utils git)
+target_link_libraries(adnl PUBLIC tdactor ton_crypto tl_api tdnet tddb keys keyring metrics)
 
 add_executable(adnl-pong adnl-pong.cpp)
 target_include_directories(adnl-pong PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnl-pong PUBLIC tdactor ton_crypto tl_api tdnet common
-  tl-utils adnl dht git)
+target_link_libraries(adnl-pong PUBLIC tdactor ton_crypto tl_api tdnet common tl-utils adnl dht git)
 
 add_library(adnltest STATIC ${ADNL_TEST_SOURCE})
 target_include_directories(adnltest PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>)
-target_link_libraries(adnltest PUBLIC adnl )
+target_link_libraries(adnltest PUBLIC adnl)
 
-install(TARGETS adnl-proxy RUNTIME DESTINATION bin)
 endif()
 #END internal
 

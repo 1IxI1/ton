@@ -17,7 +17,6 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #include "tonlib/ExtClient.h"
-
 #include "tonlib/LastBlock.h"
 #include "tonlib/LastConfig.h"
 
@@ -65,7 +64,7 @@ void ExtClient::send_raw_query(td::BufferSlice query, td::Promise<td::BufferSlic
   if (client_.adnl_ext_client_.empty()) {
     return P.set_error(TonlibError::NoLiteServers());
   }
-  td::actor::send_closure(client_.adnl_ext_client_, &ton::adnl::AdnlExtClient::send_query, "query", std::move(query),
+  td::actor::send_closure(client_.adnl_ext_client_, &liteclient::ExtClient::send_query, "query", std::move(query),
                           td::Timestamp::in(10.0), std::move(P));
 }
 }  // namespace tonlib

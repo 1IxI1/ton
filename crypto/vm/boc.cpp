@@ -16,18 +16,20 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include <iostream>
-#include <iomanip>
 #include <algorithm>
-#include "vm/boc.h"
-#include "vm/boc-writers.h"
-#include "vm/cells.h"
-#include "vm/cellslice.h"
+#include <iomanip>
+#include <iostream>
+
+#include "cells/MerkleUpdate.h"
+#include "td/utils/Slice-decl.h"
 #include "td/utils/bits.h"
 #include "td/utils/crypto.h"
 #include "td/utils/format.h"
 #include "td/utils/misc.h"
-#include "td/utils/Slice-decl.h"
+#include "vm/boc-writers.h"
+#include "vm/boc.h"
+#include "vm/cells.h"
+#include "vm/cellslice.h"
 
 namespace vm {
 using td::Ref;
@@ -87,16 +89,19 @@ td::Result<int> CellSerializationInfo::get_bits(td::Slice cell) const {
 }
 
 // TODO: check usage when result is empty
-td::Result<Ref<DataCell>> CellSerializationInfo::create_data_cell(td::Slice cell_slice,
-                                                                  td::Span<Ref<Cell>> refs) const {
-  CellBuilder cb;
-  TRY_RESULT(bits, get_bits(cell_slice));
-  cb.store_bits(cell_slice.ubegin() + data_offset, bits);
+td::Result<Ref<DataCell>> CellSerializationInfo::create_data_cell(td::Slice cell_slice, td::Span<Ref<Cell>> refs,
+                                                                  bool trust_hashes) const {
   DCHECK(refs_cnt == (td::int64)refs.size());
-  for (int k = 0; k < refs_cnt; k++) {
-    cb.store_ref(std::move(refs[k]));
+  TRY_RESULT(bits, get_bits(cell_slice));
+  DataCell::HashHint hash_hint;
+  if (trust_hashes && with_hashes) {
+    hash_hint = [&](unsigned level, const Cell::LevelMask& level_mask, CellHash& hash) {
+      unsigned hash_i = level_mask.apply(level).get_hash_i();
+      hash.as_slice().copy_from(cell_slice.substr(hashes_offset + Cell::hash_bytes * hash_i, Cell::hash_bytes));
+      return true;
+    };
   }
-  TRY_RESULT(res, cb.finalize_novm_nothrow(special));
+  TRY_RESULT(res, DataCell::create(cell_slice.substr(data_offset), bits, refs, special, std::move(hash_hint)));
   CHECK(!res.is_null());
   if (res->is_special() != special) {
     return td::Status::Error("is_special mismatch");
@@ -168,7 +173,7 @@ int BagOfCells::add_root(td::Ref<vm::Cell> add_root) {
   if (add_root.is_null()) {
     return 0;
   }
-  LOG_CHECK(add_root->get_virtualization() == 0) << "TODO: support serialization of virtualized cells";
+  LOG_CHECK(!add_root->is_virtualized()) << "TODO: support serialization of virtualized cells";
   //const Cell::Hash& hash = add_root->get_hash();
   //for (const auto& root_info : roots) {
   //if (root_info.cell->get_hash() == hash) {
@@ -183,6 +188,9 @@ int BagOfCells::add_root(td::Ref<vm::Cell> add_root) {
 
 // Changes in this function may require corresponding changes in crypto/vm/large-boc-serializer.cpp
 td::Status BagOfCells::import_cells() {
+  if (logger_ptr_) {
+    logger_ptr_->start_stage("import_cells");
+  }
   cells_clear();
   for (auto& root : roots) {
     auto res = import_cell(root.cell, 0);
@@ -196,6 +204,9 @@ td::Status BagOfCells::import_cells() {
   //LOG(INFO) << "[cells: " << cell_count << ", refs: " << int_refs << ", bytes: " << data_bytes
   //<< ", internal hashes: " << int_hashes << ", top hashes: " << top_hashes << "]";
   CHECK(cell_count != 0);
+  if (logger_ptr_) {
+    logger_ptr_->finish_stage(PSLICE() << cell_count << " cells");
+  }
   return td::Status::OK();
 }
 
@@ -207,13 +218,16 @@ td::Result<int> BagOfCells::import_cell(td::Ref<vm::Cell> cell, int depth) {
   if (cell.is_null()) {
     return td::Status::Error("error while importing a cell into a bag of cells: cell is null");
   }
+  if (logger_ptr_) {
+    TRY_STATUS(logger_ptr_->on_cells_processed(1));
+  }
   auto it = cells.find(cell->get_hash());
   if (it != cells.end()) {
     auto pos = it->second;
     cell_list_[pos].should_cache = true;
     return pos;
   }
-  if (cell->get_virtualization() != 0) {
+  if (cell->is_virtualized()) {
     return td::Status::Error(
         "error while importing a cell into a bag of cells: cell has non-zero virtualization level");
   }
@@ -436,17 +450,19 @@ std::size_t BagOfCells::estimate_serialized_size(int mode) {
   return res.ok();
 }
 
-BagOfCells& BagOfCells::serialize(int mode) {
+td::Status BagOfCells::serialize(int mode) {
   std::size_t size_est = estimate_serialized_size(mode);
   if (!size_est) {
     serialized.clear();
-    return *this;
+    return td::Status::OK();
   }
   serialized.resize(size_est);
-  if (serialize_to(const_cast<unsigned char*>(serialized.data()), serialized.size(), mode) != size_est) {
+  TRY_RESULT(size, serialize_to(const_cast<unsigned char*>(serialized.data()), serialized.size(), mode));
+  if (size != size_est) {
     serialized.clear();
+    return td::Status::Error("serialization failed");
   }
-  return *this;
+  return td::Status::OK();
 }
 
 std::string BagOfCells::serialize_to_string(int mode) {
@@ -456,8 +472,8 @@ std::string BagOfCells::serialize_to_string(int mode) {
   }
   std::string res;
   res.resize(size_est, 0);
-  if (serialize_to(const_cast<unsigned char*>(reinterpret_cast<const unsigned char*>(res.data())), res.size(), mode) ==
-      res.size()) {
+  if (serialize_to(const_cast<unsigned char*>(reinterpret_cast<const unsigned char*>(res.data())), res.size(), mode)
+          .move_as_ok() == res.size()) {
     return res;
   } else {
     return {};
@@ -470,8 +486,9 @@ td::Result<td::BufferSlice> BagOfCells::serialize_to_slice(int mode) {
     return td::Status::Error("no cells to serialize to this bag of cells");
   }
   td::BufferSlice res(size_est);
-  if (serialize_to(const_cast<unsigned char*>(reinterpret_cast<const unsigned char*>(res.data())), res.size(), mode) ==
-      res.size()) {
+  TRY_RESULT(size, serialize_to(const_cast<unsigned char*>(reinterpret_cast<const unsigned char*>(res.data())),
+                                res.size(), mode));
+  if (size == res.size()) {
     return std::move(res);
   } else {
     return td::Status::Error("error while serializing a bag of cells: actual serialized size differs from estimated");
@@ -494,14 +511,10 @@ std::string BagOfCells::extract_string() const {
 //  cell_data:(tot_cells_size * [ uint8 ])
 //  = BagOfCells;
 // Changes in this function may require corresponding changes in crypto/vm/large-boc-serializer.cpp
-template<typename WriterT>
-std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
-  auto store_ref = [&](unsigned long long value) {
-    writer.store_uint(value, info.ref_byte_size);
-  };
-  auto store_offset = [&](unsigned long long value) {
-    writer.store_uint(value, info.offset_byte_size);
-  };
+template <typename WriterT>
+td::Result<std::size_t> BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
+  auto store_ref = [&](unsigned long long value) { writer.store_uint(value, info.ref_byte_size); };
+  auto store_offset = [&](unsigned long long value) { writer.store_uint(value, info.offset_byte_size); };
 
   writer.store_uint(info.magic, 4);
 
@@ -536,6 +549,9 @@ std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
   DCHECK((unsigned)cell_count == cell_list_.size());
   if (info.has_index) {
     std::size_t offs = 0;
+    if (logger_ptr_) {
+      logger_ptr_->start_stage("generate_index");
+    }
     for (int i = cell_count - 1; i >= 0; --i) {
       const Ref<DataCell>& dc = cell_list_[i].dc_ref;
       bool with_hash = (mode & Mode::WithIntHashes) && !cell_list_[i].wt;
@@ -548,11 +564,20 @@ std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
         fixed_offset = offs * 2 + cell_list_[i].should_cache;
       }
       store_offset(fixed_offset);
+      if (logger_ptr_) {
+        TRY_STATUS(logger_ptr_->on_cells_processed(1));
+      }
+    }
+    if (logger_ptr_) {
+      logger_ptr_->finish_stage("");
     }
     DCHECK(offs == info.data_size);
   }
   DCHECK(writer.position() == info.data_offset);
   size_t keep_position = writer.position();
+  if (logger_ptr_) {
+    logger_ptr_->start_stage("serialize");
+  }
   for (int i = 0; i < cell_count; ++i) {
     const auto& dc_info = cell_list_[cell_count - 1 - i];
     const Ref<DataCell>& dc = dc_info.dc_ref;
@@ -560,8 +585,8 @@ std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
     if (dc_info.is_root_cell && (mode & Mode::WithTopHash)) {
       with_hash = true;
     }
-    unsigned char buf[256];
-    int s = dc->serialize(buf, 256, with_hash);
+    unsigned char buf[Cell::max_serialized_bytes];
+    int s = dc->serialize(buf, Cell::max_serialized_bytes, with_hash);
     writer.store_bytes(buf, s);
     DCHECK(dc->size_refs() == dc_info.ref_num);
     // std::cerr << (dc_info.is_special() ? '*' : ' ') << i << '<' << (int)dc_info.wt << ">:";
@@ -572,6 +597,9 @@ std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
       // std::cerr << ' ' << k;
     }
     // std::cerr << std::endl;
+    if (logger_ptr_) {
+      TRY_STATUS(logger_ptr_->on_cells_processed(1));
+    }
   }
   writer.chk();
   DCHECK(writer.position() - keep_position == info.data_size);
@@ -580,11 +608,14 @@ std::size_t BagOfCells::serialize_to_impl(WriterT& writer, int mode) {
     unsigned crc = writer.get_crc32();
     writer.store_uint(td::bswap32(crc), 4);
   }
+  if (logger_ptr_) {
+    logger_ptr_->finish_stage(PSLICE() << cell_count << " cells, " << writer.position() << " bytes");
+  }
   DCHECK(writer.empty());
   return writer.position();
 }
 
-std::size_t BagOfCells::serialize_to(unsigned char* buffer, std::size_t buff_size, int mode) {
+td::Result<std::size_t> BagOfCells::serialize_to(unsigned char* buffer, std::size_t buff_size, int mode) {
   std::size_t size_est = estimate_serialized_size(mode);
   if (!size_est || size_est > buff_size) {
     return 0;
@@ -599,7 +630,7 @@ td::Status BagOfCells::serialize_to_file(td::FileFd& fd, int mode) {
     return td::Status::Error("no cells to serialize to this bag of cells");
   }
   boc_writers::FileWriter writer{fd, size_est};
-  size_t s = serialize_to_impl(writer, mode);
+  TRY_RESULT(s, serialize_to_impl(writer, mode));
   TRY_STATUS(writer.finalize());
   if (s != size_est) {
     return td::Status::Error("error while serializing a bag of cells: actual serialized size differs from estimated");
@@ -607,7 +638,7 @@ td::Status BagOfCells::serialize_to_file(td::FileFd& fd, int mode) {
   return td::Status::OK();
 }
 
-unsigned long long BagOfCells::Info::read_int(const unsigned char* ptr, unsigned bytes) {
+unsigned long long BagOfCells::Info::read_int(const unsigned char* ptr, unsigned bytes) const {
   unsigned long long res = 0;
   while (bytes > 0) {
     res = (res << 8) + *ptr++;
@@ -616,7 +647,7 @@ unsigned long long BagOfCells::Info::read_int(const unsigned char* ptr, unsigned
   return res;
 }
 
-void BagOfCells::Info::write_int(unsigned char* ptr, unsigned long long value, int bytes) {
+void BagOfCells::Info::write_int(unsigned char* ptr, unsigned long long value, int bytes) const {
   ptr += bytes;
   while (bytes) {
     *--ptr = value & 0xff;
@@ -777,22 +808,18 @@ td::Result<td::Ref<vm::DataCell>> BagOfCells::deserialize_cell(int idx, td::Slic
 td::Result<long long> BagOfCells::deserialize(const td::Slice& data, int max_roots) {
   clear();
   long long size_est = info.parse_serialized_header(data);
-  //LOG(INFO) << "estimated size " << size_est << ", true size " << data.size();
   if (size_est == 0) {
     return td::Status::Error(PSLICE() << "cannot deserialize bag-of-cells: invalid header, error " << size_est);
   }
   if (size_est < 0) {
-    //LOG(ERROR) << "cannot deserialize bag-of-cells: not enough bytes (" << data.size() << " present, " << -size_est
-    //<< " required)";
-    return size_est;
+    return td::Status::Error(PSLICE() << "cannot deserialize bag-of-cells: not enough bytes (" << data.size()
+                                      << " present, " << -size_est << " required)");
   }
 
   if (size_est > (long long)data.size()) {
-    //LOG(ERROR) << "cannot deserialize bag-of-cells: not enough bytes (" << data.size() << " present, " << size_est
-    //<< " required)";
-    return -size_est;
+    return td::Status::Error(PSLICE() << "cannot deserialize bag-of-cells: not enough bytes (" << data.size()
+                                      << " present, " << size_est << " required)");
   }
-  //LOG(INFO) << "estimated size " << size_est << ", true size " << data.size();
   if (info.root_count > max_roots) {
     return td::Status::Error("Bag-of-cells has more root cells than expected");
   }
@@ -925,9 +952,9 @@ unsigned long long BagOfCells::get_idx_entry_raw(int index) {
 }
 
 /*
- * 
+ *
  *  Simple BoC serialization/deserialization functions
- * 
+ *
  */
 
 td::Result<Ref<Cell>> std_boc_deserialize(td::Slice data, bool can_be_empty, bool allow_nonzero_level) {
@@ -952,7 +979,7 @@ td::Result<Ref<Cell>> std_boc_deserialize(td::Slice data, bool can_be_empty, boo
   return std::move(root);
 }
 
-td::Result<std::vector<Ref<Cell>>> std_boc_deserialize_multi(td::Slice data, int max_roots) {
+td::Result<std::vector<Ref<Cell>>> std_boc_deserialize_multi(td::Slice data, int max_roots, bool allow_nonzero_level) {
   if (data.empty()) {
     return std::vector<Ref<Cell>>{};
   }
@@ -968,7 +995,7 @@ td::Result<std::vector<Ref<Cell>>> std_boc_deserialize_multi(td::Slice data, int
     if (root.is_null()) {
       return td::Status::Error("bag of cells has a null root cell (?)");
     }
-    if (root->get_level() != 0) {
+    if (root->get_level() != 0 && !allow_nonzero_level) {
       return td::Status::Error("bag of cells has a root with non-zero level");
     }
     roots.emplace_back(std::move(root));
@@ -1001,11 +1028,26 @@ td::Result<td::BufferSlice> std_boc_serialize_multi(std::vector<Ref<Cell>> roots
   }
   return boc.serialize_to_slice(mode);
 }
+td::Status std_boc_serialize_to_file(Ref<Cell> root, td::FileFd& fd, int mode,
+                                     td::CancellationToken cancellation_token) {
+  if (root.is_null()) {
+    return td::Status::Error("cannot serialize a null cell reference into a bag of cells");
+  }
+  td::Timer timer;
+  BagOfCellsLogger logger(std::move(cancellation_token));
+  BagOfCells boc;
+  boc.set_logger(&logger);
+  boc.add_root(std::move(root));
+  TRY_STATUS(boc.import_cells());
+  TRY_STATUS(boc.serialize_to_file(fd, mode));
+  LOG(ERROR) << "serialization took " << timer.elapsed() << "s";
+  return td::Status::OK();
+}
 
 /*
- * 
+ *
  *  Cell storage statistics
- * 
+ *
  */
 
 td::Result<CellStorageStat::CellInfo> CellStorageStat::compute_used_storage(Ref<vm::CellSlice> cs_ref, bool kill_dup,
@@ -1112,22 +1154,51 @@ td::Result<CellStorageStat::CellInfo> CellStorageStat::add_used_storage(Ref<vm::
       return ins.first->second;
     }
   }
-  vm::CellSlice cs{vm::NoVm{}, std::move(cell)};
-  return add_used_storage(std::move(cs), kill_dup, skip_count_root);
+  vm::CellSlice cs{vm::NoVm{}, cell};
+  TRY_RESULT(res, add_used_storage(std::move(cs), kill_dup, skip_count_root));
+  if (kill_dup) {
+    seen[cell->get_hash()] = res;
+  }
+  return res;
+}
+
+td::Result<CellStorageStat::CellInfo> CellStorageStat::add_used_storage(td::Span<Ref<Cell>> cells, bool kill_dup,
+                                                                        unsigned skip_count_root) {
+  CellInfo result;
+  for (const auto& cell : cells) {
+    TRY_RESULT(info, add_used_storage(cell, kill_dup, skip_count_root));
+    result.max_merkle_depth = std::max(result.max_merkle_depth, info.max_merkle_depth);
+  }
+  return result;
 }
 
 void NewCellStorageStat::add_cell(Ref<Cell> cell) {
-  dfs(std::move(cell), true, false);
+  if (cell.is_null()) {
+    return;
+  }
+  unsigned level = cell->get_level();
+  dfs(std::move(cell), level, true, false, false);
 }
-void NewCellStorageStat::add_proof(Ref<Cell> cell, const CellUsageTree* usage_tree) {
+void NewCellStorageStat::add_proof(Ref<Cell> cell, CellUsageTree* usage_tree,
+                                   MerkleUpdateLeftStat* merkle_update_left_stat) {
+  if (cell.is_null()) {
+    return;
+  }
   CHECK(usage_tree);
   usage_tree_ = usage_tree;
-  dfs(std::move(cell), false, true);
+  merkle_update_left_stat_ = merkle_update_left_stat;
+  unsigned level = cell->get_level();
+  dfs(std::move(cell), level, false, true, true);
 }
-void NewCellStorageStat::add_cell_and_proof(Ref<Cell> cell, const CellUsageTree* usage_tree) {
+void NewCellStorageStat::add_cell_and_proof(Ref<Cell> cell, CellUsageTree* usage_tree) {
+  if (cell.is_null()) {
+    return;
+  }
   CHECK(usage_tree);
   usage_tree_ = usage_tree;
-  dfs(std::move(cell), true, true);
+  merkle_update_left_stat_ = nullptr;
+  unsigned level = cell->get_level();
+  dfs(std::move(cell), level, true, true, false);
 }
 
 NewCellStorageStat::Stat NewCellStorageStat::tentative_add_cell(Ref<Cell> cell) const {
@@ -1137,19 +1208,15 @@ NewCellStorageStat::Stat NewCellStorageStat::tentative_add_cell(Ref<Cell> cell) 
   return stat.get_stat();
 }
 
-NewCellStorageStat::Stat NewCellStorageStat::tentative_add_proof(Ref<Cell> cell,
-                                                                 const CellUsageTree* usage_tree) const {
+NewCellStorageStat::Stat NewCellStorageStat::tentative_add_proof(Ref<Cell> cell, CellUsageTree* usage_tree) const {
   NewCellStorageStat stat;
   stat.parent_ = this;
   stat.add_proof(std::move(cell), usage_tree);
   return stat.get_proof_stat();
 }
 
-void NewCellStorageStat::dfs(Ref<Cell> cell, bool need_stat, bool need_proof_stat) {
-  if (cell.is_null()) {
-    // FIXME: save error flag?
-    return;
-  }
+void NewCellStorageStat::dfs(Ref<Cell> cell, unsigned merkle_depth, bool need_stat, bool need_proof_stat,
+                             bool need_left_mu_stat) {
   if (need_stat) {
     stat_.internal_refs++;
     if ((parent_ && parent_->seen_.count(cell->get_hash()) != 0) || !seen_.insert(cell->get_hash()).second) {
@@ -1166,19 +1233,41 @@ void NewCellStorageStat::dfs(Ref<Cell> cell, bool need_stat, bool need_proof_sta
       need_proof_stat = false;
     } else {
       proof_stat_.internal_refs++;
-      if ((parent_ && parent_->proof_seen_.count(cell->get_hash()) != 0) ||
-          !proof_seen_.insert(cell->get_hash()).second) {
+      if ((parent_ && parent_->proof_seen_.contains({cell->get_hash(), merkle_depth})) ||
+          !proof_seen_.emplace(cell->get_hash(), merkle_depth).second) {
         need_proof_stat = false;
       } else {
         proof_stat_.cells++;
       }
     }
   }
+  if (need_left_mu_stat) {
+    auto tree_node = cell->get_tree_node();
+    if (!tree_node.empty() && tree_node.is_from_tree(usage_tree_)) {
+      if (merkle_update_left_stat_) {
+        bool add = true;
+        if (cell->is_loaded()) {
+          // See condition in MerkleUpdate::generate_raw
+          auto loaded_cell = cell->load_cell().move_as_ok();
+          if (loaded_cell.data_cell->size_refs() == 0 &&
+              (loaded_cell.data_cell->size() <= 8 + 16 + 256 || loaded_cell.data_cell->get_level() > 0)) {
+            add = false;
+          }
+        }
+        if (add) {
+          usage_tree_->add_path_to_proof_stat(tree_node.node_id(), *merkle_update_left_stat_);
+        }
+      }
+      need_left_mu_stat = false;
+    } else if (!cell->is_loaded() || !mu_left_seen_.insert(cell).second) {
+      need_left_mu_stat = false;
+    }
+  }
 
-  if (!need_proof_stat && !need_stat) {
+  if (!need_proof_stat && !need_stat && !need_left_mu_stat) {
     return;
   }
-  vm::CellSlice cs{vm::NoVm{}, std::move(cell)};
+  CellSlice cs{NoVm{}, std::move(cell)};
   if (need_stat) {
     stat_.bits += cs.size();
   }
@@ -1186,7 +1275,7 @@ void NewCellStorageStat::dfs(Ref<Cell> cell, bool need_stat, bool need_proof_sta
     proof_stat_.bits += cs.size();
   }
   while (cs.size_refs()) {
-    dfs(cs.fetch_ref(), need_stat, need_proof_stat);
+    dfs(cs.fetch_ref(), cs.child_merkle_depth(merkle_depth), need_stat, need_proof_stat, need_left_mu_stat);
   }
 }
 
@@ -1212,6 +1301,90 @@ bool VmStorageStat::add_storage(const CellSlice& cs) {
     }
   }
   return true;
+}
+
+void ProofStorageStat::add_loaded_cell(const Ref<DataCell>& cell, td::uint8 max_level) {
+  max_level = std::min<td::uint8>(max_level, Cell::max_level);
+  auto& [status, size] = cells_[cell->get_hash(max_level)];
+  if (status == c_loaded) {
+    return;
+  }
+  proof_size_ -= size;
+  status = c_loaded;
+  proof_size_ += size = estimate_serialized_size(cell);
+  max_level += (cell->special_type() == CellTraits::SpecialType::MerkleProof ||
+                cell->special_type() == CellTraits::SpecialType::MerkleUpdate);
+  for (unsigned i = 0; i < cell->size_refs(); ++i) {
+    auto child = cell->get_ref(i);
+    auto& [child_status, child_size] = cells_[child->get_hash(max_level)];
+    if (child_status == c_none) {
+      child_status = c_prunned;
+      proof_size_ += child_size = estimate_prunned_size(child->get_level_mask().apply(max_level));
+    }
+  }
+}
+
+void ProofStorageStat::add_loaded_cell(const Ref<Cell>& cell) {
+  auto loaded = cell->load_cell().ensure().move_as_ok();
+  add_loaded_cell(loaded.data_cell, (td::uint8)cell->get_level());
+}
+
+void ProofStorageStat::add_loaded_cells(const ProofStorageStat& other) {
+  for (const auto& [hash, x] : other.cells_) {
+    const auto& [new_status, new_size] = x;
+    auto& [old_status, old_size] = cells_[hash];
+    if (old_status >= new_status) {
+      continue;
+    }
+    proof_size_ -= old_size;
+    old_status = new_status;
+    proof_size_ += old_size = new_size;
+  }
+}
+
+td::uint64 ProofStorageStat::estimate_proof_size() const {
+  return proof_size_;
+}
+
+ProofStorageStat::CellStatus ProofStorageStat::get_cell_status(const Cell::Hash& hash) const {
+  auto it = cells_.find(hash);
+  return it == cells_.end() ? c_none : it->second.first;
+}
+
+td::uint64 ProofStorageStat::estimate_prunned_size(const detail::LevelMask& level_mask) {
+  return 7 + level_mask.get_hashes_count() * (32 + 2);
+}
+
+td::uint64 ProofStorageStat::estimate_serialized_size(const Ref<DataCell>& cell) {
+  return cell->get_serialized_size() + cell->size_refs() * 3 + 3;
+}
+
+void MerkleUpdateLeftStat::add_loaded_cell(const Ref<Cell>& cell, unsigned merkle_depth) {
+  auto& info = cells_[{cell->get_hash(), merkle_depth}];
+  if (info.status == c_loaded) {
+    return;
+  }
+  auto data_cell = cell->load_cell().ensure().move_as_ok().data_cell;
+  CHECK(!data_cell->is_virtualized());
+  proof_size_ -= info.size;
+  info.status = c_loaded;
+  proof_size_ += info.size = ProofStorageStat::estimate_serialized_size(data_cell);
+  if (data_cell->special_type() == CellTraits::SpecialType::MerkleProof ||
+      data_cell->special_type() == CellTraits::SpecialType::MerkleUpdate) {
+    ++merkle_depth;
+  }
+  for (unsigned i = 0; i < data_cell->size_refs(); ++i) {
+    auto child = data_cell->get_ref(i);
+    auto& child_info = cells_[{child->get_hash(), merkle_depth}];
+    if (child_info.status == c_none) {
+      child_info.status = c_prunned;
+      proof_size_ += child_info.size = ProofStorageStat::estimate_prunned_size(child->get_level_mask());
+    }
+  }
+}
+
+td::uint64 MerkleUpdateLeftStat::estimate_proof_size() const {
+  return proof_size_;
 }
 
 }  // namespace vm

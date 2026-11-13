@@ -16,17 +16,19 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "crypto/Ed25519.h"
-#include "td/utils/logging.h"
-#include "td/utils/misc.h"
-#include "td/utils/Slice.h"
-#include "td/utils/tests.h"
-#include "td/utils/JsonBuilder.h"
-
-#include "wycheproof.h"
-
 #include <string>
 #include <utility>
+
+#include "crypto/Ed25519.h"
+#include "keys/keys.hpp"
+#include "td/utils/JsonBuilder.h"
+#include "td/utils/Slice.h"
+#include "td/utils/benchmark.h"
+#include "td/utils/logging.h"
+#include "td/utils/misc.h"
+#include "td/utils/tests.h"
+
+#include "wycheproof.h"
 
 unsigned char fixed_privkey[32] = "abacabadabacabaeabacabadabacaba";
 unsigned char fixed_pubkey[32] = {0x6f, 0x9e, 0x5b, 0xde, 0xce, 0x87, 0x21, 0xeb, 0x57, 0x37, 0xfb,
@@ -152,7 +154,7 @@ TEST(Crypto, wycheproof) {
   auto json_str = wycheproof_ed25519();
   auto value = td::json_decode(json_str).move_as_ok();
   auto &root = value.get_object();
-  auto test_groups_o = get_json_object_field(root, "testGroups", td::JsonValue::Type::Array, false).move_as_ok();
+  auto test_groups_o = root.extract_required_field("testGroups", td::JsonValue::Type::Array).move_as_ok();
   auto &test_groups = test_groups_o.get_array();
   auto from_hexc = [](char c) {
     if (c >= '0' && c <= '9') {
@@ -170,27 +172,22 @@ TEST(Crypto, wycheproof) {
   };
   for (auto &test_o : test_groups) {
     auto &test = test_o.get_object();
-    auto key_o = get_json_object_field(test, "key", td::JsonValue::Type::Object, false).move_as_ok();
-    auto sk_str = td::get_json_object_string_field(key_o.get_object(), "sk", false).move_as_ok();
-    auto pk_str = td::get_json_object_string_field(key_o.get_object(), "pk", false).move_as_ok();
+    auto key_o = test.extract_required_field("key", td::JsonValue::Type::Object).move_as_ok();
+    auto sk_str = key_o.get_object().get_required_string_field("sk").move_as_ok();
+    auto pk_str = key_o.get_object().get_required_string_field("pk").move_as_ok();
     auto pk = td::Ed25519::PublicKey(td::SecureString(from_hex(pk_str)));
     auto sk = td::Ed25519::PrivateKey(td::SecureString(from_hex(sk_str)));
     CHECK(sk.get_public_key().move_as_ok().as_octet_string().as_slice() == pk.as_octet_string().as_slice());
 
-    //auto key =
-    //td::Ed25519::PrivateKey::from_pem(
-    //td::SecureString(td::get_json_object_string_field(test, "keyPem", false).move_as_ok()), td::SecureString())
-    //.move_as_ok();
-
-    auto tests_o = get_json_object_field(test, "tests", td::JsonValue::Type::Array, false).move_as_ok();
+    auto tests_o = test.extract_required_field("tests", td::JsonValue::Type::Array).move_as_ok();
     auto &tests = tests_o.get_array();
     for (auto &test_o : tests) {
       auto &test = test_o.get_object();
-      auto id = td::get_json_object_string_field(test, "tcId", false).move_as_ok();
-      auto comment = td::get_json_object_string_field(test, "comment", false).move_as_ok();
-      auto sig = from_hex(td::get_json_object_string_field(test, "sig", false).move_as_ok());
-      auto msg = from_hex(td::get_json_object_string_field(test, "msg", false).move_as_ok());
-      auto result = td::get_json_object_string_field(test, "result", false).move_as_ok();
+      auto id = test.get_required_string_field("tcId").move_as_ok();
+      auto comment = test.get_required_string_field("comment").move_as_ok();
+      auto sig = from_hex(test.get_required_string_field("sig").move_as_ok());
+      auto msg = from_hex(test.get_required_string_field("msg").move_as_ok());
+      auto result = test.get_required_string_field("result").move_as_ok();
       auto has_result = pk.verify_signature(msg, sig).is_ok() ? "valid" : "invalid";
       if (result != has_result) {
         bad_tests.push_back({id, comment});
@@ -216,4 +213,37 @@ TEST(Crypto, almost_zero) {
       break;
     }
   }
+}
+
+BENCH(ed25519_sign, "ed25519_sign") {
+  auto private_key = td::Ed25519::generate_private_key().move_as_ok();
+  std::string hash_to_sign(32, 'a');
+  for (int i = 0; i < n; i++) {
+    private_key.sign(hash_to_sign).ensure();
+  }
+}
+
+BENCH(ed25519_shared_secret, "ed25519_shared_secret") {
+  auto private_key_a = td::Ed25519::generate_private_key().move_as_ok();
+  auto private_key_b = td::Ed25519::generate_private_key().move_as_ok();
+  auto public_key_b = private_key_a.get_public_key().move_as_ok();
+  for (int i = 0; i < n; i++) {
+    td::Ed25519::compute_shared_secret(public_key_b, private_key_a).ensure();
+  }
+}
+
+BENCH(ed25519_verify, "ed25519_verify") {
+  auto private_key = td::Ed25519::generate_private_key().move_as_ok();
+  std::string hash_to_sign(32, 'a');
+  auto public_key = private_key.get_public_key().move_as_ok();
+  auto signature = private_key.sign(hash_to_sign).move_as_ok();
+  for (int i = 0; i < n; i++) {
+    public_key.verify_signature(hash_to_sign, signature).ensure();
+  }
+}
+
+TEST(Crypto, ed25519_benchmark) {
+  bench(ed25519_signBench());
+  bench(ed25519_shared_secretBench());
+  bench(ed25519_verifyBench());
 }

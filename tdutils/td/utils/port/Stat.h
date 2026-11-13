@@ -18,17 +18,17 @@
 */
 #pragma once
 
-#include "td/utils/port/config.h"
-
-#include "td/utils/common.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Status.h"
+#include "td/utils/common.h"
+#include "td/utils/port/config.h"
 
 namespace td {
 
 struct Stat {
   bool is_dir_;
   bool is_reg_;
+  bool is_symbolic_link_;
   int64 size_;
   int64 real_size_;
   uint64 atime_nsec_;
@@ -63,5 +63,13 @@ Result<Stat> fstat(int native_fd);
 Status update_atime(CSlice path) TD_WARN_UNUSED_RESULT;
 
 #endif
+
+struct TotalMemStat {
+  uint64 total_ram;
+  uint64 available_ram;
+};
+Result<TotalMemStat> get_total_mem_stat() TD_WARN_UNUSED_RESULT;
+
+Result<uint32> get_cpu_cores() TD_WARN_UNUSED_RESULT;
 
 }  // namespace td

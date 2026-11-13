@@ -1,0 +1,465 @@
+/*
+    This file is part of TON Blockchain Library.
+
+    TON Blockchain Library is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 2 of the License, or
+    (at your option) any later version.
+
+    TON Blockchain Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#include "tolk.h"
+#include "compiler-state.h"
+#include "type-system.h"
+
+namespace tolk {
+
+/*
+ * 
+ *   ABSTRACT CODE
+ * 
+ */
+
+std::ostream& operator<<(std::ostream& os, const TmpVar& var) {
+  os << '\'' << var.ir_idx;   // vars are printed out as `'1 '2` (in stack comments, debug info, etc.)
+  if (!var.name.empty()) {
+    os << '_' << var.name;
+  }
+#ifdef TOLK_DEBUG
+  if (var.purpose) {
+    os << ' ' << var.purpose;    // "purpose" of implicitly created tmp var, like `'15 (binary-op) '16 (glob-var)`
+  }
+#endif
+  return os;
+}
+
+void VarDescr::show_value(std::ostream& os) const {
+  if (val & _Int) {
+    os << 'i';
+  }
+  if (val & _Const) {
+    os << 'c';
+  }
+  if (val & _Zero) {
+    os << '0';
+  }
+  if (val & _NonZero) {
+    os << '!';
+  }
+  if (val & _Pos) {
+    os << '>';
+  }
+  if (val & _Neg) {
+    os << '<';
+  }
+  if (val & _Bool) {
+    os << 'B';
+  }
+  if (val & _Bit) {
+    os << 'b';
+  }
+  if (val & _Even) {
+    os << 'E';
+  }
+  if (val & _Odd) {
+    os << 'O';
+  }
+  if (val & _Finite) {
+    os << 'f';
+  }
+  if (val & _Nan) {
+    os << 'N';
+  }
+  if (int_const.not_null()) {
+    os << '=' << int_const;
+  }
+}
+
+void VarDescr::show(std::ostream& os, const char* name) const {
+  if (flags & _Last) {
+    os << '*';
+  }
+  if (flags & _Unused) {
+    os << '?';
+  }
+  if (name) {
+    os << name;
+  }
+  os << '\'' << idx;
+  show_value(os);
+}
+
+void VarDescr::set_const(long long value) {
+  return set_const(td::make_refint(value));
+}
+
+void VarDescr::set_const(td::RefInt256 value) {
+  int_const = std::move(value);
+  if (!int_const->signed_fits_bits(257)) {
+    int_const.write().invalidate();
+  }
+  val = _Const | _Int;
+  int s = sgn(int_const);
+  if (s < -1) {
+    val |= _Nan | _NonZero;
+  } else if (s < 0) {
+    val |= _NonZero | _Neg | _Finite;
+    if (*int_const == -1) {
+      val |= _Bool;
+    }
+  } else if (s > 0) {
+    val |= _NonZero | _Pos | _Finite;
+  } else if (!s) {
+    //if (*int_const == 1) {
+    //  val |= _Bit;
+    //}
+    val |= _Zero | _Neg | _Pos | _Finite | _Bool | _Bit;
+  }
+  if (val & _Finite) {
+    val |= int_const->get_bit(0) ? _Odd : _Even;
+  }
+}
+
+void VarDescr::set_const(const std::string&) {
+  int_const.clear();
+  val = _Const;
+}
+
+void VarDescr::operator|=(const VarDescr& y) {
+  val &= y.val;
+  if (is_int_const() && y.is_int_const() && cmp(int_const, y.int_const) != 0) {
+    val &= ~_Const;
+  }
+  if (!(val & _Const)) {
+    int_const.clear();
+  }
+}
+
+void VarDescr::operator&=(const VarDescr& y) {
+  val |= y.val;
+  if (y.int_const.not_null() && int_const.is_null()) {
+    int_const = y.int_const;
+  }
+}
+
+void VarDescr::set_value(const VarDescr& y) {
+  val = y.val;
+  int_const = y.int_const;
+}
+
+void VarDescr::set_value(VarDescr&& y) {
+  val = y.val;
+  int_const = std::move(y.int_const);
+}
+
+void VarDescr::clear_value() {
+  val = 0;
+  int_const.clear();
+}
+
+void VarDescrList::show(std::ostream& os) const {
+  if (unreachable) {
+    os << "<unreachable> ";
+  }
+  os << "[";
+  for (const auto& v : list) {
+    os << ' ' << v;
+  }
+  os << " ]\n";
+}
+
+void Op::show(std::ostream& os, const std::vector<TmpVar>& vars, const std::string& indent, int mode) const {
+  if (mode & 2) {
+    os << indent << " [";
+    for (const auto& v : var_info.list) {
+      os << ' ';
+      if (v.flags & VarDescr::_Last) {
+        os << '*';
+      }
+      if (v.flags & VarDescr::_Unused) {
+        os << '?';
+      }
+      os << vars[v.idx];
+      if (mode & 4) {
+        os << ':';
+        v.show_value(os);
+      }
+    }
+    os << " ]\n";
+  }
+  std::string dis = disabled() ? "<disabled> " : "";
+  if (noreturn()) {
+    dis += "<noret> ";
+  }
+  if (keep_even_if_unused()) {
+    dis += "<keep> ";
+  }
+  switch (cl) {
+    case _Nop:
+      os << indent << dis << "NOP\n";
+      break;
+    case _Call:
+      os << indent << dis << "CALL: ";
+      show_var_list(os, left, vars);
+      os << " := " << (f_sym ? f_sym->name : "(null)") << " ";
+      if ((mode & 4) && args.size() == right.size()) {
+        show_var_list(os, args, vars);
+      } else {
+        show_var_list(os, right, vars);
+      }
+      os << std::endl;
+      break;
+    case _CallInd:
+      os << indent << dis << "CALLIND: ";
+      show_var_list(os, left, vars);
+      os << " := EXEC ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _Let:
+      os << indent << dis << "LET ";
+      show_var_list(os, left, vars);
+      os << " := ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _Tuple:
+      os << indent << dis << "MKTUPLE ";
+      show_var_list(os, left, vars);
+      os << " := ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _UnTuple:
+      os << indent << dis << "UNTUPLE ";
+      show_var_list(os, left, vars);
+      os << " := ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _IntConst:
+      os << indent << dis << "CONST ";
+      show_var_list(os, left, vars);
+      os << " := " << int_const << std::endl;
+      break;
+    case _SliceConst:
+      os << indent << dis << "SCONST ";
+      show_var_list(os, left, vars);
+      os << " := " << str_const << std::endl;
+      break;
+    case _SnakeStringConst:
+      os << indent << dis << "SNAKE_STR ";
+      show_var_list(os, left, vars);
+      os << " := " << str_const << std::endl;
+      break;
+    case _DebugMark:
+      if (false) {    // don't pollute IR code in console with debug marks (they will overwhelm IR list)
+        os << indent << dis;
+        AsmOp::DebugMark(debug_mark).out(os);
+        os << std::endl;
+      }
+      break;
+    case _Import:
+      os << indent << dis << "IMPORT ";
+      show_var_list(os, left, vars);
+      os << std::endl;
+      break;
+    case _Return:
+      os << indent << dis << "RETURN ";
+      show_var_list(os, left, vars);
+      os << std::endl;
+      break;
+    case _GlobVar:
+      os << indent << dis << "GLOBVAR ";
+      show_var_list(os, left, vars);
+      os << " := " << (g_sym ? g_sym->name : "(null)") << std::endl;
+      break;
+    case _SetGlob:
+      os << indent << dis << "SETGLOB ";
+      os << (g_sym ? g_sym->name : "(null)") << " := ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _SetContArgs:
+      os << indent << dis << "SETCONTARGS ";
+      show_var_list(os, left, vars);
+      os << " := ";
+      show_var_list(os, right, vars);
+      os << std::endl;
+      break;
+    case _Repeat:
+      os << indent << dis << "REPEAT ";
+      show_var_list(os, left, vars);
+      os << ' ';
+      block0.show(os, vars, indent, mode);
+      os << std::endl;
+      break;
+    case _If:
+      os << indent << dis << "IF ";
+      show_var_list(os, left, vars);
+      os << ' ';
+      block0.show(os, vars, indent, mode);
+      os << " ELSE ";
+      block1.show(os, vars, indent, mode);
+      os << std::endl;
+      break;
+    case _While:
+      os << indent << dis << "WHILE ";
+      show_var_list(os, left, vars);
+      os << ' ';
+      block0.show(os, vars, indent, mode);
+      os << " DO ";
+      block1.show(os, vars, indent, mode);
+      os << std::endl;
+      break;
+    case _Until:
+      os << indent << dis << "UNTIL ";
+      show_var_list(os, left, vars);
+      os << ' ';
+      block0.show(os, vars, indent, mode);
+      os << std::endl;
+      break;
+    case _Again:
+      os << indent << dis << "AGAIN ";
+      show_var_list(os, left, vars);
+      os << ' ';
+      block0.show(os, vars, indent, mode);
+      os << std::endl;
+      break;
+    case _BreakFromLoop:
+      os << indent << dis << "BREAK" << std::endl;
+      break;
+    case _TryCatch:
+      os << indent << dis << "TRYCATCH ";
+      show_var_list(os, left, vars);
+      os << std::endl;
+      break;
+    default:
+      tolk_assert(false);
+  }
+}
+
+void Op::show_var_list(std::ostream& os, const std::vector<var_idx_t>& idx_list,
+                       const std::vector<TmpVar>& vars) const {
+  if (!idx_list.size()) {
+    os << "()";
+  } else if (idx_list.size() == 1) {
+    os << vars.at(idx_list[0]);
+  } else {
+    os << "(" << vars.at(idx_list[0]);
+    for (std::size_t i = 1; i < idx_list.size(); i++) {
+      os << ", " << vars.at(idx_list[i]);
+    }
+    os << ")";
+  }
+}
+
+void Op::show_var_list(std::ostream& os, const std::vector<VarDescr>& list, const std::vector<TmpVar>& vars) const {
+  auto n = list.size();
+  if (!n) {
+    os << "()";
+  } else {
+    os << "( ";
+    for (std::size_t i = 0; i < list.size(); i++) {
+      if (i) {
+        os << ", ";
+      }
+      if (list[i].is_unused()) {
+        os << '?';
+      }
+      os << vars.at(list[i].idx) << ':';
+      list[i].show_value(os);
+    }
+    os << " )";
+  }
+}
+
+void OpList::show(std::ostream& os, const std::vector<TmpVar>& vars, const std::string& indent, int mode) const {
+  os << "{" << std::endl;
+  std::string sub_indent = indent + "  ";
+  for (const auto& op : list) {
+    op->show(os, vars, sub_indent, mode);
+  }
+  os << indent << "}";
+}
+
+std::ostream& operator<<(std::ostream& os, const CodeBlob& code) {
+  code.print(os);
+  return os;
+}
+
+// flags: +1 = show variable definition locations; +2 = show vars after each op; +4 = show var abstract value info after each op; +8 = show all variables at start
+void CodeBlob::print(std::ostream& os, int flags) const {
+  os << "CODE BLOB: " << var_cnt << " variables, " << in_var_cnt << " input\n";
+  if ((flags & 8) != 0) {
+    for (const TmpVar& var : vars) {
+      os << var << " : " << var.v_type->as_human_readable() << std::endl;
+    }
+  }
+  os << "------- BEGIN --------\n";
+  for (const auto& op : ops) {
+    op->show(os, vars, "", flags);
+  }
+  os << "-------- END ---------\n\n";
+}
+
+std::vector<var_idx_t> CodeBlob::create_var(TypePtr var_type, AnyV origin, std::string name) {
+  std::vector<var_idx_t> ir_idx;
+  int stack_w = var_type->get_width_on_stack();
+  ir_idx.reserve(stack_w);
+  if (const TypeDataStruct* t_struct = var_type->try_as<TypeDataStruct>()) {
+    for (int i = 0; i < t_struct->struct_ref->get_num_fields(); ++i) {
+      StructFieldPtr field_ref = t_struct->struct_ref->get_field(i);
+      std::string sub_name = name.empty() || t_struct->struct_ref->get_num_fields() == 1 ? name : name + "." + field_ref->name;
+      std::vector nested = create_var(field_ref->declared_type, origin, std::move(sub_name));
+      ir_idx.insert(ir_idx.end(), nested.begin(), nested.end());
+    }
+  } else if (const TypeDataTensor* t_tensor = var_type->try_as<TypeDataTensor>()) {
+    for (int i = 0; i < t_tensor->size(); ++i) {
+      std::string sub_name = name.empty() ? name : name + "." + std::to_string(i);
+      std::vector nested = create_var(t_tensor->items[i], origin, std::move(sub_name));
+      ir_idx.insert(ir_idx.end(), nested.begin(), nested.end());
+    }
+  } else if (const TypeDataAlias* t_alias = var_type->try_as<TypeDataAlias>()) {
+    ir_idx = create_var(t_alias->underlying_type, origin, std::move(name));
+  } else if (const TypeDataUnion* t_union = var_type->try_as<TypeDataUnion>(); t_union && stack_w != 1) {
+    std::string utag_name = name.empty() ? "'UTag" : name + ".UTag";
+    if (t_union->or_null) {   // in stack comments, `a:(int,int)?` will be "a.0 a.1 a.UTag"
+      ir_idx = create_var(t_union->or_null, origin, std::move(name));
+    } else {                  // in stack comments, `a:int|slice` will be "a.USlot1 a.UTag"
+      for (int i = 0; i < stack_w - 1; ++i) {
+        std::string slot_name = name.empty() ? "'USlot" + std::to_string(i + 1) : name + ".USlot" + std::to_string(i + 1);
+        ir_idx.emplace_back(create_var(TypeDataUnknown::create(), origin, std::move(slot_name))[0]);
+      }
+    }
+    ir_idx.emplace_back(create_var(TypeDataInt::create(), origin, std::move(utag_name))[0]);
+  } else if (var_type != TypeDataVoid::create() && var_type != TypeDataNever::create()) {
+#ifdef TOLK_DEBUG
+    tolk_assert(stack_w == 1);
+#endif
+    vars.emplace_back(var_cnt, var_type, std::move(name));
+    ir_idx.emplace_back(var_cnt);
+    var_cnt++;
+  }
+  tolk_assert(static_cast<int>(ir_idx.size()) == stack_w);
+  return ir_idx;
+}
+
+var_idx_t CodeBlob::create_int(AnyV origin, int64_t value, const char* purpose) {
+  vars.emplace_back(var_cnt, TypeDataInt::create(), std::string{});
+#ifdef TOLK_DEBUG
+  vars.back().purpose = purpose;
+#endif
+  var_idx_t ir_int = var_cnt;
+  var_cnt++;
+  add_int_const(origin, {ir_int}, td::make_refint(value));
+  return ir_int;
+}
+
+}  // namespace tolk

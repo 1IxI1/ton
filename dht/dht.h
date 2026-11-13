@@ -18,15 +18,11 @@
 */
 #pragma once
 
-#include "td/utils/int_types.h"
-
-#include "td/actor/PromiseFuture.h"
-
-#include "td/actor/actor.h"
-
 #include "adnl/adnl.h"
-
 #include "auto/tl/ton_api.hpp"
+#include "td/actor/PromiseFuture.h"
+#include "td/actor/actor.h"
+#include "td/utils/int_types.h"
 
 #include "dht-types.h"
 
@@ -53,6 +49,7 @@ class Dht : public td::actor::Actor {
 
   virtual void set_value(DhtValue key_value, td::Promise<td::Unit> result) = 0;
   virtual void get_value(DhtKey key, td::Promise<DhtValue> result) = 0;
+  virtual void get_value_many(DhtKey key, std::function<void(DhtValue)> callback, td::Promise<td::Unit> promise) = 0;
 
   virtual void register_reverse_connection(adnl::AdnlNodeIdFull client, td::Promise<td::Unit> promise) = 0;
   virtual void request_reverse_ping(adnl::AdnlNode target, adnl::AdnlNodeIdShort client,

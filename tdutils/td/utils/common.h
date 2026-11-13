@@ -54,12 +54,12 @@
 #endif
 // clang-format on
 
+#include <string>
+#include <vector>
+
 #include "td/utils/check.h"
 #include "td/utils/int_types.h"
 #include "td/utils/unique_ptr.h"
-
-#include <string>
-#include <vector>
 
 #define TD_DEBUG
 
@@ -125,6 +125,14 @@ struct Auto {
   operator ToT() const {
     return ToT();
   }
+};
+
+struct NoCopyOrMove {
+  NoCopyOrMove() = default;
+  NoCopyOrMove(NoCopyOrMove &&) = delete;
+  NoCopyOrMove(const NoCopyOrMove &) = delete;
+  NoCopyOrMove &operator=(NoCopyOrMove &&) = delete;
+  NoCopyOrMove &operator=(const NoCopyOrMove &) = delete;
 };
 
 }  // namespace td

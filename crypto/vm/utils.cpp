@@ -55,6 +55,10 @@ td::Slice get_word(td::Slice& str, const char* delims, const char* specials) {
 }  // namespace
 
 td::Result<vm::StackEntry> parse_stack_entry_in(td::Slice& str, bool prefix_only) {
+  auto* vsi = VmStateInterface::get();
+  if (vsi && !vsi->register_op()) {
+    return td::Status::Error("too big stack");
+  }
   auto word = get_word(str, " \t", "[()]");
   if (word.empty()) {
     return td::Status::Error("stack value expected instead of end-of-line");
@@ -96,10 +100,10 @@ td::Result<vm::StackEntry> convert_stack_entry(td::Slice str) {
   }
   if (l >= 3 && (str[0] == 'x' || str[0] == 'b') && str[1] == '{' && str.back() == '}') {
     unsigned char buff[128];
-    int bits =
-        (str[0] == 'x')
-            ? (int)td::bitstring::parse_bitstring_hex_literal(buff, sizeof(buff), str.begin() + 2, str.end() - 1)
-            : (int)td::bitstring::parse_bitstring_binary_literal(buff, sizeof(buff), str.begin() + 2, str.end() - 1);
+    int bits = (str[0] == 'x')
+                   ? (int)td::bitstring::parse_bitstring_hex_literal(buff, sizeof(buff), str.begin() + 2, str.end() - 1)
+                   : (int)td::bitstring::parse_bitstring_binary_literal(buff, sizeof(buff) * 8, str.begin() + 2,
+                                                                        str.end() - 1);
     if (bits < 0) {
       return td::Status::Error("failed to parse raw b{...}/x{...} number");
     }

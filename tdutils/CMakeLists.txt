@@ -1,6 +1,7 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
 option(TDUTILS_MIME_TYPE "Generate mime types conversion (gperf is required)" ON)
+option(TDUTILS_USE_LIBBACKTRACE "Use libbacktrace for better stack traces" ON)
+
+set(TD_HAVE_OPENSSL 1)
 
 if (WIN32)
   if (WINGETOPT_FOUND)
@@ -14,21 +15,17 @@ if (NOT DEFINED CMAKE_INSTALL_LIBDIR)
   set(CMAKE_INSTALL_LIBDIR "lib")
 endif()
 
-find_package(PkgConfig REQUIRED)
+find_package(PkgConfig QUIET)
 if (NOT ZLIB_FOUND)
-  pkg_check_modules(ZLIB zlib)
+  if (PkgConfig_FOUND)
+    pkg_check_modules(ZLIB zlib)
+  else()
+    find_package(ZLIB QUIET)
+  endif()
 endif()
 if (ZLIB_FOUND)
   set(TD_HAVE_ZLIB 1)
   message(STATUS "Found ZLIB: ${ZLIB_INCLUDE_DIR} ${ZLIB_LIBRARIES}")
-
-  # OpenSSL internally depends on zlib
-  if (NOT OPENSSL_FOUND)
-    find_package(OpenSSL)
-  endif()
-  if (OPENSSL_FOUND)
-    set(TD_HAVE_OPENSSL 1)
-  endif()
 endif()
 
 if (CRC32C_FOUND)
@@ -37,6 +34,16 @@ endif()
 
 if (ABSL_FOUND)
   set(TD_HAVE_ABSL 1)
+endif()
+
+# libbacktrace support - check if target exists (built at higher level)
+if (TDUTILS_USE_LIBBACKTRACE)
+  if (TARGET libbacktrace AND NOT WIN32)
+    set(TD_HAVE_LIBBACKTRACE 1)
+    message(STATUS "Using libbacktrace for enhanced stack traces")
+  else()
+    message(STATUS "libbacktrace target not found, using basic backtrace")
+  endif()
 endif()
 
 configure_file(td/utils/config.h.in td/utils/config.h @ONLY)
@@ -95,11 +102,13 @@ set(TDUTILS_SOURCE
   td/utils/BigNum.cpp
   td/utils/buffer.cpp
   td/utils/BufferedUdp.cpp
+  td/utils/AsyncFileLog.cpp
   td/utils/check.cpp
   td/utils/crypto.cpp
   td/utils/FileLog.cpp
   td/utils/filesystem.cpp
   td/utils/find_boundary.cpp
+  td/utils/FlatHashTable.cpp
   td/utils/Gzip.cpp
   td/utils/GzipByteFlow.cpp
   td/utils/Hints.cpp
@@ -112,6 +121,7 @@ set(TDUTILS_SOURCE
   td/utils/PathView.cpp
   td/utils/Random.cpp
   td/utils/SharedSlice.cpp
+  td/utils/SipHash.cpp
   td/utils/Slice.cpp
   td/utils/StackAllocator.cpp
   td/utils/Status.cpp
@@ -174,6 +184,7 @@ set(TDUTILS_SOURCE
   td/utils/port/detail/WineventPoll.h
 
   td/utils/AesCtrByteFlow.h
+  td/utils/AsyncFileLog.h
   td/utils/as.h
   td/utils/base64.h
   td/utils/benchmark.h
@@ -216,6 +227,7 @@ set(TDUTILS_SOURCE
   td/utils/invoke.h
   td/utils/JsonBuilder.h
   td/utils/List.h
+  td/utils/LRUCache.h
   td/utils/logging.h
   td/utils/MemoryLog.h
   td/utils/misc.h
@@ -235,9 +247,11 @@ set(TDUTILS_SOURCE
   td/utils/PathView.h
   td/utils/queue.h
   td/utils/Random.h
+  td/utils/RateLimiterWindow.h
   td/utils/ScopeGuard.h
   td/utils/SharedObjectPool.h
   td/utils/SharedSlice.h
+  td/utils/SipHash.h
   td/utils/Slice-decl.h
   td/utils/Slice.h
   td/utils/Span.h
@@ -252,6 +266,7 @@ set(TDUTILS_SOURCE
   td/utils/ThreadLocalStorage.h
   td/utils/ThreadSafeCounter.h
   td/utils/Time.h
+  td/utils/TimestampFormat.h
   td/utils/date.h
   td/utils/TimedStat.h
   td/utils/Timer.h
@@ -280,6 +295,23 @@ if (TDUTILS_MIME_TYPE)
   )
 endif()
 
+if (NOT LZ4_FOUND)
+  if (PkgConfig_FOUND)
+    pkg_check_modules(LZ4 REQUIRED liblz4)
+  else()
+    find_package(lz4 REQUIRED)
+  endif()
+endif()
+
+if (LZ4_FOUND)
+  set(TD_HAVE_LZ4 1)
+  set(TDUTILS_SOURCE
+    ${TDUTILS_SOURCE}
+    td/utils/lz4.cpp
+    td/utils/lz4.h
+    )
+endif()
+
 set(TDUTILS_TEST_SOURCE
   ${CMAKE_CURRENT_SOURCE_DIR}/test/buffer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test/ConcurrentHashMap.cpp
@@ -302,6 +334,7 @@ set(TDUTILS_TEST_SOURCE
   ${CMAKE_CURRENT_SOURCE_DIR}/test/pq.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test/SharedObjectPool.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test/SharedSlice.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test/SpscRing.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test/StealingQueue.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/test/variant.cpp
   PARENT_SCOPE
@@ -326,8 +359,20 @@ endif()
 target_include_directories(tdutils PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>)
 
 if (OPENSSL_FOUND)
-  target_link_libraries(tdutils PRIVATE ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS} ${ZLIB_LIBRARIES})
+  if (MSVC)
+    if (OPENSSL_LIBRARIES)
+      target_link_libraries(tdutils PRIVATE ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES})
+    else()
+      target_link_libraries(tdutils PRIVATE ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS} ${ZLIB_LIBRARIES})
+    endif()
+  else()
+    target_link_libraries(tdutils PRIVATE ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS} ${ZLIB_LIBRARIES})
+  endif()
   target_include_directories(tdutils SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
+  # Ensure OpenSSL is built before tdutils
+  if (TARGET OpenSSL)
+    add_dependencies(tdutils OpenSSL)
+  endif()
 endif()
 
 if (ZLIB_FOUND)
@@ -338,8 +383,23 @@ endif()
 if (CRC32C_FOUND)
   target_link_libraries(tdutils PRIVATE crc32c)
 endif()
+
+if (LZ4_FOUND)
+  message(STATUS "Found LZ4 ${LZ4_LIBRARIES} ${LZ4_INCLUDE_DIRS}")
+  target_link_libraries(tdutils PRIVATE ${LZ4_LIBRARIES})
+  target_include_directories(tdutils SYSTEM PRIVATE ${LZ4_INCLUDE_DIRS})
+  if (LZ4_LIBRARY_DIRS)
+    target_link_directories(tdutils PRIVATE ${LZ4_LIBRARY_DIRS})
+  endif()
+endif()
+
 if (ABSL_FOUND)
   target_link_libraries_system(tdutils absl::flat_hash_map absl::flat_hash_set absl::hash)
+endif()
+
+if (TD_HAVE_LIBBACKTRACE)
+  target_link_libraries(tdutils PRIVATE libbacktrace)
+  target_compile_definitions(tdutils PRIVATE TD_HAVE_LIBBACKTRACE=1)
 endif()
 
 if (WIN32 AND WINGETOPT_FOUND)

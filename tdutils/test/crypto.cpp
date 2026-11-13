@@ -16,17 +16,19 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <algorithm>
+#include <limits>
+
+#include "td/utils/Random.h"
+#include "td/utils/SipHash.h"
+#include "td/utils/Slice.h"
+#include "td/utils/UInt.h"
 #include "td/utils/base64.h"
 #include "td/utils/benchmark.h"
 #include "td/utils/common.h"
 #include "td/utils/crypto.h"
 #include "td/utils/logging.h"
-#include "td/utils/Random.h"
-#include "td/utils/Slice.h"
 #include "td/utils/tests.h"
-#include "td/utils/UInt.h"
-
-#include <limits>
 
 static td::vector<td::string> strings{"", "1", "short test string", td::string(1000000, 'a')};
 
@@ -35,7 +37,7 @@ static td::vector<td::string> strings{"", "1", "short test string", td::string(1
 TEST(Crypto, Aes) {
   td::Random::Xorshift128plus rnd(123);
   td::UInt256 key;
-  rnd.bytes(as_slice(key));
+  rnd.bytes(as_mutable_slice(key));
   td::string plaintext(16, '\0');
   td::string encrypted(16, '\0');
   td::string decrypted(16, '\0');
@@ -180,7 +182,7 @@ TEST(Crypto, Sha256State) {
   for (auto length : {0, 1, 31, 32, 33, 9999, 10000, 10001, 999999, 1000001}) {
     auto s = td::rand_string(std::numeric_limits<char>::min(), std::numeric_limits<char>::max(), length);
     td::UInt256 baseline;
-    td::sha256(s, as_slice(baseline));
+    td::sha256(s, as_mutable_slice(baseline));
 
     td::Sha256State state;
     state.init();
@@ -191,7 +193,7 @@ TEST(Crypto, Sha256State) {
     }
     state = std::move(state2);
     td::UInt256 result;
-    state.extract(as_slice(result));
+    state.extract(as_mutable_slice(result));
     ASSERT_TRUE(baseline == result);
   }
 }
@@ -258,7 +260,7 @@ TEST(Crypto, md5) {
 
   for (std::size_t i = 0; i < strings.size(); i++) {
     td::string output(16, '\0');
-    td::md5(strings[i], output);
+    TD_SUPPRESS("-Wdeprecated-declarations", td::md5(strings[i], output));
     ASSERT_STREQ(answers[i], td::base64_encode(output));
   }
 }
@@ -401,4 +403,103 @@ TEST(Crypto, rsa) {
   auto encrypted_value = td::rsa_encrypt_pkcs1_oaep(rsa_public_key, value).move_as_ok();
   auto decrypted_value = td::rsa_decrypt_pkcs1_oaep(rsa_private_key, encrypted_value.as_slice()).move_as_ok();
   ASSERT_TRUE(decrypted_value.as_slice().truncate(value.size()) == value);
+}
+
+TEST(Crypto, sip_hash13) {
+  auto hash = [](td::Slice data) { return td::sip_hash13(data, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL); };
+
+  // The SipHash authors publish vectors for 2-4 only, so these come from an independent
+  // implementation of the 1-3 parameters written from the specification. They are what makes this
+  // SipHash-1-3 rather than a keyed hash that merely mixes well: every property below still holds
+  // if a rotation constant is mistyped, but these digests do not.
+  ASSERT_EQ(0xabac0158050fc4dcULL, hash(""));
+  ASSERT_EQ(0x1c2697ab786a6237ULL, hash("a"));
+  ASSERT_EQ(0x6fce24e8af8146ebULL, hash("abc"));
+  ASSERT_EQ(0xe393c48ea7bc21efULL, hash("0123456789abcdef"));
+
+  ASSERT_EQ(hash("abc"), hash("abc"));
+  ASSERT_TRUE(hash("abc") != td::sip_hash13("abc", 1, 2));
+  ASSERT_TRUE(hash("") != hash(td::Slice("\0", 1)));
+  ASSERT_TRUE(hash(td::Slice("\0", 1)) != hash(td::Slice("\0\0", 2)));
+
+  // Every bit of a connection-id sized input must reach the digest.
+  td::string base(20, '\0');
+  auto base_hash = hash(base);
+  for (size_t bit = 0; bit < base.size() * 8; bit++) {
+    auto flipped = base;
+    flipped[bit / 8] = static_cast<char>(flipped[bit / 8] ^ (1 << (bit % 8)));
+    ASSERT_TRUE(hash(flipped) != base_hash);
+  }
+
+  // Random keys must spread: a table of 4096 buckets holding 40k keys averages 10 per bucket, and a
+  // hash that ignored part of the input would pile them up instead.
+  constexpr size_t bucket_count = 4096;
+  constexpr size_t key_count = 40000;
+  td::vector<size_t> buckets(bucket_count);
+  for (size_t i = 0; i < key_count; i++) {
+    td::string key(20, '\0');
+    td::Random::secure_bytes(td::MutableSlice(key));
+    buckets[hash(key) % bucket_count]++;
+  }
+  auto worst = *std::max_element(buckets.begin(), buckets.end());
+  LOG_CHECK(worst < 40) << "worst bucket has " << worst << " of " << key_count << " keys";
+}
+
+TEST(Crypto, sip_hash13_benchmark) {
+  // The size that matters is a connection id: this hash sits on every packet's lookup.
+  class SipHash13Benchmark : public td::Benchmark {
+   public:
+    explicit SipHash13Benchmark(size_t size) : size_(size) {
+    }
+    td::string get_description() const override {
+      return PSTRING() << "sip_hash13 of " << size_ << " bytes";
+    }
+    void start_up() override {
+      data_ = td::string(size_, 'a');
+    }
+    void run(int n) override {
+      td::uint64 res = 0;
+      for (int i = 0; i < n; i++) {
+        res ^= td::sip_hash13(data_, 1, 2);
+      }
+      td::do_not_optimize_away(res);
+    }
+
+   private:
+    size_t size_;
+    td::string data_;
+  };
+
+  // What it replaced, kept here so the cost of being keyed stays visible.
+  class MultiplyHashBenchmark : public td::Benchmark {
+   public:
+    explicit MultiplyHashBenchmark(size_t size) : size_(size) {
+    }
+    td::string get_description() const override {
+      return PSTRING() << "h * 31 + byte of " << size_ << " bytes";
+    }
+    void start_up() override {
+      data_ = td::string(size_, 'a');
+    }
+    void run(int n) override {
+      td::uint64 res = 0;
+      for (int i = 0; i < n; i++) {
+        td::uint64 h = 0;
+        for (char c : data_) {
+          h = h * 31 + static_cast<unsigned char>(c);
+        }
+        res ^= h;
+      }
+      td::do_not_optimize_away(res);
+    }
+
+   private:
+    size_t size_;
+    td::string data_;
+  };
+
+  for (auto size : {size_t{8}, size_t{20}, size_t{64}}) {
+    td::bench(SipHash13Benchmark(size));
+    td::bench(MultiplyHashBenchmark(size));
+  }
 }

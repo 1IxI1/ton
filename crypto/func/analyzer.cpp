@@ -16,14 +16,16 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include "vm/boc.h"
+
 #include "func.h"
 
 namespace funC {
 
 /*
- *  
+ *
  *   ANALYZE AND PREPROCESS ABSTRACT CODE
- * 
+ *
  */
 
 void CodeBlob::simplify_var_types() {
@@ -80,7 +82,7 @@ bool CodeBlob::compute_used_code_vars(std::unique_ptr<Op>& ops_ptr, const VarDes
     func_assert(ops_ptr->cl == Op::_Nop);
     return ops_ptr->set_var_info(var_info);
   }
-  return compute_used_code_vars(ops_ptr->next, var_info, edit) | ops_ptr->compute_used_vars(*this, edit);
+  return int(compute_used_code_vars(ops_ptr->next, var_info, edit)) | int(ops_ptr->compute_used_vars(*this, edit));
 }
 
 bool operator==(const VarDescrList& x, const VarDescrList& y) {
@@ -583,7 +585,7 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
         ops = std::move(op.block1);
         return prune_unreachable(ops);
       } else {
-        reach = prune_unreachable(op.block0) | prune_unreachable(op.block1);
+        reach = int(prune_unreachable(op.block0)) | int(prune_unreachable(op.block1));
       }
       break;
     }
@@ -659,7 +661,7 @@ bool prune_unreachable(std::unique_ptr<Op>& ops) {
       break;
     }
     case Op::_TryCatch: {
-      reach = prune_unreachable(op.block0) | prune_unreachable(op.block1);
+      reach = int(prune_unreachable(op.block0)) | int(prune_unreachable(op.block1));
       break;
     }
     default:
@@ -891,15 +893,16 @@ bool Op::mark_noreturn() {
       return set_noreturn(true);
     case _If:
     case _TryCatch:
-      return set_noreturn((block0->mark_noreturn() & (block1 && block1->mark_noreturn())) | next->mark_noreturn());
+      return set_noreturn((int(block0->mark_noreturn()) & int(block1 && block1->mark_noreturn())) |
+                          int(next->mark_noreturn()));
     case _Again:
       block0->mark_noreturn();
       return set_noreturn(true);
     case _Until:
-      return set_noreturn(block0->mark_noreturn() | next->mark_noreturn());
+      return set_noreturn(int(block0->mark_noreturn()) | int(next->mark_noreturn()));
     case _While:
       block1->mark_noreturn();
-      return set_noreturn(block0->mark_noreturn() | next->mark_noreturn());
+      return set_noreturn(int(block0->mark_noreturn()) | int(next->mark_noreturn()));
     case _Repeat:
       block0->mark_noreturn();
       return set_noreturn(next->mark_noreturn());

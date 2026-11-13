@@ -16,19 +16,18 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "tl_writer.h"
-
-#include "tl_core.h"
-
 #include <cassert>
 #include <cstdio>
+
+#include "tl_core.h"
+#include "tl_writer.h"
 
 namespace td {
 namespace tl {
 
 std::string TL_writer::int_to_string(int x) {
   char buf[15];
-  std::sprintf(buf, "%d", x);
+  std::snprintf(buf, sizeof(buf), "%d", x);
   return buf;
 }
 

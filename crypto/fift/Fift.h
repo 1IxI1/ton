@@ -18,11 +18,10 @@
 */
 #pragma once
 
-#include "SourceLookup.h"
-#include "vm/db/TonDb.h"
-#include "Dictionary.h"
-
 #include "td/utils/Status.h"
+
+#include "Dictionary.h"
+#include "SourceLookup.h"
 
 namespace fift {
 struct IntCtx;
@@ -31,13 +30,11 @@ struct Fift {
  public:
   struct Config {
     fift::SourceLookup source_lookup;
-    vm::TonDb ton_db;
     fift::Dictionary dictionary;
     std::ostream* output_stream{&std::cout};
     std::ostream* error_stream{&std::cerr};
     bool show_backtrace{true};
   };
-  // Fift must own ton_db and dictionary, no concurrent access is allowed
   explicit Fift(Config config);
 
   td::Result<int> interpret_file(std::string fname, std::string current_dir, bool interactive = false);

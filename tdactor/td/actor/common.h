@@ -17,14 +17,13 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include "td/actor/PromiseFuture.h"
 #include "td/actor/core/Actor.h"
 #include "td/actor/core/ActorSignals.h"
-#include "td/actor/core/SchedulerId.h"
-#include "td/actor/core/SchedulerContext.h"
+#include "td/actor/core/ActorTypeStat.h"
 #include "td/actor/core/Scheduler.h"
-
-#include "td/actor/PromiseFuture.h"
-
+#include "td/actor/core/SchedulerContext.h"
+#include "td/actor/core/SchedulerId.h"
 #include "td/utils/Timer.h"
 
 namespace td {
@@ -68,7 +67,7 @@ using core::set_debug;
 struct Debug {
  public:
   Debug() = default;
-  Debug(std::shared_ptr<core::SchedulerGroupInfo> group_info) : group_info_(std::move(group_info)) {
+  Debug(core::SchedulerGroupInfo *group_info) : group_info_(group_info) {
   }
   template <class F>
   void for_each(F &&f) {
@@ -80,18 +79,29 @@ struct Debug {
     }
   }
 
-  void dump() {
-    for_each([](core::Debug &debug) {
+  void dump(td::StringBuilder &sb) {
+    sb << "list of active actors with names:\n";
+    for_each([&](core::Debug &debug) {
       core::DebugInfo info;
       debug.read(info);
       if (info.is_active) {
-        LOG(ERROR) << info.name << " " << td::format::as_time(Time::now() - info.start_at);
+        sb << "\t\"" << info.name << "\" is active for " << Time::now() - info.start_at << "s\n";
       }
     });
+    sb << "\nsizes of cpu local queues:\n";
+    for (auto &scheduler : group_info_->schedulers) {
+      for (size_t i = 0; i < scheduler.cpu_threads_count; i++) {
+        auto size = scheduler.cpu_local_queue[i].size();
+        if (size != 0) {
+          sb << "\tcpu#" << i << " queue.size() = " << size << "\n";
+        }
+      }
+    }
+    sb << "\n";
   }
 
  private:
-  std::shared_ptr<core::SchedulerGroupInfo> group_info_;
+  core::SchedulerGroupInfo *group_info_;
 };
 
 class Scheduler {
@@ -142,7 +152,7 @@ class Scheduler {
   }
 
   Debug get_debug() {
-    return Debug{group_info_};
+    return Debug{group_info_.get()};
   }
 
   bool run() {
@@ -158,13 +168,8 @@ class Scheduler {
   }
 
   template <class F>
-  void run_in_context(F &&f) {
-    schedulers_[0]->run_in_context(std::forward<F>(f));
-  }
-
-  template <class F>
-  void run_in_context_external(F &&f) {
-    schedulers_[0]->run_in_context_external(std::forward<F>(f));
+  auto run_in_context(F &&f) {
+    return schedulers_[0]->run_in_context(std::forward<F>(f));
   }
 
   void stop() {
@@ -199,6 +204,13 @@ class Scheduler {
     }
   }
 };
+
+using core::ActorTypeStat;
+using core::ActorTypeStatManager;
+using core::ActorTypeStats;
+
+template <class T>
+struct Task;
 
 // Some helper functions. Not part of public interface and not part
 // of namespace core
@@ -236,8 +248,8 @@ class ActorMessageCreator {
 
   // Use faster allocation?
 };
-struct ActorRef {
-  ActorRef(core::ActorInfo &actor_info, uint64 link_token = core::EmptyLinkToken)
+struct ActorTarget {
+  ActorTarget(core::ActorInfo &actor_info, uint64 link_token = core::EmptyLinkToken)
       : actor_info(actor_info), link_token(link_token) {
   }
 
@@ -247,11 +259,11 @@ struct ActorRef {
 
 template <class T>
 T &current_actor() {
-  return static_cast<T &>(core::ActorExecuteContext::get()->actor());
+  return static_cast<T &>(core::ActorExecuteContext::get().actor());
 }
 
 inline void send_message(core::ActorInfo &actor_info, core::ActorMessage message) {
-  auto scheduler_context_ptr = core::SchedulerContext::get();
+  auto scheduler_context_ptr = core::SchedulerContext::get_ptr();
   if (scheduler_context_ptr == nullptr) {
     //LOG(ERROR) << "send to actor is silently ignored";
     return;
@@ -262,13 +274,13 @@ inline void send_message(core::ActorInfo &actor_info, core::ActorMessage message
   executor.send(std::move(message));
 }
 
-inline void send_message(ActorRef actor_ref, core::ActorMessage message) {
+inline void send_message(ActorTarget actor_ref, core::ActorMessage message) {
   message.set_link_token(actor_ref.link_token);
   send_message(actor_ref.actor_info, std::move(message));
 }
 
 inline void send_message_later(core::ActorInfo &actor_info, core::ActorMessage message) {
-  auto scheduler_context_ptr = core::SchedulerContext::get();
+  auto scheduler_context_ptr = core::SchedulerContext::get_ptr();
   if (scheduler_context_ptr == nullptr) {
     //LOG(ERROR) << "send to actor is silently ignored";
     return;
@@ -280,14 +292,20 @@ inline void send_message_later(core::ActorInfo &actor_info, core::ActorMessage m
   executor.send(std::move(message));
 }
 
-inline void send_message_later(ActorRef actor_ref, core::ActorMessage message) {
+inline void send_message_later(ActorTarget actor_ref, core::ActorMessage message) {
   message.set_link_token(actor_ref.link_token);
   send_message_later(actor_ref.actor_info, std::move(message));
 }
 
+template <class ClosureT>
+auto run_on_current_actor(ClosureT &&closure) {
+  using ActorType = typename std::remove_cvref_t<ClosureT>::ActorType;
+  return closure.run(&current_actor<ActorType>());
+}
+
 template <class ExecuteF, class ToMessageF>
-void send_immediate(ActorRef actor_ref, ExecuteF &&execute, ToMessageF &&to_message) {
-  auto scheduler_context_ptr = core::SchedulerContext::get();
+void send_immediate(ActorTarget actor_ref, ExecuteF &&execute, ToMessageF &&to_message) {
+  auto scheduler_context_ptr = core::SchedulerContext::get_ptr();
   if (scheduler_context_ptr == nullptr) {
     //LOG(ERROR) << "send to actor is silently ignored";
     return;
@@ -304,73 +322,120 @@ void send_immediate(ActorRef actor_ref, ExecuteF &&execute, ToMessageF &&to_mess
 }
 
 template <class F>
-void send_lambda(ActorRef actor_ref, F &&lambda) {
+void send_lambda_immediate(ActorTarget actor_ref, F &&lambda) {
   send_immediate(actor_ref, lambda, [&lambda]() mutable { return ActorMessageCreator::lambda(std::move(lambda)); });
 }
 template <class F>
-void send_lambda_later(ActorRef actor_ref, F &&lambda) {
+void send_lambda_later(ActorTarget actor_ref, F &&lambda) {
   send_message_later(actor_ref, ActorMessageCreator::lambda(std::move(lambda)));
 }
 
+template <class F>
+void send_lambda(ActorTarget actor_ref, F &&lambda) {
+  send_lambda_immediate(actor_ref, std::forward<F>(lambda));
+}
+
 template <class ClosureT>
-void send_closure_impl(ActorRef actor_ref, ClosureT &&closure) {
-  using ActorType = typename ClosureT::ActorType;
+void send_closure_impl(ActorTarget actor_ref, ClosureT &&closure) {
   send_immediate(
-      actor_ref, [&closure]() mutable { closure.run(&current_actor<ActorType>()); },
+      actor_ref, [&closure]() mutable { run_on_current_actor(closure); },
       [&closure]() mutable {
         return ActorMessageCreator::lambda(
-            [closure = to_delayed_closure(std::move(closure))]() mutable { closure.run(&current_actor<ActorType>()); });
+            [closure = to_delayed_closure(std::move(closure))]() mutable { run_on_current_actor(closure); });
       });
 }
 
 template <class... ArgsT>
-void send_closure(ActorRef actor_ref, ArgsT &&... args) {
+void send_closure(ActorTarget actor_ref, ArgsT &&...args) {
   send_closure_impl(actor_ref, create_immediate_closure(std::forward<ArgsT>(args)...));
 }
 
 template <class ClosureT>
-void send_closure_later_impl(ActorRef actor_ref, ClosureT &&closure) {
-  using ActorType = typename ClosureT::ActorType;
-  send_message_later(actor_ref,
-                     ActorMessageCreator::lambda([closure = to_delayed_closure(std::move(closure))]() mutable {
-                       closure.run(&current_actor<ActorType>());
-                     }));
-}
-
-template <class ClosureT, class PromiseT>
-void send_closure_with_promise(ActorRef actor_ref, ClosureT &&closure, PromiseT &&promise) {
-  using ActorType = typename ClosureT::ActorType;
-  using ResultType = decltype(closure.run(&current_actor<ActorType>()));
-  auto &&promise_i = promise_interface<ResultType>(std::forward<PromiseT>(promise));
-  send_immediate(
-      actor_ref, [&closure, &promise = promise_i]() mutable { promise(closure.run(&current_actor<ActorType>())); },
-      [&closure, &promise = promise_i]() mutable {
-        return ActorMessageCreator::lambda(
-            [closure = to_delayed_closure(std::move(closure)), promise = std::move(promise)]() mutable {
-              promise(closure.run(&current_actor<ActorType>()));
-            });
-      });
-}
-
-template <class ClosureT, class PromiseT>
-void send_closure_with_promise_later(ActorRef actor_ref, ClosureT &&closure, PromiseT &&promise) {
-  using ActorType = typename ClosureT::ActorType;
-  using ResultType = decltype(closure.run(&current_actor<ActorType>()));
+void send_closure_later_impl(ActorTarget actor_ref, ClosureT &&closure) {
   send_message_later(
-      actor_ref,
-      ActorMessageCreator::lambda([closure = to_delayed_closure(std::move(closure)),
-                                   promise = promise_interface<ResultType>(std::forward<PromiseT>(promise))]() mutable {
-        promise(closure.run(&current_actor<ActorType>()));
-      }));
+      actor_ref, ActorMessageCreator::lambda(
+                     [closure = to_delayed_closure(std::move(closure))]() mutable { run_on_current_actor(closure); }));
+}
+
+// Helper to unwrap Result<T> to T, otherwise keep the type as is
+template <class T>
+struct unwrap_result {
+  using type = T;
+};
+template <class T>
+struct unwrap_result<td::Result<T>> {
+  using type = T;
+};
+template <class T>
+struct unwrap_result<td::actor::Task<T>> {
+  using type = T;
+};
+template <class T>
+using unwrap_result_t = typename unwrap_result<T>::type;
+
+template <class ClosureT, class PromiseT>
+void send_closure_with_promise(ActorTarget actor_ref, ClosureT &&closure, PromiseT &&promise) {
+  using RawResultType = decltype(run_on_current_actor(closure));
+  if constexpr (std::is_void_v<RawResultType>) {
+    // Adapt void to td::Unit
+    auto &&promise_i = promise_interface<td::Unit>(std::forward<PromiseT>(promise));
+    send_immediate(
+        actor_ref,
+        [&closure, &promise = promise_i]() mutable {
+          run_on_current_actor(closure);
+          promise.set_value(td::Unit());
+        },
+        [&closure, &promise = promise_i]() mutable {
+          return ActorMessageCreator::lambda(
+              [closure = to_delayed_closure(std::move(closure)), promise = std::move(promise)]() mutable {
+                run_on_current_actor(closure);
+                promise.set_value(td::Unit());
+              });
+        });
+  } else {
+    using ResultType = unwrap_result_t<RawResultType>;
+    auto &&promise_i = promise_interface<ResultType>(std::forward<PromiseT>(promise));
+    send_immediate(
+        actor_ref,
+        [&closure, &promise = promise_i]() mutable { connect(std::move(promise), run_on_current_actor(closure)); },
+        [&closure, &promise = promise_i]() mutable {
+          return ActorMessageCreator::lambda(
+              [closure = to_delayed_closure(std::move(closure)), promise = std::move(promise)]() mutable {
+                connect(std::move(promise), run_on_current_actor(closure));
+              });
+        });
+  }
+}
+
+template <class ClosureT, class PromiseT>
+void send_closure_with_promise_later(ActorTarget actor_ref, ClosureT &&closure, PromiseT &&promise) {
+  using RawResultType = decltype(run_on_current_actor(closure));
+  if constexpr (std::is_void_v<RawResultType>) {
+    // Adapt void to td::Unit
+    send_message_later(
+        actor_ref,
+        ActorMessageCreator::lambda([closure = to_delayed_closure(std::move(closure)),
+                                     promise = promise_interface<td::Unit>(std::forward<PromiseT>(promise))]() mutable {
+          run_on_current_actor(closure);
+          promise.set_value({});
+        }));
+  } else {
+    using ResultType = unwrap_result_t<RawResultType>;
+    send_message_later(actor_ref, ActorMessageCreator::lambda([closure = to_delayed_closure(std::move(closure)),
+                                                               promise = promise_interface<ResultType>(
+                                                                   std::forward<PromiseT>(promise))]() mutable {
+                         connect(std::move(promise), run_on_current_actor(closure));
+                       }));
+  }
 }
 
 template <class... ArgsT>
-void send_closure_later(ActorRef actor_ref, ArgsT &&... args) {
+void send_closure_later(ActorTarget actor_ref, ArgsT &&...args) {
   send_closure_later_impl(actor_ref, create_delayed_closure(std::forward<ArgsT>(args)...));
 }
 
-inline void send_signals(ActorRef actor_ref, ActorSignals signals) {
-  auto scheduler_context_ptr = core::SchedulerContext::get();
+inline void send_signals(ActorTarget actor_ref, ActorSignals signals) {
+  auto scheduler_context_ptr = core::SchedulerContext::get_ptr();
   if (scheduler_context_ptr == nullptr) {
     //LOG(ERROR) << "send to actor is silently ignored";
     return;
@@ -381,8 +446,8 @@ inline void send_signals(ActorRef actor_ref, ActorSignals signals) {
       core::ActorExecutor::Options().with_has_poll(scheduler_context.has_poll()).with_signals(signals.raw()));
 }
 
-inline void send_signals_later(ActorRef actor_ref, ActorSignals signals) {
-  auto scheduler_context_ptr = core::SchedulerContext::get();
+inline void send_signals_later(ActorTarget actor_ref, ActorSignals signals) {
+  auto scheduler_context_ptr = core::SchedulerContext::get_ptr();
   if (scheduler_context_ptr == nullptr) {
     //LOG(ERROR) << "send to actor is silently ignored";
     return;
@@ -396,17 +461,24 @@ inline void send_signals_later(ActorRef actor_ref, ActorSignals signals) {
 
 inline void register_actor_info_ptr(core::ActorInfoPtr actor_info_ptr) {
   auto state = actor_info_ptr->state().get_flags_unsafe();
-  core::SchedulerContext::get()->add_to_queue(std::move(actor_info_ptr), state.get_scheduler_id(), !state.is_shared());
+  actor_info_ptr->on_add_to_queue();
+  core::SchedulerContext::get().add_to_queue(std::move(actor_info_ptr), state.get_scheduler_id(), !state.is_shared());
 }
 
-template <class T, class... ArgsT>
-core::ActorInfoPtr create_actor(core::ActorOptions &options, ArgsT &&... args) noexcept {
-  auto *scheduler_context = core::SchedulerContext::get();
+template <class T>
+core::ActorInfoPtr create_actor_info(core::ActorOptions &options, std::unique_ptr<T> actor) noexcept {
+  auto *scheduler_context = core::SchedulerContext::get_ptr();
   if (!options.has_scheduler()) {
     options.on_scheduler(scheduler_context->get_scheduler_id());
   }
-  auto res =
-      scheduler_context->get_actor_info_creator().create(std::make_unique<T>(std::forward<ArgsT>(args)...), options);
+  options.with_actor_stat_id(core::ActorTypeStatImpl::get_unique_id<T>());
+  auto res = scheduler_context->get_actor_info_creator().create(std::move(actor), options);
+  return res;
+}
+
+template <class T>
+core::ActorInfoPtr create_actor(core::ActorOptions &options, std::unique_ptr<T> actor) noexcept {
+  auto res = create_actor_info(options, std::move(actor));
   register_actor_info_ptr(res);
   return res;
 }

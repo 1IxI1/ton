@@ -1,0 +1,706 @@
+global t: tuple;
+
+
+@method_id(101)
+fun test1(x: int): int {
+    if (x > 200) {
+        return 200;
+    } else if (x > 100) {
+        return 100;
+    } else if (!(x <= 50)) {
+        if (!(x > 90)) {
+            return x;
+        } else {
+            return 90;
+        }
+    } else {
+        return 0;
+    }
+}
+
+@method_id(102)
+fun test2(x: int) {
+    if (x == 20) { return 20; }
+    if (x != 50) { return 50; }
+    if (x == 0) { return 0; }
+    return -1;
+}
+
+@method_id(103)
+fun test3(x: int) {
+    if (!(x != 20)) { return 20; }
+    if (!(x == 50)) { return 50; }
+    if (x == 0) { return 0; }
+    return -1;
+}
+
+fun elseif(cond: int) {
+    if (cond > 0) {
+        throw(cond);
+    }
+}
+
+@method_id(104)
+fun test4(x: int): int {
+    if (x==1) {
+        return 111;
+    } else {
+        x *= 2;
+    }
+    return x + 1;
+}
+
+@method_id(105)
+fun test5(x: int): (int, int) {
+    return (test4(x), 222);
+}
+
+@method_id(106)
+fun test6(x: int) {
+    try {
+        if (x < 0) { return -1; }
+        elseif (x);
+    } catch(excNo) {
+        return excNo * 1000;
+    }
+    return 0;
+}
+
+fun doNothing(): void {}
+
+@method_id(107)
+fun test7() {
+    if (random.uint256() != 0) { return doNothing() }
+    // here we test that no "missing return" error
+}
+
+@noinline
+fun withNoElse(op: int): int {
+    if (op == 123) { return 100 }
+    if (op == 234) { return 200 }
+    if (op == 345) { return 300 }
+    throw 0xFF
+}
+
+@noinline
+fun withElse(op: int): int {
+    if (op == 123) { return 100 }
+    else if (op == 234) { return 200 }
+    else if (op == 345) { return 300 }
+    return 0xFF
+}
+
+@noinline
+fun withMatch(op: int): int {
+    match (op) {
+        123 => return 100,
+        234 => return 200,
+        345 => return 300,
+    }
+    throw 0xFF
+}
+
+@method_id(108)
+fun test8(op: int) {
+    return (withNoElse(op), withElse(op), withMatch(op));
+}
+
+@noinline
+fun demo9_1(x: int) {
+    if (x > 0) { t.push(123); }
+    else { t.push(456) }
+}
+
+@noinline
+fun demo9_2(x: int) {
+    if (x > 0) { t.push(123); }
+}
+
+@noinline
+fun demo9_3(x: int) {
+    if (x > 0) { t.push(123); }
+    return;
+}
+
+@noinline
+fun demo9_4(x: int) {
+    if (x != -100) {
+        if (x > 0) { t.push(123); }
+        return;
+    }
+}
+
+@method_id(109)
+fun test9(x: int) {
+    t = createEmptyTuple();
+    demo9_1(x); demo9_2(x); demo9_3(x); demo9_4(x);
+    return t;
+}
+
+@noinline
+fun demo10_1(x: int) {
+    match(x) {
+        0 => t.push(123),
+        1 => t.push(456),
+    }
+}
+
+@noinline
+fun demo10_2(x: int) {
+    if (x != -100) {
+        match (x) {
+            0 => t.push(123),
+            else => t.push(456)
+        }
+        return;
+    }
+    t.push(789)
+}
+
+@method_id(110)
+fun test10(x: int) {
+    t = createEmptyTuple();
+    demo10_1(x); demo10_2(x);
+    return t;
+}
+
+@noinline
+fun demo_neg_11_1(mutate x: int) {
+    match (x) {
+        -1 => { x = 0; }
+        else => { x = 1; }
+    }
+}
+
+fun justVoidPush() {
+    t.push(100);
+}
+
+fun demo_neg_11_2(x: int) {
+    match (x) {
+        -1 => t.push(123),
+        else => t.push(456)
+    }
+    return justVoidPush();
+}
+
+@method_id(111)
+fun test11(x: int) {
+    t = createEmptyTuple();
+    demo_neg_11_1(mutate x);
+    demo_neg_11_2(x);
+    return (x, t);
+}
+
+fun demo12_1(x: int) {
+    __expect_inline(true);
+    if (x > 0) { t.push(123); }
+    else { t.push(456) }
+}
+
+fun demo12_2(x: int) {
+    __expect_inline(true);
+    if (x > 0) { t.push(123); }
+}
+
+fun demo12_3(x: int) {
+    __expect_inline(true);
+    if (x > 0) { t.push(123); }
+    return;
+}
+
+fun demo12_4(x: int) {
+    __expect_inline(true);
+    if (x != -100) {
+        if (x > 0) { t.push(123); }
+        return;
+    }
+}
+
+@method_id(112)
+fun test12(x: int) {
+    t = createEmptyTuple();
+    demo12_1(x); demo12_2(x); demo12_3(x); demo12_4(x);
+    return t;
+}
+
+@method_id(113)
+fun test13(x: int) {
+    var r = createEmptyTuple();
+    if (!(x is int))     { r.push( 1);  } else { r.push(0) }
+    if (!(x !is int))    { r.push( 3);  } else { r.push(0) }
+    if (!(!(x !is int))) { r.push( 7);  } else { r.push(0) }
+    if (!(x == null))    { r.push(11);  } else { r.push(0) }
+    if (!(x != null))    { r.push(13);  } else { r.push(0) }
+    r.push( (x  is int) ? 17 : 0);
+    r.push(!(x  is int) ? 19 : 0);
+    r.push(!(x !is int) ? 23 : 0);
+    r.push(!(x == null) ? 31 : 0);
+    r.push(!(x != null) ? 37 : 0);
+    return r;
+}
+
+@method_id(114)
+fun test14() {
+    var x: int = 1;
+    if (!(x !is int)) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+@method_id(115)
+fun test15(x: address): bool {
+    if (!(x is address)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+fun helper16(cond: bool, a: int?, b: int?): int {
+    if (cond ? a != null : b != null) {
+        __expect_type((a, b), "(int?, int?)");
+        if (a != null) {
+            return 1;
+        } else {
+            return 2;
+        }
+    } else {
+        __expect_type((a, b), "(int?, int?)");
+    }
+    return 0;
+}
+
+@method_id(116)
+fun test16() {
+    return (
+        helper16(true, 1, 1),           // 1
+        helper16(true, null, 1),        // 0
+        helper16(false, 1, 1),          // 1
+        helper16(false, null, 1),       // 2
+        helper16(false, 1, null),       // 0
+    )
+}
+
+@method_id(117)
+fun test17(x: int) {
+    if (!(x != 0)) {
+        return 10;
+    }
+    return 20;
+}
+
+@method_id(118)
+fun test18(x: bool): int {
+    if (!((x is bool) == true)) {
+        return 111;
+    } else {
+        return 222;
+    }
+}
+
+@method_id(119)
+fun test19(x: bool): int {
+    if (!((x !is bool) == true)) {
+        return 333;
+    } else {
+        return 444;
+    }
+}
+
+@method_id(120)
+fun test20(x: int) {
+    var r = [];
+    if (x == 0) { r.push(1); } else { r.push(0); }
+    if (!(x == 0)) { r.push(2); } else { r.push(0); }
+    if (!((x == 0) == true)) { r.push(3); } else { r.push(0); }
+    if (!((0 == x) != false)) { r.push(4); } else { r.push(0); }
+    if (!!(x != 0)) { r.push(5); } else { r.push(0); }
+    if ((!!(x != 0)) is int) { r.push(6); } else { r.push(0); }
+    return r;
+}
+
+@method_id(121)
+fun test21(x: int?) {
+    var r = [];
+    if (!(x !is int)) { r.push(1); } else { r.push(0); }
+    if (!(x is int)) { r.push(0); } else { r.push(2); }
+    if (!((x !is int) == true)) { r.push(3); } else { r.push(0); }
+    if (!((x is int) != false)) { r.push(0); } else { r.push(4); }
+    return r;
+}
+
+@method_id(122)
+fun test22(x: int): int {
+    var r = 0;
+    if (x == 0) { r += 1; }
+    if (!(x == 0)) { r += 2; }
+    if (!((x == 0) == true)) { r += 4; }
+    if (!((0 == x) != false)) { r += 8; }
+    return r;
+}
+
+fun chooseAsmIfElse(flag: int): int
+    asm """
+IF:<{
+  1 PUSHINT
+  }>ELSE<{
+  2 PUSHINT
+  }>
+"""
+
+@method_id(123)
+fun test23(x: int): int {
+    return chooseAsmIfElse(x);
+}
+
+@method_id(124)
+fun test24(c: int): int {
+    var r = 0;
+    if (c > 10) { r = 1 }       // will transform to IFJMP
+    else { r = 2 }
+    return r;
+}
+
+@method_id(125)
+fun test25(a: int, b: int): int {
+    var r = 0;
+    if (a != 0) {
+        if (b != 0) { r = 1 }
+        else { r = 2 }
+    }
+    return r;
+}
+
+@method_id(126)
+fun test26(c: int): int {
+    var r = 0;
+    if (c == 0) { r = 1 }
+    else { r = 2 }
+    return r;
+}
+
+fun main() {
+
+}
+
+/**
+@testcase | 101 | 0 | 0
+@testcase | 101 | 1000 | 200
+@testcase | 101 | 150 | 100
+@testcase | 101 | -1 | 0
+@testcase | 101 | 87 | 87
+@testcase | 101 | 94 | 90
+@testcase | 102 | 20 | 20
+@testcase | 102 | 40 | 50
+@testcase | 102 | 50 | -1
+@testcase | 103 | 20 | 20
+@testcase | 103 | 40 | 50
+@testcase | 103 | 50 | -1
+@testcase | 104 | 1  | 111
+@testcase | 104 | 3  | 7
+@testcase | 105 | 1  | 111 222
+@testcase | 105 | 3  | 7 222
+@testcase | 106 | -5 | -1
+@testcase | 106 | 5  | 5000
+@testcase | 108 | 123 | 100 100 100
+@testcase | 108 | 345 | 300 300 300
+@testcase | 109 | 10  | [ 123 123 123 123 ]
+@testcase | 109 | -10 | [ 456 ]
+@testcase | 110 | 0   | [ 123 123 ]
+@testcase | 110 | 5   | [ 456 ]
+@testcase | 111 | 5   | 1 [ 456 100 ]
+@testcase | 112 | 10  | [ 123 123 123 123 ]
+@testcase | 112 | -10 | [ 456 ]
+@testcase | 113 | 8   | [ 0 3 0 11 0 17 0 23 31 0 ]
+@testcase | 114 |     | 1
+@testcase | 115 | 0   | 0
+@testcase | 116 |     | 1 0 1 2 0
+@testcase | 117 | 0   | 10
+@testcase | 117 | 5   | 20
+@testcase | 118 | -1  | 222
+@testcase | 119 | -1  | 333
+@testcase | 120 | 0   | [ 1 0 0 0 0 0 ]
+@testcase | 120 | 7   | [ 0 2 3 4 5 0 ]
+@testcase | 121 | 5   | [ 1 2 3 4 ]
+@testcase | 121 | null | [ 0 0 0 0 ]
+@testcase | 122 | 0   | 1
+@testcase | 122 | 7   | 14
+@testcase | 123 | 0   | 2
+@testcase | 123 | 4   | 1
+@testcase | 124 | 20 | 1
+@testcase | 124 | 5  | 2
+@testcase | 125 | 1 1 | 1
+@testcase | 125 | 1 0 | 2
+@testcase | 125 | 0 1 | 0
+@testcase | 126 | 0  | 1
+@testcase | 126 | 5  | 2
+
+@fif_codegen
+"""
+  test3() PROC:<{ //  x
+    DUP	        //  x x
+    20 NEQINT	//  x '2
+    IFNOTJMP:<{	//  x
+      DROP	    //
+      20 PUSHINT	//  '3=20
+    }>	        //  x
+    DUP	        //  x x
+    50 EQINT	//  x '5
+    IFNOTJMP:<{	//  x
+"""
+
+@fif_codegen
+"""
+  withNoElse() PROC:<{
+    DUP
+    123 EQINT
+    IFJMP:<{
+      DROP
+      100 PUSHINT
+    }>
+    DUP
+    234 PUSHINT
+    EQUAL
+    IFJMP:<{
+      DROP
+      200 PUSHINT
+    }>
+    345 PUSHINT
+    EQUAL
+    IFJMP:<{
+      300 PUSHINT
+    }>
+    255 THROW
+  }>
+"""
+
+@fif_codegen
+"""
+  withElse() PROC:<{
+    DUP
+    123 EQINT
+    IFJMP:<{
+      DROP
+      100 PUSHINT
+    }>
+    DUP
+    234 PUSHINT
+    EQUAL
+    IFJMP:<{
+      DROP
+      200 PUSHINT
+    }>
+    345 PUSHINT
+    EQUAL
+    IFJMP:<{
+      300 PUSHINT
+    }>
+    8 PUSHPOW2DEC
+  }>
+"""
+
+@fif_codegen
+"""
+  withMatch() PROC:<{
+    DUP
+    123 EQINT
+    IFJMP:<{
+      DROP
+      100 PUSHINT
+    }>
+    DUP
+    234 PUSHINT
+    EQUAL
+    IFJMP:<{
+      DROP
+      200 PUSHINT
+    }>
+    345 PUSHINT
+    EQUAL
+    IFJMP:<{
+      300 PUSHINT
+    }>
+    255 THROW
+  }>
+"""
+
+@fif_codegen
+"""
+  demo9_1() PROC:<{
+    0 GTINT
+    IFJMP:<{
+      $t GETGLOB
+      123 PUSHINT
+      TPUSH
+      $t SETGLOB
+    }>
+    $t GETGLOB
+    456 PUSHINT
+    TPUSH
+    $t SETGLOB
+  }>
+"""
+
+@fif_codegen
+"""
+  demo9_2() PROC:<{
+    0 GTINT
+    IFJMP:<{
+      $t GETGLOB
+      123 PUSHINT
+      TPUSH
+      $t SETGLOB
+    }>
+  }>
+"""
+
+@fif_codegen
+"""
+  demo9_3() PROC:<{
+    0 GTINT
+    IFJMP:<{
+      $t GETGLOB
+      123 PUSHINT
+      TPUSH
+      $t SETGLOB
+    }>
+  }>
+"""
+
+@fif_codegen
+"""
+  demo9_4() PROC:<{
+    DUP
+    -100 NEQINT
+    IFJMP:<{
+      0 GTINT
+      IFJMP:<{
+        $t GETGLOB
+        123 PUSHINT
+        TPUSH
+        $t SETGLOB
+      }>
+    }>
+    DROP
+  }>
+"""
+
+@fif_codegen
+"""
+  demo10_1() PROC:<{
+    DUP
+    IFJMP:<{
+      1 EQINT
+      IFJMP:<{
+        $t GETGLOB
+        456 PUSHINT
+        TPUSH
+        $t SETGLOB
+      }>
+    }>
+    DROP
+    $t GETGLOB
+    123 PUSHINT
+    TPUSH
+    $t SETGLOB
+  }>
+"""
+
+@fif_codegen
+"""
+  test14() PROC:<{
+    1 PUSHINT
+  }>
+"""
+
+@fif_codegen
+"""
+  test15() PROC:<{
+    DROP
+    FALSE
+  }>
+"""
+
+@fif_codegen
+"""
+  test17() PROC:<{
+    IFNOTJMP:<{
+      10 PUSHINT
+    }>
+    20 PUSHINT
+  }>
+"""
+
+@fif_codegen
+"""
+  test18() PROC:<{
+    DROP
+    222 PUSHINT
+  }>
+"""
+
+@fif_codegen
+"""
+  test22() PROC:<{
+    0 PUSHINT
+    OVER
+    IFNOT:<{
+      DROP
+      1 PUSHINT
+    }>
+    OVER
+    IF:<{
+      2 ADDCONST
+    }>
+    OVER
+    IF:<{
+      4 ADDCONST
+    }>
+    SWAP
+    IFJMP:<{
+      8 ADDCONST
+    }>
+  }>
+"""
+
+@fif_codegen
+"""
+  test24() PROC:<{
+    10 GTINT
+    IFJMP:<{
+      1 PUSHINT
+    }>
+    2 PUSHINT
+  }>
+"""
+
+@fif_codegen
+"""
+  test25() PROC:<{
+    0 PUSHINT
+    s0 s2 XCHG
+    IFJMP:<{
+      NIP
+      IFJMP:<{
+        1 PUSHINT
+      }>
+      2 PUSHINT
+    }>
+    DROP
+  }>
+"""
+
+@fif_codegen
+"""
+  test26() PROC:<{
+    IFJMP:<{
+      2 PUSHINT
+    }>
+    1 PUSHINT
+  }>
+"""
+
+*/

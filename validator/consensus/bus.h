@@ -1,0 +1,276 @@
+/*
+ * Copyright (c) 2025-2026, TON CORE TECHNOLOGIES CO. L.L.C
+ *
+ * SPDX-License-Identifier: LGPL-2.0-or-later
+ */
+
+#pragma once
+
+#include "common/AtomicRef.h"
+#include "consensus/misbehavior.h"
+#include "keyring/keyring.h"
+#include "overlay/overlays.h"
+#include "td/actor/BusRuntime.h"
+#include "ton/ton-types.h"
+#include "validator/collator-scoreboard.hpp"
+
+#include "chain-state.h"
+#include "manager-facade.h"
+#include "types.h"
+#include "validator-registry-watcher.hpp"
+
+namespace ton::validator::consensus {
+
+struct Start {
+  ChainStateRef state;
+
+  std::string contents_to_string() const;
+};
+
+using StartEvent = std::shared_ptr<const Start>;
+
+struct StopRequested {};
+
+struct FinalizeBlock {
+  using ReturnType = td::Unit;
+
+  CandidateRef candidate;
+  td::Ref<block::BlockSignatureSet> signatures;
+
+  std::string contents_to_string() const;
+};
+
+struct OurLeaderWindowStarted {
+  ParentId base;
+  ChainStateRef state;
+  td::uint32 start_slot;
+  td::uint32 end_slot;
+  td::Timestamp start_time;
+
+  std::string contents_to_string() const;
+};
+
+struct OurLeaderWindowUpcoming {
+  td::uint32 start_slot;
+
+  std::string contents_to_string() const;
+};
+
+struct CandidateGenerated {
+  CandidateRef candidate;
+
+  std::string contents_to_string() const;
+};
+
+// The only guarantee is that the candidate has a valid signature from `candidate->leader`.
+struct CandidateReceived {
+  CandidateRef candidate;
+
+  std::string contents_to_string() const;
+};
+
+struct ValidationRequest {
+  using ReturnType = ValidateCandidateResult;
+
+  ChainStateRef state;
+  CandidateRef candidate;
+
+  std::string contents_to_string() const;
+  static std::string response_to_string(const ReturnType&);
+};
+
+struct IncomingProtocolMessage {
+  using LogToDebug = std::true_type;
+
+  std::optional<PeerValidatorId> source_validator;
+  adnl::AdnlNodeIdShort source;
+  ProtocolMessage message;
+
+  std::string contents_to_string() const;
+};
+
+struct OutgoingProtocolMessage {
+  using LogToDebug = std::true_type;
+
+  struct BroadcastToAll {};
+  struct BroadcastToValidators {};
+  struct BroadcastToRandom {
+    size_t count;
+  };
+  struct SendToPeer {
+    adnl::AdnlNodeIdShort peer;
+  };
+
+  using Recipient = std::variant<BroadcastToAll, BroadcastToValidators, BroadcastToRandom, SendToPeer>;
+
+  Recipient recipient;
+  ProtocolMessage message;
+
+  std::string contents_to_string() const;
+};
+
+struct IncomingCandidateRequest {
+  using LogToDebug = std::true_type;
+  using ReturnType = ProtocolMessage;
+
+  std::optional<PeerValidatorId> source_validator;
+  adnl::AdnlNodeIdShort source;
+  ProtocolMessage request;
+
+  std::string contents_to_string() const;
+  static std::string response_to_string(const ReturnType&);
+};
+
+struct IncomingCollatorRequest {
+  using LogToDebug = std::true_type;
+  using ReturnType = ProtocolMessage;
+
+  std::optional<PeerValidatorId> source_validator;
+  adnl::AdnlNodeIdShort source;
+  ProtocolMessage request;
+
+  std::string contents_to_string() const;
+  static std::string response_to_string(const ReturnType&);
+};
+
+struct OutgoingOverlayRequest {
+  using LogToDebug = std::true_type;
+  using ReturnType = ProtocolMessage;
+
+  std::optional<adnl::AdnlNodeIdShort> destination;
+  td::Timestamp timeout;
+  ProtocolMessage request;
+  td::uint64 max_answer_size;
+
+  std::string contents_to_string() const;
+  static std::string response_to_string(const ReturnType&);
+};
+
+struct BlockFinalizedInMasterchain {
+  BlockIdExt block;
+
+  std::string contents_to_string() const;
+};
+
+struct MisbehaviorReport {
+  PeerValidatorId id;
+  MisbehaviorRef proof;
+
+  std::string contents_to_string() const;
+};
+
+struct TraceEvent {
+  std::unique_ptr<const stats::Event> event;
+
+  std::string contents_to_string() const;
+};
+
+struct NoncriticalParamsUpdated {
+  NewConsensusConfig::NoncriticalParams params;
+
+  std::string contents_to_string() const;
+};
+
+struct ValidatorOptionsUpdated {
+  std::string contents_to_string() const;
+};
+
+struct PrecheckCandidateBroadcast {
+  using ReturnType = td::Unit;
+
+  td::uint32 slot;
+  td::Bits256 broadcast_id;
+  bool signature_checked;
+
+  std::string contents_to_string() const;
+};
+
+class Db {
+ public:
+  virtual ~Db() = default;
+
+  // Note: `get` and `get_by_prefix` use db snapshot from the start
+  // `set` waits for syncing data to disk
+  virtual std::optional<td::BufferSlice> get(td::Slice key) const = 0;
+  virtual std::vector<std::pair<td::BufferSlice, td::BufferSlice>> get_by_prefix(td::uint32 prefix) const = 0;
+  virtual td::actor::Task<> set(td::BufferSlice key, td::BufferSlice value) = 0;
+  virtual td::actor::Task<> close() = 0;
+};
+
+class Bus : public td::actor::Bus {
+ public:
+  using Events = td::TypeList<Start, StopRequested, FinalizeBlock, OurLeaderWindowStarted, OurLeaderWindowUpcoming,
+                              CandidateGenerated, CandidateReceived, ValidationRequest, IncomingProtocolMessage,
+                              OutgoingProtocolMessage, IncomingCandidateRequest, IncomingCollatorRequest,
+                              OutgoingOverlayRequest, BlockFinalizedInMasterchain, MisbehaviorReport, TraceEvent,
+                              NoncriticalParamsUpdated, ValidatorOptionsUpdated, PrecheckCandidateBroadcast>;
+
+  Bus() = default;
+  ~Bus() override {
+    db = {};
+    stop_promise.set_value(td::Unit());
+  }
+
+  bool is_validator() const {
+    return local_id.has_value();
+  }
+
+  ValidatorSessionId session_id;
+
+  ShardIdFull shard;
+  td::actor::ActorId<ManagerFacade> manager;
+  td::actor::ActorId<keyring::Keyring> keyring;
+  mutable td::AtomicRef<ValidatorManagerOptions> validator_opts;
+
+  std::vector<PeerValidator> validator_set;
+  ValidatorWeight total_weight;
+  ton::CatchainSeqno cc_seqno;
+  td::uint32 validator_set_hash;
+  std::optional<PeerValidator> local_id;
+
+  adnl::AdnlNodeIdShort local_adnl_id;
+  std::vector<adnl::AdnlNodeIdShort> all_overlay_nodes;
+  std::set<adnl::AdnlNodeIdShort> all_current_validators;
+  bool is_collator = false;
+  std::set<adnl::AdnlNodeIdShort> all_collators;
+  td::actor::ActorId<CollatorScoreboard> collator_scoreboard;
+  td::Timestamp expected_start_time;
+
+  NewConsensusConfig config;
+
+  td::Ref<CollatorSchedule> collator_schedule;
+
+  td::actor::ActorId<overlay::Overlays> overlays;
+  td::actor::ActorId<adnl::AdnlSenderEx> adnl_sender;
+  std::unique_ptr<Db> db;
+
+  td::Promise<td::Unit> stop_promise;
+};
+
+using BusHandle = td::actor::BusHandle<Bus>;
+
+struct BlockAccepter {
+  static void register_in(td::actor::Runtime&);
+};
+
+struct BlockProducer {
+  static void register_in(td::actor::Runtime&);
+};
+
+struct BlockSyncOverlay {
+  static void register_in(td::actor::Runtime&);
+};
+
+struct BlockValidator {
+  static void register_in(td::actor::Runtime&);
+};
+
+struct PrivateOverlay {
+  static void register_in(td::actor::Runtime&);
+};
+
+struct TraceCollector {
+  static void register_in(td::actor::Runtime&);
+};
+
+}  // namespace ton::validator::consensus

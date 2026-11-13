@@ -1,0 +1,1583 @@
+/*
+    This file is part of TON Blockchain Library.
+
+    TON Blockchain Library is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 2 of the License, or
+    (at your option) any later version.
+
+    TON Blockchain Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#include "ast.h"
+#include "tolk.h"
+#include "compilation-errors.h"
+#include "compiler-settings.h"
+#include "type-system.h"
+
+namespace tolk {
+
+// functions returning "never" are assumed to interrupt flow
+// for instance, variables after their call aren't considered used
+// its main purpose is `throw` statement, it's a call to a built-in `__throw` function
+static bool does_function_always_throw(FunctionPtr fun_ref) {
+  return fun_ref->inferred_return_type == TypeDataNever::create();
+}
+
+bool OpList::has_reachable_direct_break() const {
+  for (const auto& op : *this) {
+    if (op->cl == Op::_BreakFromLoop) {
+      return true;
+    }
+    if (op->cl == Op::_If || op->cl == Op::_TryCatch) {
+      if (op->block0.has_reachable_direct_break() || op->block1.has_reachable_direct_break()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Successor of `_BreakFromLoop` is the enclosing loop's exit, not the next body instruction.
+static thread_local const VarDescrList* current_loop_exit_var_info = nullptr;
+
+struct LoopExitGuard {
+  const VarDescrList* prev;
+  explicit LoopExitGuard(const VarDescrList& exit_info)
+    : prev(current_loop_exit_var_info) {
+    current_loop_exit_var_info = &exit_info;
+  }
+  ~LoopExitGuard() {
+    current_loop_exit_var_info = prev;
+  }
+};
+
+// Facts at `_BreakFromLoop` after fwd_analyze; same walk as has_reachable_direct_break
+// (if/try only — nested loops keep their own breaks).
+static VarDescrList collect_break_facts(const OpList& ops) {
+  VarDescrList collected;
+  collected.set_unreachable();
+  for (const auto& op : ops) {
+    if (op->cl == Op::_BreakFromLoop) {
+      collected |= op->var_info;
+    } else if (op->cl == Op::_If || op->cl == Op::_TryCatch) {
+      collected |= collect_break_facts(op->block0);
+      collected |= collect_break_facts(op->block1);
+    }
+  }
+  return collected;
+}
+
+/*
+ *  
+ *   ANALYZE AND PREPROCESS ABSTRACT CODE
+ * 
+ */
+
+// Backward dataflow analysis: computes var_info for every Op in the code tree.
+// After this pass, each op's var_info describes which variables are alive (needed) right before that op.
+// The terminal Nop's var_info becomes the "exit" info of the block.
+bool CodeBlob::compute_used_code_vars() {
+  VarDescrList empty_var_info;
+  // pass edit=true: ops whose results are entirely unused get disabled
+  return ops.compute_used_code_vars(empty_var_info, true);
+}
+
+bool OpList::compute_used_code_vars(const VarDescrList& var_info, bool edit) {
+  // the last element is always a trailing _Nop that receives the outgoing var_info
+  tolk_assert(!empty() && back()->cl == Op::_Nop);
+
+  bool changed = back()->set_var_info(var_info);
+  for (int i = static_cast<int>(size()) - 2; i >= 0; --i) {
+    const VarDescrList& next_var_info = list[i + 1]->var_info;
+    // bitwise | is used to execute both left and right parts
+    changed = static_cast<int>(changed) | static_cast<int>(list[i]->compute_used_vars(edit, next_var_info));
+  }
+  return changed;
+}
+
+bool operator==(const VarDescrList& x, const VarDescrList& y) {
+  if (x.size() != y.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < x.size(); i++) {
+    if (x.list[i].idx != y.list[i].idx || x.list[i].flags != y.list[i].flags) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool same_values(const VarDescr& x, const VarDescr& y) {
+  if (x.val != y.val || x.is_int_const() != y.is_int_const()) {
+    return false;
+  }
+  if (x.is_int_const() && *x.int_const != *y.int_const) {
+    return false;
+  }
+  return true;
+}
+
+bool same_values(const VarDescrList& x, const VarDescrList& y) {
+  if (x.size() != y.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < x.size(); i++) {
+    if (x.list[i].idx != y.list[i].idx || !same_values(x.list[i], y.list[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Op::set_var_info(const VarDescrList& new_var_info) {
+  if (var_info == new_var_info) {
+    return false;
+  }
+  var_info = new_var_info;
+  return true;
+}
+
+bool Op::set_var_info(VarDescrList&& new_var_info) {
+  if (var_info == new_var_info) {
+    return false;
+  }
+  var_info = std::move(new_var_info);
+  return true;
+}
+
+bool Op::set_var_info_except(const VarDescrList& new_var_info, const std::vector<var_idx_t>& var_list) {
+  if (!var_list.size()) {
+    return set_var_info(new_var_info);
+  }
+  VarDescrList tmp_info{new_var_info};
+  tmp_info -= var_list;
+  return set_var_info(tmp_info);
+}
+
+bool Op::set_var_info_except(VarDescrList&& new_var_info, const std::vector<var_idx_t>& var_list) {
+  if (var_list.size()) {
+    new_var_info -= var_list;
+  }
+  return set_var_info(std::move(new_var_info));
+}
+std::vector<var_idx_t> sort_unique_vars(const std::vector<var_idx_t>& var_list) {
+  std::vector<var_idx_t> vars{var_list}, unique_vars;
+  std::sort(vars.begin(), vars.end());
+  vars.erase(std::unique(vars.begin(), vars.end()), vars.end());
+  return vars;
+}
+
+VarDescr* VarDescrList::operator[](var_idx_t idx) {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  return it != list.end() && it->idx == idx ? &*it : nullptr;
+}
+
+const VarDescr* VarDescrList::operator[](var_idx_t idx) const {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  return it != list.end() && it->idx == idx ? &*it : nullptr;
+}
+
+std::size_t VarDescrList::count(const std::vector<var_idx_t> idx_list) const {
+  std::size_t res = 0;
+  for (var_idx_t idx : idx_list) {
+    if (operator[](idx)) {
+      ++res;
+    }
+  }
+  return res;
+}
+
+std::size_t VarDescrList::count_used(const std::vector<var_idx_t> idx_list) const {
+  std::size_t res = 0;
+  for (var_idx_t idx : idx_list) {
+    auto v = operator[](idx);
+    if (v && !v->is_unused()) {
+      ++res;
+    }
+  }
+  return res;
+}
+
+VarDescrList& VarDescrList::operator-=(var_idx_t idx) {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  if (it != list.end() && it->idx == idx) {
+    list.erase(it);
+  }
+  return *this;
+}
+
+VarDescrList& VarDescrList::operator-=(const std::vector<var_idx_t>& idx_list) {
+  for (var_idx_t idx : idx_list) {
+    *this -= idx;
+  }
+  return *this;
+}
+
+VarDescrList& VarDescrList::add_var(var_idx_t idx, bool unused) {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  if (it == list.end() || it->idx != idx) {
+    list.emplace(it, idx, VarDescr::_Last | (unused ? VarDescr::_Unused : 0));
+  } else if (it->is_unused() && !unused) {
+    it->clear_unused();
+  }
+  return *this;
+}
+
+VarDescrList& VarDescrList::add_vars(const std::vector<var_idx_t>& idx_list, bool unused) {
+  for (var_idx_t idx : idx_list) {
+    add_var(idx, unused);
+  }
+  return *this;
+}
+
+VarDescr& VarDescrList::add(var_idx_t idx) {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  if (it == list.end() || it->idx != idx) {
+    it = list.emplace(it, idx);
+  }
+  return *it;
+}
+
+VarDescr& VarDescrList::add_newval(var_idx_t idx) {
+  auto it = std::lower_bound(list.begin(), list.end(), idx);
+  if (it == list.end() || it->idx != idx) {
+    return *list.emplace(it, idx);
+  } else {
+    it->clear_value();
+    return *it;
+  }
+}
+
+VarDescrList& VarDescrList::clear_last() {
+  for (auto& var : list) {
+    if (var.flags & VarDescr::_Last) {
+      var.flags &= ~VarDescr::_Last;
+    }
+  }
+  return *this;
+}
+
+VarDescrList VarDescrList::operator+(const VarDescrList& y) const {
+  VarDescrList res;
+  auto it1 = list.cbegin();
+  auto it2 = y.list.cbegin();
+  while (it1 != list.cend() && it2 != y.list.cend()) {
+    if (it1->idx < it2->idx) {
+      res.list.push_back(*it1++);
+    } else if (it1->idx > it2->idx) {
+      res.list.push_back(*it2++);
+    } else {
+      res.list.push_back(*it1++);
+      res.list.back() += *it2++;
+    }
+  }
+  while (it1 != list.cend()) {
+    res.list.push_back(*it1++);
+  }
+  while (it2 != y.list.cend()) {
+    res.list.push_back(*it2++);
+  }
+  return res;
+}
+
+VarDescrList& VarDescrList::operator+=(const VarDescrList& y) {
+  return *this = *this + y;
+}
+
+VarDescrList VarDescrList::operator|(const VarDescrList& y) const {
+  if (y.unreachable) {
+    return *this;
+  }
+  if (unreachable) {
+    return y;
+  }
+  VarDescrList res;
+  auto it1 = list.cbegin();
+  auto it2 = y.list.cbegin();
+  while (it1 != list.cend() && it2 != y.list.cend()) {
+    if (it1->idx < it2->idx) {
+      it1++;
+    } else if (it1->idx > it2->idx) {
+      it2++;
+    } else {
+      res.list.push_back(*it1++);
+      res.list.back() |= *it2++;
+    }
+  }
+  return res;
+}
+
+VarDescrList& VarDescrList::operator|=(const VarDescrList& y) {
+  if (y.unreachable) {
+    return *this;
+  } else {
+    return *this = *this | y;
+  }
+}
+
+VarDescrList& VarDescrList::import_values(const VarDescrList& values) {
+  if (values.unreachable) {
+    set_unreachable();
+  } else
+    for (auto& vd : list) {
+      auto new_vd = values[vd.idx];
+      if (new_vd) {
+        vd.set_value(*new_vd);
+      } else {
+        vd.clear_value();
+      }
+    }
+  return *this;
+}
+
+// Standard backward propagation of used variables through `left = OP right`:
+// starts from next_var_info (what's needed after this op), removes left (defined here), adds right (consumed here).
+// Returns true if this op's var_info changed (meaning the backward pass needs to continue).
+bool Op::std_compute_used_vars(const VarDescrList& next_var_info, bool disabled) {
+  // left = OP right
+  // var_info := (var_info - left) + right
+  VarDescrList new_var_info{next_var_info};
+  new_var_info -= left;
+  new_var_info.clear_last();
+  if (args.size() == right.size() && !disabled) {
+    for (const VarDescr& arg : args) {
+      new_var_info.add_var(arg.idx, arg.is_unused());
+    }
+  } else {
+    new_var_info.add_vars(right, disabled);
+  }
+  return set_var_info(std::move(new_var_info));
+}
+
+// Backward dataflow analysis for a single op: computes which variables are needed before this op,
+// given which are needed after it (next_var_info). When edit=true, may disable ops whose results are unused.
+// Returns true if this op's var_info changed.
+bool Op::compute_used_vars(bool edit, const VarDescrList& next_var_info) {
+  switch (cl) {
+    case _Nop:
+    case _DebugMark:
+      return set_var_info_except(next_var_info, left);
+    case _IntConst:
+    case _SliceConst:
+    case _SnakeStringConst:
+    case _GlobVar:
+    case _SetContArgs:
+    case _Call:
+    case _CallInd:
+    case _Tuple:
+    case _UnTuple: {
+      // left = EXEC right;
+      if (!next_var_info.count_used(left) && !keep_even_if_unused()) {
+        // all variables in `left` are not needed
+        if (edit) {
+          set_disabled();
+        }
+        return std_compute_used_vars(next_var_info, true);
+      }
+      if (edit) {
+        set_disabled(false);
+      }
+      if (cl == _Call && does_function_always_throw(f_sym)) {
+        VarDescrList new_var_info;    // empty, not next_var_info
+        if (args.size() == right.size()) {
+          for (const VarDescr& arg : args) {
+            new_var_info.add_var(arg.idx, arg.is_unused());
+          }
+        } else {
+          new_var_info.add_vars(right, false);
+        }
+        return set_var_info(std::move(new_var_info));
+      }
+      return std_compute_used_vars(next_var_info);
+    }
+    case _SetGlob: {
+      // GLOB = right
+      if (right.empty() && edit) {
+        set_disabled();
+      }
+      return std_compute_used_vars(next_var_info, right.empty());
+    }
+    case _Let: {
+      // left = right
+      std::size_t cnt = next_var_info.count_used(left);
+      bool force_keep = keep_even_if_unused();
+      tolk_assert(left.size() == right.size());
+      auto l_it = left.cbegin(), r_it = right.cbegin();
+      VarDescrList new_var_info{next_var_info};
+      new_var_info -= left;
+      new_var_info.clear_last();
+      std::vector<var_idx_t> new_left, new_right;
+      for (; l_it < left.cend(); ++l_it, ++r_it) {
+        if (std::find(l_it + 1, left.cend(), *l_it) == left.cend()) {
+          auto p = next_var_info[*l_it];
+          new_var_info.add_var(*r_it, !force_keep && edit && (!p || p->is_unused()));
+          new_left.push_back(*l_it);
+          new_right.push_back(*r_it);
+        }
+      }
+      if (new_left.size() < left.size()) {
+        left = std::move(new_left);
+        right = std::move(new_right);
+      }
+      if (!cnt && edit && !force_keep) {
+        // all variables in `left` are not needed
+        set_disabled();
+      } else if (edit) {
+        set_disabled(false);
+      }
+      return set_var_info(std::move(new_var_info));
+    }
+    case _Return: {
+      // return left
+      if (var_info.count(left) == left.size()) {
+        return false;
+      }
+      std::vector<var_idx_t> unique_vars = sort_unique_vars(left);
+      var_info.list.clear();
+      for (var_idx_t i : unique_vars) {
+        var_info.list.emplace_back(i, VarDescr::_Last);
+      }
+      return true;
+    }
+    case _BreakFromLoop: {
+      // successor is the enclosing loop's exit, not the next body instruction
+      tolk_assert(current_loop_exit_var_info);
+      return set_var_info(*current_loop_exit_var_info);
+    }
+    case _Import: {
+      // import left
+      std::vector<var_idx_t> unique_vars = sort_unique_vars(left);
+      var_info.list.clear();
+      for (var_idx_t i : unique_vars) {
+        var_info.list.emplace_back(i, next_var_info[i] ? 0 : VarDescr::_Last);
+      }
+      return true;
+    }
+    case _If: {
+      // if (left) then block0 else block1
+      block0.compute_used_code_vars(next_var_info, edit);
+      VarDescrList merge_info;
+      if (!block1.empty()) {
+        block1.compute_used_code_vars(next_var_info, edit);
+        merge_info = block0.entry_var_info() + block1.entry_var_info();
+      } else {
+        merge_info = block0.entry_var_info() + next_var_info;
+      }
+      merge_info.clear_last();
+      merge_info += left;
+      return set_var_info(std::move(merge_info));
+    }
+    case _While: {
+      // while (block0 || left) block1;
+      // ... block0 left { block1 block0 left } next
+      // Break must leave the same stack as a normal loop exit, so keep header vars too.
+      VarDescrList break_exit{next_var_info};
+      LoopExitGuard exit_guard(break_exit);
+      VarDescrList new_var_info{next_var_info};
+      bool changes = false;
+      do {
+        VarDescrList after_cond{new_var_info};
+        after_cond += left;
+        block0.compute_used_code_vars(after_cond, changes);
+        block1.compute_used_code_vars(block0.entry_var_info(), changes);
+        std::size_t n = new_var_info.size();
+        new_var_info += block1.entry_var_info();
+        new_var_info.clear_last();
+        break_exit += new_var_info;
+        if (changes) {
+          break;
+        }
+        changes = (new_var_info.size() == n);
+      } while (changes <= edit);
+      new_var_info += left;
+      block0.compute_used_code_vars(new_var_info, edit);
+      break_exit += block0.entry_var_info();
+      bool body_changed = block1.compute_used_code_vars(block0.entry_var_info(), edit);
+      return static_cast<int>(body_changed) | static_cast<int>(set_var_info(block0.entry_var_info()));
+    }
+    case _Until: {
+      // until (block0 || left);
+      // .. { block0 left } block0 left next
+      VarDescrList break_exit{next_var_info};
+      LoopExitGuard exit_guard(break_exit);
+      VarDescrList after_cond_first{next_var_info};
+      after_cond_first += left;
+      block0.compute_used_code_vars(after_cond_first, false);
+      VarDescrList new_var_info{block0.entry_var_info()};
+      bool changes = false;
+      do {
+        VarDescrList after_cond{new_var_info};
+        after_cond += next_var_info;
+        after_cond += left;
+        block0.compute_used_code_vars(after_cond, changes);
+        std::size_t n = new_var_info.size();
+        new_var_info += block0.entry_var_info();
+        new_var_info.clear_last();
+        break_exit += new_var_info;
+        if (changes) {
+          break;
+        }
+        changes = (new_var_info.size() == n);
+      } while (changes <= edit);
+      return set_var_info(std::move(new_var_info) + next_var_info);
+    }
+    case _Repeat: {
+      // repeat (left) block0
+      // left { block0 } next
+      VarDescrList break_exit{next_var_info};
+      LoopExitGuard exit_guard(break_exit);
+      VarDescrList new_var_info{next_var_info};
+      bool changes = false;
+      do {
+        block0.compute_used_code_vars(new_var_info, changes);
+        std::size_t n = new_var_info.size();
+        new_var_info += block0.entry_var_info();
+        new_var_info.clear_last();
+        break_exit += new_var_info;
+        if (changes) {
+          break;
+        }
+        changes = (new_var_info.size() == n);
+      } while (changes <= edit);
+      tolk_assert(left.size() == 1);
+      bool last = new_var_info.count_used(left) == 0;
+      new_var_info += left;
+      if (last) {
+        new_var_info[left[0]]->flags |= VarDescr::_Last;
+      }
+      return set_var_info(std::move(new_var_info));
+    }
+    case _Again: {
+      // for(;;) block0
+      // { block0 }
+      // no normal-exit: header liveness is the back-edge only; break sees next_var_info
+      VarDescrList break_exit{next_var_info};
+      LoopExitGuard exit_guard(break_exit);
+      VarDescrList new_var_info;
+      bool changes = false;
+      do {
+        block0.compute_used_code_vars(new_var_info, changes);
+        std::size_t n = new_var_info.size();
+        new_var_info += block0.entry_var_info();
+        new_var_info.clear_last();
+        if (changes) {
+          break;
+        }
+        changes = (new_var_info.size() == n);
+      } while (changes <= edit);
+      return set_var_info(std::move(new_var_info));
+    }
+    case _TryCatch: {
+      block0.compute_used_code_vars(next_var_info, edit);
+      block1.compute_used_code_vars(next_var_info, edit);
+      VarDescrList merge_info = block0.entry_var_info() + block1.entry_var_info() + next_var_info;
+      merge_info -= left;
+      merge_info.clear_last();
+      return set_var_info(std::move(merge_info));
+    }
+    default:
+      err("unknown operation in compute_used_vars()").fire(origin);
+  }
+}
+
+// helper: inline block's ops (excluding trailing Nop) into `result`
+static void inline_block_content(OpList& result, OpList& block) {
+  for (size_t j = 0; j < block.size() - 1; j++) {
+    result.push_back(std::move(block[j]));
+  }
+}
+
+// helper: merge two blocks into one (first content + second content + trailing Nop)
+static OpList merge_blocks(OpList& first, OpList& second) {
+  OpList merged;
+  inline_block_content(merged, first);
+  for (auto& o : second) {
+    merged.push_back(std::move(o));
+  }
+  return merged;
+}
+
+// returns true if the op list reaches its end (code is reachable at the bottom)
+bool OpList::prune_unreachable() {
+  OpList& ops = *this;
+  OpList result;
+
+  for (size_t i = 0; i < ops.size(); i++) {
+    Op& op = *ops[i];
+
+    bool reach;
+    switch (op.cl) {
+      case Op::_Nop:
+        // skip non-terminal Nops; keep terminal Nop (last element)
+        if (i == ops.size() - 1) {
+          result.push_back(std::move(ops[i]));
+        }
+        continue;
+      case Op::_IntConst:
+      case Op::_SliceConst:
+      case Op::_SnakeStringConst:
+      case Op::_GlobVar:
+      case Op::_SetGlob:
+      case Op::_SetContArgs:
+      case Op::_CallInd:
+      case Op::_Tuple:
+      case Op::_UnTuple:
+      case Op::_Import:
+      case Op::_Let:
+      case Op::_DebugMark:
+        reach = true;
+        break;
+      case Op::_Return:
+      case Op::_BreakFromLoop:
+        reach = false;
+        break;
+      case Op::_Call:
+        reach = !does_function_always_throw(op.f_sym);
+        break;
+      case Op::_If: {
+        // if left then block0 else block1; ...
+        VarDescr* c_var = op.var_info[op.left[0]];
+        if (c_var && c_var->always_true()) {
+          // condition always true: inline block0, discard block1
+          bool block_reaches = op.block0.prune_unreachable();
+          inline_block_content(result, op.block0);
+          if (!block_reaches) {
+            result.push_back(make_terminal_nop(op.origin));
+            ops = std::move(result);
+            return false;
+          }
+          continue;  // remaining ops processed in next iterations
+        }
+        if (c_var && c_var->always_false()) {
+          // condition always false: inline block1, discard block0
+          bool block_reaches = op.block1.prune_unreachable();
+          inline_block_content(result, op.block1);
+          if (!block_reaches) {
+            result.push_back(make_terminal_nop(op.origin));
+            ops = std::move(result);
+            return false;
+          }
+          continue;
+        }
+        reach = static_cast<int>(op.block0.prune_unreachable()) | static_cast<int>(op.block1.prune_unreachable());
+        break;
+      }
+      case Op::_While: {
+        // while (block0 || left) block1;
+        if (!op.block0.prune_unreachable()) {
+          // block0 (condition computation) never returns — inline block0
+          inline_block_content(result, op.block0);
+          result.push_back(make_terminal_nop(op.origin));
+          ops = std::move(result);
+          return false;
+        }
+        const VarDescr* c_var = op.block0.exit_var_info()[op.left[0]];
+        if (c_var && c_var->always_false()) {
+          // condition always false — loop body never executed, inline block0 (condition part)
+          inline_block_content(result, op.block0);
+          continue;  // remaining ops processed in next iterations
+        }
+        if (c_var && c_var->always_true()) {
+          if (!op.block1.prune_unreachable() && !op.block1.has_reachable_direct_break()) {
+            // body never returns and cannot break — unroll, code after the loop is dead
+            for (auto& o : merge_blocks(op.block0, op.block1)) {
+              result.push_back(std::move(o));
+            }
+            ops = std::move(result);
+            return false;
+          }
+          // infinite loop (maybe exited by break): while → again
+          op.cl = Op::_Again;
+          op.block0 = merge_blocks(op.block0, op.block1);
+          op.block1.clear();
+          op.left.clear();
+          reach = op.block0.has_reachable_direct_break();
+        } else {
+          if (!op.block1.prune_unreachable() && !op.block1.has_reachable_direct_break()) {
+            // body never returns and cannot break (a break would need *BRK, not a plain if)
+            // while(block0; cond) block1; next → block0_content; if(cond) block1 else {}; next
+            inline_block_content(result, op.block0);
+            op.cl = Op::_If;
+            op.block0 = std::move(op.block1);   // if-then = old while-body
+            op.block1.clear();
+            op.block1.push_back(make_terminal_nop(op.origin));  // else = empty
+          }
+          reach = true;
+        }
+        break;
+      }
+      case Op::_Repeat: {
+        // repeat (left) block0
+        VarDescr* c_var = op.var_info[op.left[0]];
+        if (c_var && c_var->always_nonpos()) {
+          // loop never executed — skip the repeat op
+          continue;
+        }
+        if (c_var && c_var->always_pos()) {
+          if (!op.block0.prune_unreachable() && !op.block0.has_reachable_direct_break()) {
+            // executed at least once, never returns, cannot break
+            inline_block_content(result, op.block0);
+            result.push_back(make_terminal_nop(op.origin));
+            ops = std::move(result);
+            return false;
+          }
+        } else {
+          op.block0.prune_unreachable();
+        }
+        reach = true;
+        break;
+      }
+      case Op::_Until:
+      case Op::_Again: {
+        // do block0 until left; ...
+        if (!op.block0.prune_unreachable() && !op.block0.has_reachable_direct_break()) {
+          // never returns and cannot break — replace loop by the body
+          inline_block_content(result, op.block0);
+          result.push_back(make_terminal_nop(op.origin));
+          ops = std::move(result);
+          return false;
+        }
+        reach = (op.cl != Op::_Again) || op.block0.has_reachable_direct_break();
+        break;
+      }
+      case Op::_TryCatch: {
+        reach = static_cast<int>(op.block0.prune_unreachable()) | static_cast<int>(op.block1.prune_unreachable());
+        break;
+      }
+      default:
+        err("unknown operation in prune_unreachable()").fire(op.origin);
+    }
+
+    result.push_back(std::move(ops[i]));
+    if (!reach) {
+      // remaining ops are unreachable, append terminal Nop
+      result.push_back(make_terminal_nop(op.origin));
+      ops = std::move(result);
+      return false;
+    }
+  }
+
+  ops = std::move(result);
+  return true;
+}
+
+void CodeBlob::prune_unreachable_code() {
+  if (ops.prune_unreachable()) {
+    err("control reaches end of function (stack is malformed, a compiler bug)").fire(fun_ref);
+  }
+}
+
+void CodeBlob::fwd_analyze() {
+  VarDescrList values;
+  tolk_assert(!ops.empty() && ops.front()->cl == Op::_Import);
+  for (var_idx_t i : ops.front()->left) {
+    values += i;
+    if (vars[i].v_type == TypeDataInt::create()) {
+      values[i]->val |= VarDescr::_Int;
+    }
+  }
+  ops.fwd_analyze(values);
+}
+
+void Op::prepare_args(VarDescrList values) {
+  if (args.size() != right.size()) {
+    args.clear();
+    for (var_idx_t i : right) {
+      args.emplace_back(i);
+    }
+  }
+  for (std::size_t i = 0; i < right.size(); i++) {
+    const VarDescr* val = values[right[i]];
+    if (val) {
+      args[i].set_value(*val);
+      // args[i].clear_unused();
+    } else {
+      args[i].clear_value();
+    }
+    args[i].clear_unused();
+  }
+}
+
+void Op::maybe_swap_builtin_args_to_compile() {
+  // in builtins.cpp, where optimizing constants are done, implementations assume that args are passed ltr (as declared);
+  // if a function has arg_order, called arguments might have been put on a stack not ltr, but in asm order;
+  // here we swap them back before calling FunctionBodyBuiltin compile, and also swap after
+  tolk_assert(arg_order_already_equals_asm());
+  if (f_sym->method_name == "storeUint" || f_sym->method_name == "storeInt" || f_sym->method_name == "storeBool") {
+    std::swap(args[0], args[1]);
+  }
+}
+
+// Forward dataflow analysis over an entire OpList: sequentially propagates known values
+// (constants, types) through each op.
+// Returns the resulting values at the end of the block.
+VarDescrList OpList::fwd_analyze(VarDescrList values) const {
+  for (auto& op_ptr : list) {
+    values = op_ptr->fwd_analyze(std::move(values));
+  }
+  return values;
+}
+
+// Forward dataflow analysis for a single op: imports incoming values into var_info,
+// then updates them with new values produced by this op (constants, call results, etc.).
+// Returns the updated values to be passed to the next op.
+VarDescrList Op::fwd_analyze(VarDescrList values) {
+  var_info.import_values(values);
+  switch (cl) {
+    case _Nop:
+    case _Import:
+    case _DebugMark:
+      break;
+    case _Return:
+    case _BreakFromLoop:
+      values.set_unreachable();
+      break;
+    case _IntConst: {
+      values.add_newval(left[0]).set_const(int_const);
+      break;
+    }
+    case _SliceConst: {
+      values.add_newval(left[0]).set_const(str_const);
+      break;
+    }
+    case _SnakeStringConst: {
+      values.add_newval(left[0]).set_const(str_const);
+      break;
+    }
+    case _Call: {
+      prepare_args(values);
+      if (!f_sym->is_code_function()) {
+        std::vector<VarDescr> res;
+        res.reserve(left.size());
+        for (var_idx_t i : left) {
+          res.emplace_back(i);
+        }
+        AsmOpList tmp;
+        if (!f_sym->is_asm_function()) {
+          if (arg_order_already_equals_asm()) {
+            maybe_swap_builtin_args_to_compile();
+          }
+          std::get<FunctionBodyBuiltinAsmOp*>(f_sym->body)->compile(tmp, res, args, origin);
+          if (arg_order_already_equals_asm()) {
+            maybe_swap_builtin_args_to_compile();
+          }
+        }
+        bool result_is_int_const = !left.empty();
+        for (const VarDescr& r : res) {
+          result_is_int_const &= r.is_int_const();
+        }
+        if (f_sym->is_removable_if_unused() && result_is_int_const) {
+          set_keep_flag(false);
+        }
+        int j = 0;
+        for (var_idx_t i : left) {
+          values.add_newval(i).set_value(res[j++]);
+        }
+      } else {
+        for (var_idx_t i : left) {
+          values.add_newval(i);
+        }
+      }
+      if (does_function_always_throw(f_sym)) {
+        values.set_unreachable();
+      }
+      break;
+    }
+    case _Tuple:
+    case _UnTuple:
+    case _GlobVar:
+    case _SetContArgs:
+    case _CallInd: {
+      for (var_idx_t i : left) {
+        values.add_newval(i);
+      }
+      break;
+    }
+    case _SetGlob:
+      break;
+    case _Let: {
+      std::vector<VarDescr> old_val;
+      tolk_assert(left.size() == right.size());
+      for (std::size_t i = 0; i < right.size(); i++) {
+        const VarDescr* ov = values[right[i]];
+        if (!ov && G_settings.verbosity >= 5) {
+          std::cerr << "FATAL: error in assignment at right component #" << i << " (no value for _" << right[i] << ")"
+                    << std::endl;
+          for (auto x : left) {
+            std::cerr << '_' << x << " ";
+          }
+          std::cerr << "= ";
+          for (auto x : right) {
+            std::cerr << '_' << x << " ";
+          }
+          std::cerr << std::endl;
+        }
+        // tolk_assert(ov);
+        if (ov) {
+          old_val.push_back(*ov);
+        } else {
+          old_val.emplace_back();
+        }
+      }
+      for (std::size_t i = 0; i < left.size(); i++) {
+        values.add_newval(left[i]).set_value(std::move(old_val[i]));
+      }
+      break;
+    }
+    case _If: {
+      VarDescrList val1 = block0.fwd_analyze( values);
+      VarDescrList val2 = !block1.empty() ? block1.fwd_analyze( std::move(values)) : std::move(values);
+      values = val1 | val2;
+      break;
+    }
+    case _Repeat: {
+      bool atl1 = (values[left[0]] && values[left[0]]->always_pos());
+      VarDescrList next_values = block0.fwd_analyze( values);
+      while (true) {
+        VarDescrList new_values = values | next_values;
+        if (same_values(new_values, values)) {
+          break;
+        }
+        values = std::move(new_values);
+        next_values = block0.fwd_analyze( values);
+      }
+      if (atl1) {
+        values = std::move(next_values);
+      }
+      values |= collect_break_facts(block0);
+      break;
+    }
+    case _While: {
+      auto values0 = values;
+      values = block0.fwd_analyze(values);
+      if (values[left[0]] && values[left[0]]->always_false()) {
+        // block1 never executed
+        block1.fwd_analyze(values);
+        values |= collect_break_facts(block1);
+        break;
+      }
+      while (true) {
+        VarDescrList next_values = values | block0.fwd_analyze( values0 | block1.fwd_analyze( values));
+        if (same_values(next_values, values)) {
+          break;
+        }
+        values = std::move(next_values);
+      }
+      values |= collect_break_facts(block1);
+      break;
+    }
+    case _Until:
+    case _Again: {
+      while (true) {
+        VarDescrList next_values = values | block0.fwd_analyze(values);
+        if (same_values(next_values, values)) {
+          break;
+        }
+        values = std::move(next_values);
+      }
+      if (cl == _Again) {
+        values = collect_break_facts(block0);
+      } else {
+        values = block0.fwd_analyze(values);
+        values |= collect_break_facts(block0);
+      }
+      break;
+    }
+    case _TryCatch: {
+      VarDescrList val1 = block0.fwd_analyze(values);
+      VarDescrList val2 = block1.fwd_analyze(std::move(values));
+      values = val1 | val2;
+      break;
+    }
+    default:
+      err("unknown operation in fwd_analyze()").fire(origin);
+  }
+  return values;
+}
+
+void Op::set_disabled(bool flag) {
+  if (flag) {
+    flags |= _Disabled;
+  } else {
+    flags &= ~_Disabled;
+  }
+}
+
+
+bool Op::set_noreturn(bool flag) {
+  if (flag) {
+    flags |= _NoReturn;
+  } else {
+    flags &= ~_NoReturn;
+  }
+  return flag;
+}
+
+void Op::set_keep_flag(bool flag) {
+  if (flag) {
+    flags |= _KeepEvenIfUnused;
+  } else {
+    flags &= ~_KeepEvenIfUnused;
+  }
+}
+
+void Op::set_arg_order_already_equals_asm_flag() {
+  flags |= _ArgOrderAlreadyEqualsAsm;
+}
+
+// Two-phase mark_noreturn for OpList:
+// Phase 1 (forward): recursively process blocks, perform _If restructuring
+//   (move else-branch into continuation when if-branch always returns)
+// Phase 2 (backward): compute noreturn flags knowing the continuation's noreturn status
+bool OpList::mark_noreturn() {
+  OpList& ops = *this;
+  // Phase 1: forward pass — process sub-blocks and restructure _If
+  for (size_t i = 0; i < ops.size(); i++) {
+    Op& op = *ops[i];
+    switch (op.cl) {
+      case Op::_If: {
+        op.block0.mark_noreturn();
+        // replace `if (cond) { return; } else { block1; } next;` with `if (cond) { return; } block1; next`
+        // purpose: avoid unnecessary RETALT instructions in generated code
+        bool block1_nontrivial = !op.block1.is_empty_block();
+        if (op.block0.is_noreturn() && block1_nontrivial) {
+          VarDescrList block1_var_info = op.block1.entry_var_info();  // important to keep it
+          // take block1's content (minus trailing Nop), insert into parent after this _If op
+          size_t block1_content_count = op.block1.size() - 1;  // minus trailing Nop
+          size_t insert_pos = i + 1;
+          for (size_t j = 0; j < block1_content_count; j++) {
+            ops.insert(ops.begin() + static_cast<long>(insert_pos + j), std::move(op.block1[j]));
+          }
+          // reset block1 to just a Nop
+          op.block1.clear();
+          op.block1.push_back(make_terminal_nop(op.origin));
+          op.block1.set_entry_var_info(std::move(block1_var_info));
+          // newly inserted ops will be processed in subsequent iterations of this loop
+        } else {
+          op.block1.mark_noreturn();
+        }
+        break;
+      }
+      case Op::_TryCatch:
+        op.block0.mark_noreturn();
+        if (!op.block1.empty()) {
+          op.block1.mark_noreturn();
+        }
+        break;
+      case Op::_Again:
+      case Op::_Until:
+      case Op::_Repeat:
+        op.block0.mark_noreturn();
+        break;
+      case Op::_While:
+        op.block0.mark_noreturn();
+        op.block1.mark_noreturn();
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Phase 2: backward pass — compute noreturn flags
+  for (int i = static_cast<int>(ops.size()) - 1; i >= 0; i--) {
+    Op& op = *ops[i];
+    bool next_noreturn = (i < static_cast<int>(ops.size()) - 1) ? ops[i + 1]->noreturn() : false;
+
+    switch (op.cl) {
+      case Op::_Nop:
+        op.set_noreturn(false);
+        break;
+      case Op::_Import:
+      case Op::_IntConst:
+      case Op::_SliceConst:
+      case Op::_SnakeStringConst:
+      case Op::_DebugMark:
+      case Op::_Let:
+      case Op::_Tuple:
+      case Op::_UnTuple:
+      case Op::_SetGlob:
+      case Op::_GlobVar:
+      case Op::_SetContArgs:
+      case Op::_CallInd:
+        op.set_noreturn(next_noreturn);
+        break;
+      case Op::_Return:
+      case Op::_BreakFromLoop:
+        op.set_noreturn();
+        break;
+      case Op::_Call:
+        op.set_noreturn(next_noreturn || does_function_always_throw(op.f_sym));
+        break;
+      case Op::_If:
+        op.set_noreturn((op.block0.is_noreturn() && op.block1.is_noreturn()) || next_noreturn);
+        break;
+      case Op::_TryCatch:
+        op.set_noreturn((op.block0.is_noreturn() && op.block1.is_noreturn()) || next_noreturn);
+        break;
+      case Op::_Again:
+        op.set_noreturn(!op.block0.has_reachable_direct_break() || next_noreturn);
+        break;
+      case Op::_Until:
+        op.set_noreturn((op.block0.is_noreturn() && !op.block0.has_reachable_direct_break()) || next_noreturn);
+        break;
+      case Op::_While:
+        op.set_noreturn(op.block0.is_noreturn() || next_noreturn);
+        break;
+      case Op::_Repeat:
+        op.set_noreturn(next_noreturn);
+        break;
+      default:
+        err("unknown operation in mark_noreturn()").fire(op.origin);
+    }
+  }
+
+  return ops.empty() ? false : ops.front()->noreturn();
+}
+
+void CodeBlob::mark_noreturn() {
+  ops.mark_noreturn();
+}
+
+// See `materialize_immediate_returns` below for the purpose.
+static void copy_trailing_return_into(OpList& into_blk, const OpList& src, size_t from, size_t ret_idx) {
+  // skip a branch that already returns
+  for (int i = static_cast<int>(into_blk.size()) - 1; i >= 0; --i) {
+    Op::OpKind cl = into_blk[i]->cl;
+    if (cl == Op::_Nop || cl == Op::_DebugMark) {
+      continue;
+    }
+    if (cl == Op::_Return || cl == Op::_BreakFromLoop) {
+      return;
+    }
+    break;
+  }
+  tolk_assert(!into_blk.empty() && into_blk.back()->cl == Op::_Nop);
+
+  // clone preceding Op::_DebugMark and the trailing Op::_Return
+  for (size_t j = from; j < ret_idx; ++j) {
+    if (src[j]->cl == Op::_DebugMark) {
+      auto dst = std::make_unique<Op>(src[j]->origin, Op::_DebugMark);
+      dst->debug_mark = src[j]->debug_mark;
+      into_blk.insert(into_blk.end() - 1, std::move(dst));    // -1: before the terminal _Nop
+    }
+  }
+  auto dst = std::make_unique<Op>(src[ret_idx]->origin, Op::_Return, src[ret_idx]->left);
+  dst->debug_mark = src[ret_idx]->debug_mark;   // it's DebugMarkLeaveFunction
+  into_blk.insert(into_blk.end() - 1, std::move(dst));
+}
+
+// If `Op::_If` is followed by `Op::_Return` (debug marks in between), clone that return into both branches.
+static void try_materialize_if(OpList& ops, size_t if_idx) {
+  size_t j = if_idx + 1;
+  while (j < ops.size() && ops[j]->cl == Op::_DebugMark) {
+    ++j;
+  }
+  if (j >= ops.size() || ops[j]->cl != Op::_Return) {
+    return;
+  }
+
+  // skip multi-slot returns: they duplicate stack shuffles
+  const Op& ret = *ops[j];
+  tolk_assert(!ret.disabled());
+  if (ret.left.size() > 1) {
+    return;
+  }
+  copy_trailing_return_into(ops[if_idx]->block0, ops, if_idx + 1, j);
+  copy_trailing_return_into(ops[if_idx]->block1, ops, if_idx + 1, j);
+}
+
+static void materialize_in_list(OpList& ops) {
+  for (size_t i = 0; i < ops.size(); ++i) {
+    Op& op = *ops[i];
+    if (op.cl == Op::_If) {
+      try_materialize_if(ops, i);
+    }
+    if (!op.block0.empty()) {
+      materialize_in_list(op.block0);
+    }
+    if (!op.block1.empty()) {
+      materialize_in_list(op.block1);
+    }
+  }
+}
+
+/*
+ *   Clone a `_Return` that immediately follows `_If` into both branches.
+ *   Then `mark_noreturn` + codegen emit IFJMP instead of IF + RET.
+ *
+ *   Example:
+ *   > fun demo() {
+ *   >     if (c) { A }
+ *   >     else { B }
+ *   > }
+ *
+ *   IR now:
+ *   > Op::_If then={ A } else={ B }
+ *   > Op::_Return    // it's end of function
+ *
+ *   IR after transformation:
+ *   > Op::_If then={ A; Op::_Return } else={ B; Op::_Return }
+ *   > Op::_Return    // codegen does not emit it: Op::_If is already noreturn
+ *
+ *   Result fif:
+ *   > IFJMP:<{ A }>
+ *   > B
+ */
+void CodeBlob::materialize_immediate_returns() {
+  materialize_in_list(ops);
+}
+
+/*
+ *   Strip redundant `!= 0` / `== 0` from `if`, `while`, etc.
+ *   `if (x != 0)` -> IF (no `0 NEQINT`)
+ *   `if (x == 0)` -> IFNOT
+ *   The same trick is applied to ternary (`__condsel`) and assertions (`__throw_if` / `__throw_ifnot`).
+ *
+ *   This is absent in FunC (whereas almost everything here is inherited, to be rewritten some day).
+ *   Done at IR level (after `fwd_analyze`) to optimize code after inlining.
+ *
+ *   Tricky case: `if (... == 0) return; else <big_block>`
+ *   We want `IFJMP:<{ return }>` followed by `else` body.
+ *   But if we naively swap the branches for `_==_`, the noreturn block ends up in `else`,
+ * producing worse bytecode (`0 EQINT` removed but extra `c2 SAVE` / `RETALT` added).
+ *   So we explicitly search for that shape — see `try_fold_condition`.
+ *
+ *   How `_!=_` / `_==_` are removed.
+ * After rewiring the condition to `x`, clear keep flag on the matched `_Call`.
+ * On the next `compute_used_code_vars` pass, if nobody else reads its result, DCE prunes it.
+ */
+
+// Recognize `tmp := x != 0` or `tmp := x == 0`. On match:
+// - `out_is_eq` is true for `==`, false for `!=`,
+// - `out_zero_arg_idx` is the position of the literal zero (0 or 1)
+//    so the caller knows which slot of `op.right` holds the actual `x`.
+static bool match_eq_neq_zero(const Op& op, bool& out_is_eq, int& out_zero_arg_idx) {
+  if (op.cl != Op::_Call || op.disabled() || op.f_sym == nullptr) {
+    return false;
+  }
+  bool is_eq = op.f_sym->name == "_==_";
+  bool is_neq = op.f_sym->name == "_!=_";
+  if (!is_eq && !is_neq) {
+    return false;
+  }
+  if (op.args.size() < 2 || op.right.size() < 2) {    // if `fwd_analyze` hasn't run yet
+    return false;
+  }
+  if (op.args[0].is_int_const() && op.args[0].int_const == 0) {
+    out_zero_arg_idx = 0;
+    out_is_eq = is_eq;
+    return true;
+  }
+  if (op.args[1].is_int_const() && op.args[1].int_const == 0) {
+    out_zero_arg_idx = 1;
+    out_is_eq = is_eq;
+    return true;
+  }
+  return false;
+}
+
+// Walk `list` backwards looking for the most recent op that produces `target`.
+// Single-slot `_Let([a], [b])` ops are just renames — we step through them.
+// Example:
+// > fun isZero(x: int): bool { return x == 0; }
+// gets inlined inside
+// > if (isZero(y)) { ... }
+//
+// Then the IR right before the `_If` is:
+//     _Let  [t1] := y             // x bound to y when inlining
+//     _Call [t2] := _==_(t1, 0)   // body of isZero
+//     _Let  [t3] := t2            // return value of isZero
+//     _If   cond=t3 ...
+//
+// We're called with target = t3:
+//   1. We see `_Let [t3] := t2` — single-slot rename, switch target to t2.
+//   2. We see `_Call [t2] := _==_(t1, 0)` — writes target and is not a `_Let`, so we return it.
+//
+struct ProducerLookupResult {
+  Op* op;
+  int idx;
+};
+
+static bool does_op_or_nested_blocks_write_var(const Op& op, var_idx_t target);
+
+static bool does_op_list_write_var(const OpList& list, var_idx_t target) {
+  for (const std::unique_ptr<Op>& op : list) {
+    if (does_op_or_nested_blocks_write_var(*op, target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool does_op_or_nested_blocks_write_var(const Op& op, var_idx_t target) {
+  for (var_idx_t v : op.left) {
+    if (v == target) {
+      return true;
+    }
+  }
+  return does_op_list_write_var(op.block0, target) || does_op_list_write_var(op.block1, target);
+}
+
+// Walk `list` backwards, looking for the op that produced `target`.
+// Single-slot `_Let dst := src` ops are treated as renames (so the search continues with `target = src`).
+//
+// Returns `{op, i}` where `op` is the producing op (any non-`_Let` writer of `target`), `i` is its index in `list`.
+// Returns `{nullptr, -1}` in two cases:
+//   1. no writer of `target` is reachable
+//   2. `target` is conditionally rewritten inside the nested block of some intervening op,
+//      e.g. `var c = x != 0; if (flip) { c = false; } if (c) ...`.
+static ProducerLookupResult find_producer_in_list(OpList& list, int max_idx_exclusive, var_idx_t target) {
+  for (int i = max_idx_exclusive - 1; i >= 0; --i) {
+    Op* op = list[i].get();
+    if (op->disabled()) {
+      continue;
+    }
+
+    // top-level write check (also handles `if`/`while` cond-var being read into `op.left`,
+    // but that's fine — we'd just stop the search, which is the safe direction)
+    bool writes_target = false;
+    for (var_idx_t v : op->left) {
+      if (v == target) {
+        writes_target = true;
+        break;
+      }
+    }
+
+    // nested-block write check
+    if (!writes_target && (does_op_list_write_var(op->block0, target) || does_op_list_write_var(op->block1, target))) {
+      return {nullptr, -1};
+    }
+
+    if (!writes_target) {
+      continue;
+    }
+
+    if (op->cl == Op::_Let && op->left.size() == 1 && op->right.size() == 1) {
+      target = op->right[0];
+      continue;
+    }
+
+    return {op, i};
+  }
+  return {nullptr, -1};
+}
+
+// Guard for the `_==_` / `_!=_` to analyze that operand is NOT reassigned between the comparison and the consumer.
+// Our IR (Ops) is not SSA — `x = ...` reuses the same `var_idx_t`:
+// > val c = (x != 0); x = 555; if (c) { return 1; }
+static bool is_var_written_in_range(const OpList& list, int first_idx, int max_idx_exclusive, var_idx_t target) {
+  for (int i = first_idx; i < max_idx_exclusive; ++i) {
+    if (does_op_or_nested_blocks_write_var(*list[i], target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Cheap "does this block end with a return?" check for `if (... == 0) return; else <big_block>` corner case.
+// We can't use `mark_noreturn` here: that pass runs only after the whole optimize loop.
+static bool block_ends_with_return(const OpList& block) {
+  for (int i = static_cast<int>(block.size()) - 1; i >= 0; --i) {
+    const Op* op = block[i].get();
+    if (op->disabled() || op->cl == Op::_Nop) {
+      continue;
+    }
+    return op->cl == Op::_Return;
+  }
+  return false;
+}
+
+// Try to simplify the condition of an `if` / `while` / `do...until` op.
+//
+// Tolk:                    IR before:
+//   if (y != 0) { ... }      _Call [t] := _!=_(y, 0)
+//                            _If   cond=t  then=block0  else=block1
+//
+// Result in: cond=y, not t:
+//                            _Call [t] := _!=_(y, 0)        (now dead, DCE will remove it)
+//                            _If   cond=y  then=...  else=...
+//
+// For `_==_` we additionally swap `then`/`else`.
+// Returns true if any rewrite happened (to keep iterating).
+static bool try_fold_condition(Op& cond_op, OpList& search_list, int search_max_idx_exclusive) {
+  if (cond_op.left.size() != 1) {
+    return false;
+  }
+  bool is_loop = (cond_op.cl == Op::_While || cond_op.cl == Op::_Until);
+  bool any_changed = false;
+
+  while (true) {
+    var_idx_t cond_var = cond_op.left[0];
+    ProducerLookupResult producer = find_producer_in_list(search_list, search_max_idx_exclusive, cond_var);
+    if (!producer.op) {
+      break;
+    }
+
+    bool is_eq = false;
+    int zero_arg_idx = -1;
+    if (!match_eq_neq_zero(*producer.op, is_eq, zero_arg_idx)) {
+      break;
+    }
+    // for loops, the would-be branch swap would also flip "iterate"/"stop" — skip
+    if (is_eq && is_loop) {
+      break;
+    }
+    // for `if (... == 0) return; else <big_block>` — see the section header
+    if (is_eq && cond_op.cl == Op::_If && block_ends_with_return(cond_op.block0) && !cond_op.block1.is_empty_block()) {
+      break;
+    }
+
+    var_idx_t inner_var = producer.op->right[1 - zero_arg_idx];
+    if (is_var_written_in_range(search_list, producer.idx, search_max_idx_exclusive, inner_var)) {
+      break;
+    }
+
+    cond_op.left[0] = inner_var;
+    if (is_eq) {
+      std::swap(cond_op.block0, cond_op.block1);
+    }
+    producer.op->set_keep_flag(false);
+    any_changed = true;
+    // keep looping to detect cases like `(x != 0) != 0`
+  }
+  return any_changed;
+}
+
+// Besides `if` and `loops`, we want to simplify conditions of ternary and assert.
+//
+//   Tolk                     IR (Ops)
+//   ----------------------   --------------------------------------
+//   cond ? a : b             _Call [t] := __condsel(cond, a, b)
+//   assert(cond, code)       _Call []  := __throw_ifnot(code, cond)
+//   assert(!cond, code)      _Call []  := __throw_if(code, cond)
+//
+// This helper does: "if `call_op` is one of these, return (by ref) index of its
+// `cond` argument, and what to do for the `_==_(x, 0)` case to preserve semantics":
+// - for the ternary, "negate the cond" means swapping the arguments
+// - for the conditional throw, it means flipping the function
+// On unsupported ops, returns -1.
+static int detect_cond_arg_for_pseudo_builtin(const Op& call_op, int& out_swap_a, int& out_swap_b, std::string_view& out_flip_to) {
+  out_swap_a = out_swap_b = -1;
+  out_flip_to = {};
+  if (call_op.cl != Op::_Call || call_op.disabled() || call_op.f_sym == nullptr) {
+    return -1;
+  }
+  const std::string& name = call_op.f_sym->name;
+  if (name == "__condsel" && call_op.right.size() == 3) {
+    out_swap_a = 1;
+    out_swap_b = 2;
+    return 0;
+  }
+  if (name == "__throw_if" && call_op.right.size() == 2) {
+    out_flip_to = "__throw_ifnot";
+    return 1;
+  }
+  if (name == "__throw_ifnot" && call_op.right.size() == 2) {
+    out_flip_to = "__throw_if";
+    return 1;
+  }
+  return -1;
+}
+
+// Same idea as `try_fold_condition`, but for ternary and assert calls:
+//
+//   Tolk:                       IR (Ops):
+//     hasNext(m) ? a : b          _Call [t1] := _!=_(z, 0)         // body of inlined `hasNext`
+//                                 _Call [t2] := __condsel(t1, a, b)
+//   After: replace `t1` with `z`
+//
+//   Tolk:                       IR before:
+//     assert(isEmpty(m), 100)     _Call [t1] := _==_(z, 0)          // body of inlined `isEmpty`
+//                                 _Call []  := __throw_ifnot(100, t1)
+//   After: replace __throw_ifnot with __throw_if and `t1` with `z`
+static bool try_fold_call_cond_arg(Op& call_op, OpList& search_list, int search_max_idx_exclusive) {
+  int swap_a, swap_b;
+  std::string_view flip_to;
+  int cond_arg_idx = detect_cond_arg_for_pseudo_builtin(call_op, swap_a, swap_b, flip_to);
+  if (cond_arg_idx < 0) {
+    return false;
+  }
+  bool any_changed = false;
+
+  while (true) {
+    var_idx_t cond_var = call_op.right[cond_arg_idx];
+    ProducerLookupResult producer = find_producer_in_list(search_list, search_max_idx_exclusive, cond_var);
+    if (!producer.op) {
+      break;
+    }
+
+    bool is_eq = false;
+    int zero_arg_idx = -1;
+    if (!match_eq_neq_zero(*producer.op, is_eq, zero_arg_idx)) {
+      break;
+    }
+
+    var_idx_t inner_var = producer.op->right[1 - zero_arg_idx];
+    if (is_var_written_in_range(search_list, producer.idx, search_max_idx_exclusive, inner_var)) {
+      break;
+    }
+
+    call_op.right[cond_arg_idx] = inner_var;
+    if (is_eq) {
+      if (swap_a >= 0 && swap_b >= 0) {
+        // `__condsel(cond, a, b)` -> `__condsel(cond, b, a)`
+        std::swap(call_op.right[swap_a], call_op.right[swap_b]);
+      } else if (!flip_to.empty()) {
+        // `__throw_if(code, cond)` <-> `__throw_ifnot(code, cond)`
+        call_op.f_sym = lookup_function(flip_to);
+        flip_to = flip_to == "__throw_if" ? "__throw_ifnot" : "__throw_if";
+      }
+    }
+    // important: `args` is cached, wipe it. `compute_used_vars` reads variable indices from `args`, not from `right`.
+    call_op.args.clear();
+    producer.op->set_keep_flag(false);
+    any_changed = true;
+  }
+  return any_changed;
+}
+
+// Top-level public function: walk the op list, try to simplify each conditional / pseudo-builtin ops,
+// and recurse into nested blocks (then-branch, else-branch, loop body, try/catch).
+bool OpList::optimize_conditional_branches() {
+  bool any_changed = false;
+  for (size_t i = 0; i < list.size(); ++i) {
+    Op& op = *list[i];
+    if (op.cl == Op::_If) {
+      if (try_fold_condition(op, *this, static_cast<int>(i))) {
+        any_changed = true;
+      }
+      any_changed |= op.block0.optimize_conditional_branches();
+      any_changed |= op.block1.optimize_conditional_branches();
+    } else if (op.cl == Op::_While || op.cl == Op::_Until) {
+      if (try_fold_condition(op, op.block0, static_cast<int>(op.block0.size()))) {
+        any_changed = true;
+      }
+      any_changed |= op.block0.optimize_conditional_branches();
+      if (op.cl == Op::_While) {
+        any_changed |= op.block1.optimize_conditional_branches();
+      }
+    } else if (op.cl == Op::_Repeat || op.cl == Op::_Again) {
+      any_changed |= op.block0.optimize_conditional_branches();
+    } else if (op.cl == Op::_TryCatch) {
+      any_changed |= op.block0.optimize_conditional_branches();
+      any_changed |= op.block1.optimize_conditional_branches();
+    } else if (op.cl == Op::_Call) {
+      if (try_fold_call_cond_arg(op, *this, static_cast<int>(i))) {
+        any_changed = true;
+      }
+    }
+  }
+  return any_changed;
+}
+
+bool CodeBlob::optimize_conditional_branches() {
+  return ops.optimize_conditional_branches();
+}
+
+}  // namespace tolk

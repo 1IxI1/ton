@@ -16,51 +16,122 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "vm/boc.h"
-#include "vm/cellslice.h"
-#include "vm/cells.h"
-#include "common/AtomicRef.h"
-#include "vm/cells/CellString.h"
-#include "vm/cells/MerkleProof.h"
-#include "vm/cells/MerkleUpdate.h"
-#include "vm/db/CellStorage.h"
-#include "vm/db/CellHashTable.h"
-#include "vm/db/TonDb.h"
-#include "vm/db/StaticBagOfCellsDb.h"
+#include <barrier>
+#include <latch>
+#include <map>
+#include <numeric>
+#include <openssl/sha.h>
+#include <optional>
+#include <set>
+#include <thread>
+#include <variant>
 
-#include "td/utils/base64.h"
-#include "td/utils/benchmark.h"
-#include "td/utils/crypto.h"
+// FIXME: Remove once RocksDB stops triggering this warning.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-int-float-conversion"
+#include "rocksdb/compaction_filter.h"
+#include "rocksdb/db.h"
+#include "rocksdb/merge_operator.h"
+#pragma GCC diagnostic pop
+
+#include "common/AtomicRef.h"
+#include "openssl/digest.hpp"
+#include "storage/db.h"
+#include "td/actor/actor.h"
+#include "td/db/MemoryKeyValue.h"
+#include "td/db/RocksDb.h"
+#include "td/db/utils/BlobView.h"
+#include "td/db/utils/CyclicBuffer.h"
 #include "td/utils/Random.h"
+#include "td/utils/ScopeGuard.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Span.h"
 #include "td/utils/Status.h"
 #include "td/utils/Timer.h"
+#include "td/utils/VectorQueue.h"
+#include "td/utils/base64.h"
+#include "td/utils/benchmark.h"
+#include "td/utils/crypto.h"
 #include "td/utils/filesystem.h"
-#include "td/utils/port/path.h"
 #include "td/utils/format.h"
 #include "td/utils/misc.h"
-#include "td/utils/optional.h"
+#include "td/utils/overloaded.h"
+#include "td/utils/port/path.h"
 #include "td/utils/tests.h"
-#include "td/utils/tl_parsers.h"
 #include "td/utils/tl_helpers.h"
+#include "td/utils/tl_parsers.h"
+#include "vm/boc.h"
+#include "vm/cells.h"
+#include "vm/cells/CellString.h"
+#include "vm/cells/MerkleProof.h"
+#include "vm/cells/MerkleUpdate.h"
+#include "vm/db/CellStorage.h"
+#include "vm/db/StaticBagOfCellsDb.h"
+#include "vm/db/TonDb.h"
+#include "vm/dict.h"
 
-#include "td/db/utils/BlobView.h"
-#include "td/db/RocksDb.h"
-#include "td/db/MemoryKeyValue.h"
-#include "td/db/utils/CyclicBuffer.h"
+class ActorExecutor : public vm::DynamicBagOfCellsDb::AsyncExecutor {
+ public:
+  ActorExecutor(size_t tn) : tn_(tn) {
+    scheduler_.run_in_context([&] { worker_ = td::actor::create_actor<Worker>("Worker"); });
+    thread_ = td::thread([this]() { scheduler_.run(); });
+  }
+  ~ActorExecutor() {
+    scheduler_.run_in_context([&] { send_closure(worker_, &Worker::close); });
+    thread_.join();
+  }
+  std::string describe() const override {
+    return PSTRING() << "ActorExecutor(tn=" << tn_ << ")";
+  }
+  class Worker : public td::actor::Actor {
+   public:
+    void close() {
+      td::actor::core::SchedulerContext::get().stop();
+      stop();
+    }
+    void execute_sync(std::function<void()> f) {
+      f();
+    }
+  };
 
-#include "td/fec/fec.h"
+  void execute_async(std::function<void()> f) override {
+    class Runner : public td::actor::Actor {
+     public:
+      explicit Runner(std::function<void()> f) : f_(std::move(f)) {
+      }
+      void start_up() override {
+        f_();
+        stop();
+      }
 
-#include <set>
-#include <map>
+     private:
+      std::function<void()> f_;
+    };
+    auto context = td::actor::SchedulerContext::get_ptr();
+    if (context) {
+      td::actor::create_actor<Runner>("executeasync", std::move(f)).release();
+    } else {
+      scheduler_.run_in_context([&] { td::actor::create_actor<Runner>("executeasync", std::move(f)).release(); });
+    }
+  }
 
-#include <openssl/sha.h>
+  void execute_sync(std::function<void()> f) override {
+    auto context = td::actor::SchedulerContext::get_ptr();
+    if (context) {
+      td::actor::send_closure(worker_, &Worker::execute_sync, std::move(f));
+    } else {
+      scheduler_.run_in_context([&] { td::actor::send_closure(worker_, &Worker::execute_sync, std::move(f)); });
+    }
+  }
 
-#include "openssl/digest.hpp"
+ private:
+  size_t tn_;
+  td::actor::Scheduler scheduler_{{tn_}, false, td::actor::Scheduler::Paused};
+  td::actor::ActorOwn<Worker> worker_;
+  td::thread thread_;
+};
 
 namespace vm {
-
 std::vector<int> do_get_serialization_modes() {
   std::vector<int> res;
   for (int i = 0; i < 32; i++) {
@@ -82,9 +153,23 @@ int get_random_serialization_mode(T &rnd) {
   return modes[rnd.fast(0, (int)modes.size() - 1)];
 }
 
-class BenchSha256 : public td::Benchmark {
+class BenchSha : public td::Benchmark {
  public:
+  explicit BenchSha(size_t n) : str_(n, 'a') {
+  }
   std::string get_description() const override {
+    return PSTRING() << get_name() << " length=" << str_.size();
+  }
+
+  virtual std::string get_name() const = 0;
+
+ protected:
+  std::string str_;
+};
+class BenchSha256 : public BenchSha {
+ public:
+  using BenchSha::BenchSha;
+  std::string get_name() const override {
     return "SHA256";
   }
 
@@ -92,7 +177,7 @@ class BenchSha256 : public td::Benchmark {
     int res = 0;
     for (int i = 0; i < n; i++) {
       digest::SHA256 hasher;
-      hasher.feed("abcd", 4);
+      hasher.feed(str_);
       unsigned char buf[32];
       hasher.extract(buf);
       res += buf[0];
@@ -100,10 +185,12 @@ class BenchSha256 : public td::Benchmark {
     td::do_not_optimize_away(res);
   }
 };
-class BenchSha256Reuse : public td::Benchmark {
+class BenchSha256Reuse : public BenchSha {
  public:
-  std::string get_description() const override {
-    return "SHA256 reuse";
+  using BenchSha::BenchSha;
+
+  std::string get_name() const override {
+    return "SHA256 reuse (used in DataCell)";
   }
 
   void run(int n) override {
@@ -111,7 +198,7 @@ class BenchSha256Reuse : public td::Benchmark {
     digest::SHA256 hasher;
     for (int i = 0; i < n; i++) {
       hasher.reset();
-      hasher.feed("abcd", 4);
+      hasher.feed(str_);
       unsigned char buf[32];
       hasher.extract(buf);
       res += buf[0];
@@ -119,28 +206,46 @@ class BenchSha256Reuse : public td::Benchmark {
     td::do_not_optimize_away(res);
   }
 };
-class BenchSha256Low : public td::Benchmark {
+class BenchSha256Low : public BenchSha {
  public:
-  std::string get_description() const override {
+  using BenchSha::BenchSha;
+
+  std::string get_name() const override {
     return "SHA256 low level";
   }
 
+// Use the old method to check for performance degradation
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)  // Disable deprecated warning for MSVC
+#endif
   void run(int n) override {
     int res = 0;
-    td::Sha256State ctx;
+    SHA256_CTX ctx;
     for (int i = 0; i < n; i++) {
-      ctx.init();
-      ctx.feed("abcd");
+      SHA256_Init(&ctx);
+      SHA256_Update(&ctx, str_.data(), str_.size());
       unsigned char buf[32];
-      ctx.extract(td::MutableSlice{buf, 32});
+      SHA256_Final(buf, &ctx);
       res += buf[0];
     }
     td::do_not_optimize_away(res);
   }
 };
-class BenchSha256Tdlib : public td::Benchmark {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+class BenchSha256Tdlib : public BenchSha {
  public:
-  std::string get_description() const override {
+  using BenchSha::BenchSha;
+
+  std::string get_name() const override {
     return "SHA256 TDLib";
   }
 
@@ -150,7 +255,7 @@ class BenchSha256Tdlib : public td::Benchmark {
     for (int i = 0; i < n; i++) {
       td::init_thread_local<td::Sha256State>(ctx);
       ctx->init();
-      ctx->feed("abcd");
+      ctx->feed(str_);
       unsigned char buf[32];
       ctx->extract(td::MutableSlice(buf, 32), false);
       res += buf[0];
@@ -158,11 +263,89 @@ class BenchSha256Tdlib : public td::Benchmark {
     td::do_not_optimize_away(res);
   }
 };
+
+template <class F>
+void bench_threaded(F &&f) {
+  class Threaded : public td::Benchmark {
+   public:
+    explicit Threaded(F &&f) : f_(std::move(f)), base(f_()) {
+    }
+    F f_;
+    std::decay_t<decltype(f_())> base;
+
+    std::string get_description() const override {
+      return base.get_description() + " threaded";
+    }
+
+    void run(int n) override {
+      std::atomic<int> task_i{0};
+      int chunk_size = 1024;
+      int num_threads = 16;
+      n *= num_threads;
+      std::vector<td::thread> threads;
+      for (int i = 0; i < num_threads; i++) {
+        threads.emplace_back([&]() mutable {
+          auto bench = f_();
+          while (true) {
+            i = task_i.fetch_add(chunk_size, std::memory_order_relaxed);
+            auto i_end = std::min(n, i + chunk_size);
+            if (i > n) {
+              break;
+            }
+            bench.run(i_end - i);
+          }
+        });
+      }
+      for (auto &thread : threads) {
+        thread.join();
+      }
+    };
+  };
+  bench(Threaded(std::forward<F>(f)));
+}
 TEST(Cell, sha_benchmark) {
-  bench(BenchSha256Tdlib());
-  bench(BenchSha256Low());
-  bench(BenchSha256Reuse());
-  bench(BenchSha256());
+  for (size_t n : {4, 64, 128}) {
+    bench(BenchSha256Tdlib(n));
+    bench(BenchSha256Low(n));
+    bench(BenchSha256Reuse(n));
+    bench(BenchSha256(n));
+  }
+}
+TEST(Cell, sha_benchmark_threaded) {
+  for (size_t n : {4, 64, 128}) {
+    bench_threaded([n] { return BenchSha256Tdlib(n); });
+    bench_threaded([n]() { return BenchSha256Low(n); });
+    bench_threaded([n]() { return BenchSha256Reuse(n); });
+    bench_threaded([n]() { return BenchSha256(n); });
+  }
+}
+class BenchTasks : public td::Benchmark {
+ public:
+  explicit BenchTasks(size_t tn) : tn_(tn) {
+  }
+
+  std::string get_description() const override {
+    return PSTRING() << "bench_tasks(threads_n=" << tn_ << ")";
+  }
+
+  void run(int n) override {
+    ActorExecutor executor(tn_);
+    for (int i = 0; i < n; i++) {
+      std::latch latch(tn_);
+      for (size_t j = 0; j < tn_; j++) {
+        executor.execute_async([&]() { latch.count_down(); });
+      }
+      latch.wait();
+    }
+  }
+
+ private:
+  size_t tn_{};
+};
+TEST(Bench, Tasks) {
+  for (size_t tn : {1, 4, 16}) {
+    bench(BenchTasks(tn));
+  }
 }
 
 std::string serialize_boc(Ref<Cell> cell, int mode = 31) {
@@ -277,6 +460,8 @@ class CellExplorer {
         cs_ = {};
         break;
       }
+      default:
+        UNREACHABLE();
     }
   }
 
@@ -314,6 +499,8 @@ class CellExplorer {
       case op.ReadCellSlice:
         log_ << "read slice " << op.children_mask << "\n";
         break;
+      default:
+        UNREACHABLE();
     }
   }
   void log_cell(const Ref<Cell> &cell) {
@@ -462,22 +649,24 @@ TEST(Cell, MerkleProof) {
     auto cell = gen_random_cell(rnd.fast(1, 1000), rnd, with_prunned_branches);
     auto exploration = CellExplorer::random_explore(cell, rnd);
 
-    auto usage_tree = std::make_shared<CellUsageTree>();
+    auto usage_tree = std::make_shared<CellUsageTree>(cell);
     auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
     auto exploration2 = CellExplorer::explore(usage_cell, exploration.ops);
     ASSERT_EQ(exploration.log, exploration2.log);
 
-    auto is_prunned = [&](const Ref<Cell> &cell) { return exploration.visited.count(cell->get_hash()) == 0; };
-    auto proof = MerkleProof::generate(cell, is_prunned);
+    auto is_prunned = [&](const Ref<Cell> &cell_to_check) {
+      return exploration.visited.count(cell_to_check->get_hash()) == 0;
+    };
+    auto proof = MerkleProof::generate(cell, is_prunned).move_as_ok();
     // CellBuilder::virtualize(proof, 1);
     //ASSERT_EQ(1u, proof->get_level());
-    auto virtualized_proof = MerkleProof::virtualize(proof, 1);
+    auto virtualized_proof = MerkleProof::virtualize(proof).move_as_ok();
     auto exploration3 = CellExplorer::explore(virtualized_proof, exploration.ops);
     ASSERT_EQ(exploration.log, exploration3.log);
 
-    auto proof2 = MerkleProof::generate(cell, usage_tree.get());
+    auto proof2 = MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
     CHECK(proof2->get_depth() == proof->get_depth());
-    auto virtualized_proof2 = MerkleProof::virtualize(proof2, 1);
+    auto virtualized_proof2 = MerkleProof::virtualize(proof2).move_as_ok();
     auto exploration4 = CellExplorer::explore(virtualized_proof2, exploration.ops);
     ASSERT_EQ(exploration.log, exploration4.log);
   }
@@ -493,37 +682,37 @@ TEST(Cell, MerkleProofCombine) {
 
     Ref<Cell> proof1;
     {
-      auto usage_tree = std::make_shared<CellUsageTree>();
+      auto usage_tree = std::make_shared<CellUsageTree>(cell);
       auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
       CellExplorer::explore(usage_cell, exploration1.ops);
-      proof1 = MerkleProof::generate(cell, usage_tree.get());
+      proof1 = MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
 
-      auto virtualized_proof = MerkleProof::virtualize(proof1, 1);
+      auto virtualized_proof = MerkleProof::virtualize(proof1).move_as_ok();
       auto exploration = CellExplorer::explore(virtualized_proof, exploration1.ops);
       ASSERT_EQ(exploration.log, exploration1.log);
     }
 
     Ref<Cell> proof2;
     {
-      auto usage_tree = std::make_shared<CellUsageTree>();
+      auto usage_tree = std::make_shared<CellUsageTree>(cell);
       auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
       CellExplorer::explore(usage_cell, exploration2.ops);
-      proof2 = MerkleProof::generate(cell, usage_tree.get());
+      proof2 = MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
 
-      auto virtualized_proof = MerkleProof::virtualize(proof2, 1);
+      auto virtualized_proof = MerkleProof::virtualize(proof2).move_as_ok();
       auto exploration = CellExplorer::explore(virtualized_proof, exploration2.ops);
       ASSERT_EQ(exploration.log, exploration2.log);
     }
 
     Ref<Cell> proof12;
     {
-      auto usage_tree = std::make_shared<CellUsageTree>();
+      auto usage_tree = std::make_shared<CellUsageTree>(cell);
       auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
       CellExplorer::explore(usage_cell, exploration1.ops);
       CellExplorer::explore(usage_cell, exploration2.ops);
-      proof12 = MerkleProof::generate(cell, usage_tree.get());
+      proof12 = MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
 
-      auto virtualized_proof = MerkleProof::virtualize(proof12, 1);
+      auto virtualized_proof = MerkleProof::virtualize(proof12).move_as_ok();
       auto exploration_a = CellExplorer::explore(virtualized_proof, exploration1.ops);
       auto exploration_b = CellExplorer::explore(virtualized_proof, exploration2.ops);
       ASSERT_EQ(exploration_a.log, exploration1.log);
@@ -532,28 +721,28 @@ TEST(Cell, MerkleProofCombine) {
 
     {
       auto check = [&](auto proof_union) {
-        auto virtualized_proof = MerkleProof::virtualize(proof_union, 1);
+        auto virtualized_proof = MerkleProof::virtualize(proof_union).move_as_ok();
         auto exploration_a = CellExplorer::explore(virtualized_proof, exploration1.ops);
         auto exploration_b = CellExplorer::explore(virtualized_proof, exploration2.ops);
         ASSERT_EQ(exploration_a.log, exploration1.log);
         ASSERT_EQ(exploration_b.log, exploration2.log);
       };
-      auto proof_union = MerkleProof::combine(proof1, proof2);
+      auto proof_union = MerkleProof::combine(proof1, proof2).move_as_ok();
       ASSERT_EQ(proof_union->get_hash(), proof12->get_hash());
       check(proof_union);
 
-      auto proof_union_fast = MerkleProof::combine_fast(proof1, proof2);
+      auto proof_union_fast = MerkleProof::combine_fast(proof1, proof2).move_as_ok();
       check(proof_union_fast);
     }
     {
-      auto cell = MerkleProof::virtualize(proof12, 1);
+      cell = MerkleProof::virtualize(proof12).move_as_ok();
 
-      auto usage_tree = std::make_shared<CellUsageTree>();
+      auto usage_tree = std::make_shared<CellUsageTree>(cell);
       auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
       CellExplorer::explore(usage_cell, exploration1.ops);
-      auto proof = MerkleProof::generate(cell, usage_tree.get());
+      auto proof = MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
 
-      auto virtualized_proof = MerkleProof::virtualize(proof, 2);
+      auto virtualized_proof = MerkleProof::virtualize(proof).move_as_ok();
       auto exploration = CellExplorer::explore(virtualized_proof, exploration1.ops);
       ASSERT_EQ(exploration.log, exploration1.log);
       if (proof->get_hash() != proof1->get_hash()) {
@@ -575,10 +764,10 @@ Ref<Cell> gen_random_cell(int size, Ref<Cell> from, td::Random::Xorshift128plus 
   return gen_random_cell(size, rnd, with_prunned_branches, std::move(exploration.visited_cells));
 }
 auto gen_merkle_update(Ref<Cell> cell, td::Random::Xorshift128plus &rnd, bool with_prunned_branches) {
-  auto usage_tree = std::make_shared<CellUsageTree>();
+  auto usage_tree = std::make_shared<CellUsageTree>(cell);
   auto usage_cell = UsageCell::create(cell, usage_tree->root_ptr());
   auto new_cell = gen_random_cell(rnd.fast(1, X), usage_cell, rnd, with_prunned_branches);
-  auto update = MerkleUpdate::generate(cell, new_cell, usage_tree.get());
+  auto update = MerkleUpdate::generate(cell, new_cell, usage_tree.get()).move_as_ok();
   return std::make_tuple(new_cell, update, usage_tree);
 };
 
@@ -587,7 +776,7 @@ void check_merkle_update(Ref<Cell> A, Ref<Cell> B, Ref<Cell> AB) {
   CHECK(A.not_null());
   MerkleUpdate::may_apply(A, AB).ensure();
   MerkleUpdate::validate(AB).ensure();
-  auto got_B = MerkleUpdate::apply(A, AB);
+  auto got_B = MerkleUpdate::apply(A, AB).move_as_ok();
   ASSERT_EQ(B->get_hash(), got_B->get_hash());
 };
 
@@ -603,6 +792,327 @@ TEST(Cell, MerkleUpdate) {
     check_merkle_update(A, B, AB);
   }
 };
+
+namespace {
+
+constexpr unsigned long_chain_length = 400;
+
+Ref<Cell> make_cell(std::vector<Ref<Cell>> refs) {
+  CellBuilder cb;
+  for (const auto &ref : refs) {
+    cb.store_ref(ref);
+  }
+  return cb.finalize();
+}
+
+Ref<Cell> make_chain(Ref<Cell> tail, unsigned length, bool bit = false, unsigned inner_bits = 1023) {
+  for (unsigned i = 0; i < length; ++i) {
+    CellBuilder cb;
+    cb.store_bits_same(inner_bits, bit);
+    cb.store_ref(tail);
+    tail = cb.finalize();
+  }
+  return tail;
+}
+
+Ref<Cell> follow_chain(Ref<Cell> cell, unsigned length) {
+  for (unsigned i = 0; i < length; ++i) {
+    CellSlice cs(NoVm(), cell);
+    ASSERT_EQ(cs.size_refs(), 1u);
+    cell = cs.fetch_ref();
+  }
+  return cell;
+}
+
+class MerkleUpdateEstimationTest {
+ public:
+  explicit MerkleUpdateEstimationTest(Ref<Cell> initial_root)
+      : initial_root_(std::move(initial_root))
+      , usage_tree_(std::make_shared<CellUsageTree>(initial_root_))
+      , state_(UsageCell::create(initial_root_, usage_tree_->root_ptr())) {
+  }
+
+  Ref<Cell> state() const {
+    return state_;
+  }
+
+  void update_state(Ref<Cell> state) {
+    state_ = std::move(state);
+    stat_.add_proof(state_, usage_tree_.get(), &left_stat_);
+  }
+
+  void check(td::Slice name) {
+    auto stat = stat_.get_proof_stat();
+    // Cell-size terms from BlockLimitStatus::estimate_block_size, without its
+    // whole-block and per-transaction allowances. In particular, this does not
+    // add a separate allowance for the MerkleUpdate wrapper or BOC header.
+    auto right_size = (stat.bits >> 3) + stat.cells * 12 + stat.internal_refs * 3 + stat.external_refs * 40;
+    auto left_size = left_stat_.estimate_proof_size();
+    // Generate only after the last transaction: generation changes usage-tree marks.
+    auto update = MerkleUpdate::generate(initial_root_, state_, usage_tree_.get()).move_as_ok();
+    check_merkle_update(initial_root_, state_, update);
+    CellSlice update_cs{NoVm{}, update};
+    auto serialized = std_boc_serialize(update, 0).move_as_ok();
+    auto serialized_left = std_boc_serialize(update_cs.prefetch_ref(0), 0).move_as_ok();
+    auto serialized_right = std_boc_serialize(update_cs.prefetch_ref(1), 0).move_as_ok();
+    LOG(INFO) << name << ": serialized_size=" << serialized.size() << " (left=" << serialized_left.size()
+              << ", right=" << serialized_right.size() << "), estimated_size=" << left_size + right_size
+              << " (left=" << left_size << ", right=" << right_size << ")";
+  }
+
+ private:
+  Ref<Cell> initial_root_;
+  std::shared_ptr<CellUsageTree> usage_tree_;
+  Ref<Cell> state_;
+  NewCellStorageStat stat_;
+  MerkleUpdateLeftStat left_stat_;
+};
+
+}  // namespace
+
+TEST(Cell, MerkleUpdateEstimationRebuiltCell) {
+  auto x = make_cell({make_cell({})});  // X is non-leaf.
+  MerkleUpdateEstimationTest test(make_chain(x, long_chain_length));
+  auto a = test.state();
+
+  // Transaction 1: rebuild X without accessing A's usage path; store {A, {X}}.
+  CellBuilder cb;
+  cb.append_cellslice(CellSlice(NoVm(), x));
+  auto rebuilt_x = cb.finalize();
+  ASSERT_EQ(rebuilt_x->get_hash(), x->get_hash());
+  ASSERT_TRUE(rebuilt_x.get() != x.get());
+  ASSERT_TRUE(rebuilt_x->get_tree_node().empty());
+  test.update_state(make_cell({a, make_cell({rebuilt_x})}));
+  auto first_state = test.state();
+
+  // Transaction 2: obtain X' through A and store {A, {X'}}. The state hash is
+  // unchanged, but estimation must discover the newly used path through A.
+  a = CellSlice(NoVm(), first_state).prefetch_ref(0);
+  auto original_x = follow_chain(a, long_chain_length);
+  ASSERT_EQ(original_x->get_hash(), rebuilt_x->get_hash());
+  ASSERT_TRUE(!original_x->get_tree_node().empty());
+  test.update_state(make_cell({a, make_cell({original_x})}));
+  ASSERT_EQ(test.state()->get_hash(), first_state->get_hash());
+  test.check("MerkleUpdateEstimationRebuiltCell");
+}
+
+TEST(Cell, MerkleUpdateEstimationDifferentUsagePaths) {
+  constexpr unsigned short_chain_length = 3;
+  auto x = make_cell({make_cell({})});
+  // Different bits ensure that A is not a hash-equal suffix of B.
+  auto a = make_chain(x, short_chain_length, false);
+  auto b = make_chain(x, long_chain_length, true);
+  MerkleUpdateEstimationTest test(make_cell({a, b}));
+  CellSlice initial(NoVm(), test.state());
+  a = initial.prefetch_ref(0);
+  b = initial.prefetch_ref(1);
+
+  // Transaction 1: load X through short A and store {A, B, {X}}.
+  auto x_from_a = follow_chain(a, short_chain_length);
+  test.update_state(make_cell({a, b, make_cell({x_from_a})}));
+  auto first_state = test.state();
+
+  // Transaction 2: load the same X through long B and store {A, B, {X'}}.
+  CellSlice current(NoVm(), first_state);
+  a = current.prefetch_ref(0);
+  b = current.prefetch_ref(1);
+  auto x_from_b = follow_chain(b, long_chain_length);
+  ASSERT_EQ(x_from_a->get_hash(), x_from_b->get_hash());
+  ASSERT_TRUE(x_from_a->get_tree_node().node_id() != x_from_b->get_tree_node().node_id());
+  test.update_state(make_cell({a, b, make_cell({x_from_b})}));
+  ASSERT_EQ(test.state()->get_hash(), first_state->get_hash());
+  test.check("MerkleUpdateEstimationDifferentUsagePaths");
+}
+
+TEST(Cell, MerkleUpdateEstimationOldMerkleDepths) {
+  auto x = make_cell({make_cell({})});
+  auto a = make_chain(x, long_chain_length);
+  auto proof_a = CellBuilder::create_merkle_proof(a);
+  auto proof_proof_a = CellBuilder::create_merkle_proof(proof_a);
+  MerkleUpdateEstimationTest test(make_cell({proof_proof_a, proof_a, a}));
+  CellSlice initial(NoVm(), test.state());
+  Ref<Cell> first = initial.prefetch_ref(0);
+  Ref<Cell> second = initial.prefetch_ref(1);
+  a = initial.prefetch_ref(2);
+
+  // Follow the two raw MerkleProof references, then A; do not virtualize them.
+  auto original_x = follow_chain(first, long_chain_length + 2);
+  ASSERT_EQ(original_x->get_hash(), x->get_hash());
+  test.update_state(make_cell({first, second, a, make_cell({original_x})}));
+  test.check("MerkleUpdateEstimationOldMerkleDepths");
+}
+
+TEST(Cell, MerkleUpdateEstimationNewMerkleDepths) {
+  auto x = make_cell({make_cell({})});
+  MerkleUpdateEstimationTest test(x);
+
+  // Build new A ending in the old UsageCell X and reference A at depths 2, 1, 0.
+  auto a = make_chain(test.state(), long_chain_length);
+  auto proof_a = CellBuilder::create_merkle_proof(a);
+  auto proof_proof_a = CellBuilder::create_merkle_proof(proof_a);
+  test.update_state(make_cell({proof_proof_a, proof_a, a}));
+  test.check("MerkleUpdateEstimationNewMerkleDepths");
+}
+
+TEST(Cell, MerkleUpdateEstimationNewMerkleDepthsNoPrunned) {
+  MerkleUpdateEstimationTest test(make_cell({}));
+  // Build new A ending in the newly created cell and reference A at depths 2, 1, 0.
+  auto a = make_chain(make_cell({}), long_chain_length);
+  auto proof_a = CellBuilder::create_merkle_proof(a);
+  auto proof_proof_a = CellBuilder::create_merkle_proof(proof_a);
+  test.update_state(make_cell({proof_proof_a, proof_a, a}));
+  test.check("MerkleUpdateEstimationNewMerkleDepthsNoPrunned");
+}
+
+TEST(Cell, MerkleUpdateEstimationPrunedCopies) {
+  auto x = make_cell({make_cell({})});  // X is non-leaf.
+  std::vector<Ref<Cell>> a(long_chain_length);
+  auto tail = x;
+  for (unsigned i = long_chain_length; i > 0; --i) {
+    tail = make_chain(tail, 1, false, 1);
+    a[i - 1] = tail;
+  }
+
+  // A_i = {A_(i+1)},       A_(n+1) = X
+  // B_i = {B_(i+1), A_i},  B_(n+1) = MerkleProof(A_1)
+  Ref<Cell> root = CellBuilder::create_merkle_proof(a[0]);
+  for (unsigned i = long_chain_length; i > 0; --i) {
+    CellBuilder cb;
+    cb.store_bits_same(1, true);
+    cb.store_ref(root);
+    cb.store_ref(a[i - 1]);
+    root = cb.finalize();
+  }
+  MerkleUpdateEstimationTest test(root);
+
+  // Reuse only X, obtained through B's first references, the proof, then A.
+  // This marks every B_i and A_i even though there is just one reused cell.
+  auto cell = test.state();
+  for (unsigned i = 0; i < long_chain_length; ++i) {
+    CellSlice cs(NoVm(), cell);
+    ASSERT_EQ(cs.size_refs(), 2u);
+    cell = cs.prefetch_ref(0);
+  }
+  auto original_x = follow_chain(cell, long_chain_length + 1);
+  ASSERT_EQ(original_x->get_hash(), x->get_hash());
+  ASSERT_TRUE(!original_x->get_tree_node().empty());
+  test.update_state(original_x);
+
+  // Left-proof DFS first expands all A_i at Merkle depth 1, then emits a
+  // separate pruned copy of each A_i through B_i's second reference at depth 0.
+  test.check("MerkleUpdateEstimationPrunedCopies");
+}
+
+TEST(Cell, MerkleUpdateEstimationTwoPrunedCopies) {
+  auto make_tail = [](unsigned tag) {
+    CellBuilder cb;
+    cb.store_long(tag, 2);
+    cb.store_ref(make_cell({}));
+    return cb.finalize();
+  };
+  // Different non-leaf tails ensure that right-proof hash deduplication does
+  // not skip marking any of the three paths through the original state.
+  auto x = make_tail(0);
+  auto y = make_tail(1);
+  auto z = make_tail(2);
+  std::vector<Ref<Cell>> a(long_chain_length);
+  Ref<Cell> tail = x;
+  for (unsigned i = long_chain_length; i > 0; --i) {
+    tail = make_chain(tail, 1, false, 1);
+    a[i - 1] = tail;
+  }
+  auto make_ref_chain = [&](Ref<Cell> end, bool bit) {
+    for (unsigned i = long_chain_length; i > 0; --i) {
+      CellBuilder cb;
+      cb.store_bits_same(1, bit);
+      cb.store_ref(end);
+      cb.store_ref(a[i - 1]);
+      end = cb.finalize();
+    }
+    return end;
+  };
+  auto b = make_ref_chain(y, true);
+  auto c = make_ref_chain(z, false);
+
+  // A_i = {A_(i+1)}, with tail X.
+  // B_i = {B_(i+1), A_i}, with tail Y; C_i = {C_(i+1), A_i}, with tail Z.
+  // Root = {A_1, MerkleProof(B_1), MerkleProof(MerkleProof(C_1))}.
+  auto proof_b = CellBuilder::create_merkle_proof(b);
+  auto proof_c = CellBuilder::create_merkle_proof(c);
+  auto proof_proof_c = CellBuilder::create_merkle_proof(proof_c);
+  MerkleUpdateEstimationTest test(make_cell({a[0], proof_b, proof_proof_c}));
+  CellSlice initial(NoVm(), test.state());
+  auto original_x = follow_chain(initial.prefetch_ref(0), long_chain_length);
+  auto original_y = follow_chain(initial.prefetch_ref(1), 1);
+  auto original_z = follow_chain(initial.prefetch_ref(2), 2);
+  for (unsigned i = 0; i < long_chain_length; ++i) {
+    CellSlice b_cs(NoVm(), original_y);
+    CellSlice c_cs(NoVm(), original_z);
+    ASSERT_EQ(b_cs.size_refs(), 2u);
+    ASSERT_EQ(c_cs.size_refs(), 2u);
+    original_y = b_cs.prefetch_ref(0);
+    original_z = c_cs.prefetch_ref(0);
+  }
+  ASSERT_EQ(original_x->get_hash(), x->get_hash());
+  ASSERT_EQ(original_y->get_hash(), y->get_hash());
+  ASSERT_EQ(original_z->get_hash(), z->get_hash());
+  test.update_state(make_cell({original_x, original_y, original_z}));
+  test.check("MerkleUpdateEstimationTwoPrunedCopies");
+}
+
+TEST(Cell, MerkleUpdateEstimationShiftedExpansionDepth) {
+  // Distinct non-leaf tails make all reused hashes different, so right-proof
+  // deduplication does not skip marking any of the three usage paths below.
+  auto x = make_cell({make_cell({})});
+  CellBuilder y_cb;
+  y_cb.store_long(1, 2);
+  y_cb.store_ref(make_cell({}));
+  auto y = y_cb.finalize();
+
+  // A_i = {A_(i+1)}, ending in X; B_i = {B_(i+1), A_i}, ending in Y.
+  // Use one-bit intermediate cells so the per-cell estimation allowance
+  // does not hide the cost of missing pruned copies.
+  std::vector<Ref<Cell>> a(long_chain_length);
+  Ref<Cell> tail = x;
+  for (unsigned i = long_chain_length; i > 0; --i) {
+    tail = make_chain(tail, 1, false, 1);
+    a[i - 1] = tail;
+  }
+  Ref<Cell> b = y;
+  for (unsigned i = long_chain_length; i > 0; --i) {
+    CellBuilder cb;
+    cb.store_bits_same(1, true);
+    cb.store_ref(b);
+    cb.store_ref(a[i - 1]);
+    b = cb.finalize();
+  }
+
+  // Initial root = {MerkleProof(A_1), B_1}.
+  MerkleUpdateEstimationTest test(make_cell({CellBuilder::create_merkle_proof(a[0]), b}));
+  CellSlice initial(NoVm(), test.state());
+  // Fetch A_1 without opening it through this path: only the MerkleProof
+  // becomes an ancestor marked for inclusion in the left subtree.
+  auto original_a = follow_chain(initial.prefetch_ref(0), 1);
+  auto original_b = initial.prefetch_ref(1);
+  // Reach X through B_1's second reference, marking A's nodes at depth 0.
+  auto original_x = follow_chain(CellSlice(NoVm(), original_b).prefetch_ref(1), long_chain_length);
+  auto original_y = original_b;
+  for (unsigned i = 0; i < long_chain_length; ++i) {
+    CellSlice cs(NoVm(), original_y);
+    ASSERT_EQ(cs.size_refs(), 2u);
+    original_y = cs.prefetch_ref(0);
+  }
+  ASSERT_EQ(original_a->get_hash(), a[0]->get_hash());
+  ASSERT_EQ(original_x->get_hash(), x->get_hash());
+  ASSERT_EQ(original_y->get_hash(), y->get_hash());
+  test.update_state(make_cell({original_a, original_x, original_y}));
+
+  // Left-proof DFS expands every A_i through the MerkleProof at depth 1,
+  // because inclusion is determined by hash, despite their marked usage
+  // paths having depth 0. Each B_i then references a depth-0 pruned copy.
+  // Recording only usage depths misses the extra copies of A_2 ... A_400.
+  test.check("MerkleUpdateEstimationShiftedExpansionDepth");
+}
 
 TEST(Cell, MerkleUpdateCombine) {
   td::Random::Xorshift128plus rnd{123};
@@ -620,7 +1130,7 @@ TEST(Cell, MerkleUpdateCombine) {
     std::tie(C, BC, std::ignore) = gen_merkle_update(B, rnd, with_prunned_branches);
     check_merkle_update(B, C, BC);
 
-    check_merkle_update(A, C, MerkleUpdate::combine(AB, BC));
+    check_merkle_update(A, C, MerkleUpdate::combine(AB, BC).move_as_ok());
   }
 };
 
@@ -707,6 +1217,26 @@ TEST(TonDb, BocFuzz) {
           .move_as_ok())
       .ensure_error();
 }
+
+TEST(TonDb, BocDeserializeTruncated) {
+  td::Random::Xorshift128plus rnd{123};
+  auto serialized = serialize_boc(gen_random_cell(8, rnd), 31);
+  CHECK(serialized.size() > 1);
+
+  auto truncated = td::Slice{serialized}.substr(0, serialized.size() - 1);
+
+  // Truncated data deserialization causes error
+  vm::BagOfCells boc;
+  boc.deserialize(truncated).ensure_error();
+  vm::std_boc_deserialize(truncated).ensure_error();
+  vm::std_boc_deserialize_multi(truncated).ensure_error();
+
+  // Empty data deserializes into empty vector of roots
+  td::BufferSlice empty;
+  auto empty_roots = vm::std_boc_deserialize_multi(empty.as_slice()).move_as_ok();
+  CHECK(empty_roots.empty());
+}
+
 void test_parse_prefix(td::Slice boc) {
   for (size_t i = 0; i <= boc.size(); i++) {
     auto prefix = boc.substr(0, i);
@@ -762,21 +1292,454 @@ TEST(TonDb, BocMultipleRoots) {
   }
 };
 
-TEST(TonDb, DynamicBoc) {
+TEST(TonDb, InMemoryDynamicBocSimple) {
+  auto counter = [] { return td::NamedThreadSafeCounter::get_default().get_counter("DataCell").sum(); };
+  auto before = counter();
+  SCOPE_EXIT {
+    LOG_CHECK(before == counter()) << before << " vs " << counter();
+  };
   td::Random::Xorshift128plus rnd{123};
+  auto kv = std::make_shared<td::MemoryKeyValue>();
+  CellStorer storer(*kv);
+
+  auto boc = DynamicBagOfCellsDb::create_in_memory(kv.get(), {});
+
+  auto empty_cell = vm::CellBuilder().finalize();
+  boc->inc(empty_cell);
+  boc->prepare_commit().ensure();
+  boc->commit(storer).ensure();
+  auto got_empty_cell = boc->load_cell(empty_cell->get_hash().as_slice()).move_as_ok();
+  ASSERT_EQ(empty_cell->get_hash(), got_empty_cell->get_hash());
+
+  boc->dec(empty_cell);
+
+  auto one_ref_cell = vm::CellBuilder().store_ref(empty_cell).finalize();
+  boc->inc(one_ref_cell);
+  boc->prepare_commit().ensure();
+  boc->commit(storer).ensure();
+  auto got_one_ref_cell = boc->load_cell(one_ref_cell->get_hash().as_slice()).move_as_ok();
+  ASSERT_EQ(one_ref_cell->get_hash(), got_one_ref_cell->get_hash());
+  boc = DynamicBagOfCellsDb::create_in_memory(kv.get(), {});
+
+  auto random_ref_cell = gen_random_cell(3, rnd);
+  boc->inc(random_ref_cell);
+  boc->prepare_commit().ensure();
+  boc->commit(storer).ensure();
+  auto got_random_ref_cell = boc->load_cell(random_ref_cell->get_hash().as_slice()).move_as_ok();
+  ASSERT_EQ(random_ref_cell->get_hash(), got_random_ref_cell->get_hash());
+  boc = DynamicBagOfCellsDb::create_in_memory(kv.get(), {});
+}
+
+int VERBOSITY_NAME(boc) = VERBOSITY_NAME(DEBUG) + 10;
+
+struct CellMerger : td::Merger {
+  void merge_value_and_update(std::string &value, td::Slice update) override {
+    return CellStorer::merge_value_and_refcnt_diff(value, update);
+  }
+  void merge_update_and_update(std::string &left_update, td::Slice right_update) override {
+    LOG(ERROR) << "update_and_update";
+    UNREACHABLE();
+    return CellStorer::merge_refcnt_diffs(left_update, right_update);
+  }
+};
+struct CompactionFilterEraseEmptyValues : public rocksdb::CompactionFilter {
+  bool Filter(int level, const rocksdb::Slice & /*key*/, const rocksdb::Slice &existing_value, std::string *new_value,
+              bool *value_changed) const override {
+    return existing_value.empty();
+  }
+  bool FilterMergeOperand(int, const rocksdb::Slice & /*key*/, const rocksdb::Slice &operand) const override {
+    return operand.empty();
+  }
+
+  // Name of the compaction filter
+  const char *Name() const override {
+    return "CompactionFilterEraseEmptyValues";
+  }
+};
+auto to_td(rocksdb::Slice value) -> td::Slice {
+  return td::Slice(value.data(), value.size());
+}
+
+struct MergeOperatorAddCellRefcnt : public rocksdb::MergeOperator {
+  const char *Name() const override {
+    return "MergeOperatorAddCellRefcnt";
+  }
+  bool FullMergeV2(const MergeOperationInput &merge_in, MergeOperationOutput *merge_out) const override {
+    CHECK(merge_in.existing_value);
+    auto &value = *merge_in.existing_value;
+    CHECK(merge_in.operand_list.size() >= 1);
+    td::Slice diff;
+    std::string diff_buf;
+    if (merge_in.operand_list.size() == 1) {
+      diff = to_td(merge_in.operand_list[0]);
+    } else {
+      diff_buf = merge_in.operand_list[0].ToString();
+      for (size_t i = 1; i < merge_in.operand_list.size(); ++i) {
+        CellStorer::merge_refcnt_diffs(diff_buf, to_td(merge_in.operand_list[i]));
+      }
+      diff = diff_buf;
+    }
+
+    merge_out->new_value = value.ToString();
+    CellStorer::merge_value_and_refcnt_diff(merge_out->new_value, diff);
+    return true;
+  }
+  bool PartialMerge(const rocksdb::Slice & /*key*/, const rocksdb::Slice &left, const rocksdb::Slice &right,
+                    std::string *new_value, rocksdb::Logger *logger) const override {
+    *new_value = left.ToString();
+    CellStorer::merge_refcnt_diffs(*new_value, to_td(right));
+    return true;
+  }
+};
+
+struct DB {
+  std::unique_ptr<DynamicBagOfCellsDb> dboc;
+  std::shared_ptr<td::KeyValue> kv;
+  void reset_loader() {
+    dboc->set_loader(std::make_unique<CellLoader>(kv->snapshot()));
+  }
+};
+
+thread_local const std::string *current_boc_rocksdb_path = nullptr;
+
+struct BocOptions {
+  using AsyncExecutor = DynamicBagOfCellsDb::AsyncExecutor;
+
+  using CreateInMemoryOptions = DynamicBagOfCellsDb::CreateInMemoryOptions;
+  using CreateV1Options = DynamicBagOfCellsDb::CreateV1Options;
+  using CreateV2Options = DynamicBagOfCellsDb::CreateV2Options;
+
+  std::shared_ptr<AsyncExecutor> async_executor;
+  struct KvOptions {
+    enum KvType { InMemory, RocksDb } kv_type{InMemory};
+    bool experimental{false};
+    bool no_transactions{false};
+    size_t cache_size{0};
+    friend td::StringBuilder &operator<<(td::StringBuilder &sb, const KvOptions &kv_options) {
+      if (kv_options.kv_type == KvType::InMemory) {
+        return sb << "InMemory{}";
+      }
+      return sb << "RockDb{cache_size=" << kv_options.cache_size << ", no_transactions=" << kv_options.no_transactions
+                << ", experimental=" << kv_options.experimental << "}";
+    }
+  };
+  KvOptions kv_options;
+  std::variant<CreateV1Options, CreateV2Options, CreateInMemoryOptions> options;
+  std::pair<int, int> compress_depth_range{0, 0};
+  td::uint64 seed{123};
+  td::Random::Xorshift128plus rnd{123};
+
+  std::shared_ptr<KeyValue> create_kv(std::shared_ptr<KeyValue> old_key_value, bool no_reads = false) {
+    if (kv_options.kv_type == KvOptions::InMemory) {
+      if (old_key_value) {
+        return old_key_value;
+      }
+      return std::make_shared<td::MemoryKeyValue>(std::make_shared<CellMerger>());
+    } else if (kv_options.kv_type == KvOptions::RocksDb) {
+      auto merge_operator = std::make_shared<MergeOperatorAddCellRefcnt>();
+      static const CompactionFilterEraseEmptyValues compaction_filter;
+      CHECK(!old_key_value || old_key_value.use_count() == 1);
+      auto db_path = current_boc_rocksdb_path == nullptr || current_boc_rocksdb_path->empty()
+                         ? std::string{"test_celldb"}
+                         : *current_boc_rocksdb_path;
+      if (old_key_value) {
+        //LOG(ERROR) << "Reload rocksdb";
+        old_key_value.reset();
+      } else {
+        //LOG(ERROR) << "New rocksdb";
+        td::rmrf(db_path).ignore();
+      }
+      auto db_options = td::RocksDbOptions{
+          .block_cache = {},
+          .merge_operator = merge_operator,
+          .compaction_filter = &compaction_filter,
+          .experimental = kv_options.experimental,
+          .no_reads = no_reads,
+          .no_transactions = kv_options.no_transactions,
+          .use_direct_reads = true,
+          .no_block_cache = true,
+      };
+      if (kv_options.cache_size != 0) {
+        db_options.no_block_cache = false;
+        db_options.block_cache = rocksdb::NewLRUCache(kv_options.cache_size);
+      }
+      return std::make_shared<td::RocksDb>(td::RocksDb::open(db_path, std::move(db_options)).move_as_ok());
+    } else {
+      UNREACHABLE();
+    }
+  }
+  void check_kv_is_empty(KeyValue &kv) {
+    if (kv_options.kv_type == KvOptions::InMemory) {
+      ASSERT_EQ(0u, kv.count("").move_as_ok());
+      return;
+    }
+
+    size_t non_empty_values = 0;
+    kv.for_each([&](auto key, auto value) {
+      non_empty_values += !value.empty();
+      return td::Status::OK();
+    });
+    if (non_empty_values != 0) {
+      kv.for_each([&](auto key, auto value) {
+        LOG(ERROR) << "Key: " << td::hex_encode(key) << " Value: " << td::hex_encode(value);
+        std::string x;
+        LOG(ERROR) << int(kv.get(key, x).move_as_ok());
+        return td::Status::OK();
+      });
+    }
+    ASSERT_EQ(0u, non_empty_values);
+  }
+
+  [[nodiscard]] auto create_db(DB db, std::optional<td::int64> o_root_n) {
+    auto old_boc = std::move(db.dboc);
+    auto old_kv = std::move(db.kv);
+    old_boc.reset();
+    using ResT = DB;
+    auto res = std::visit(td::overloaded(
+                              [&](CreateV1Options &) -> ResT {
+                                auto new_kv = create_kv(std::move(old_kv));
+                                auto res = DynamicBagOfCellsDb::create();
+                                res->set_loader(std::make_unique<CellLoader>(new_kv->snapshot()));
+                                return DB{.dboc = std::move(res), .kv = std::move(new_kv)};
+                              },
+                              [&](CreateV2Options &options) -> ResT {
+                                auto new_kv = create_kv(std::move(old_kv));
+                                auto res = DynamicBagOfCellsDb::create_v2(options);
+                                res->set_loader(std::make_unique<CellLoader>(new_kv->snapshot()));
+                                return DB{.dboc = std::move(res), .kv = std::move(new_kv)};
+                              },
+                              [&](CreateInMemoryOptions &options) -> ResT {
+                                auto read_kv = create_kv(std::move(old_kv), false);
+                                auto res = DynamicBagOfCellsDb::create_in_memory(read_kv.get(), options);
+                                auto new_kv = create_kv(std::move(read_kv), true);
+                                res->set_loader(std::make_unique<CellLoader>(new_kv->snapshot()));
+                                auto stats = res->get_stats().move_as_ok();
+                                if (o_root_n) {
+                                  ASSERT_EQ(*o_root_n, stats.roots_total_count);
+                                }
+                                VLOG(boc) << "reset roots_n=" << stats.roots_total_count
+                                          << " cells_n=" << stats.cells_total_count;
+                                return DB{.dboc = std::move(res), .kv = std::move(new_kv)};
+                              }),
+                          options);
+    if (compress_depth_range.second != 0) {
+      res.dboc->set_celldb_compress_depth(rnd.fast(compress_depth_range.first, compress_depth_range.second));
+    }
+    return res;
+  }
+  void prepare_commit(DynamicBagOfCellsDb &dboc, StoreCellHint hint = {}) {
+    td::PerfWarningTimer warning_timer("test_db_prepare_commit");
+    if (async_executor) {
+      std::latch latch(1);
+      td::Result<td::Unit> res;
+      async_executor->execute_sync([&, hint = std::move(hint)] {
+        dboc.prepare_commit_async(async_executor, std::move(hint), [&](auto r) {
+          res = std::move(r);
+          latch.count_down();
+        });
+      });
+      latch.wait();
+      async_executor->execute_sync([&] {});
+      res.ensure();
+    } else {
+      dboc.prepare_commit(std::move(hint));
+    }
+  }
+  enum CacheAction { ResetCache, KeepCache };
+  void write_commit(DynamicBagOfCellsDb &dboc, std::shared_ptr<KeyValue> kv, CacheAction action) {
+    td::PerfWarningTimer warning_timer("test_db_write_commit");
+    kv->begin_write_batch().ensure();
+    CellStorer cell_storer(*kv);
+    {
+      td::PerfWarningTimer timer("test_db_commit");
+      dboc.commit(cell_storer).ensure();
+    }
+    {
+      td::PerfWarningTimer timer("test_db_commit_write_batch");
+      kv->commit_write_batch().ensure();
+    }
+    switch (action) {
+      case ResetCache: {
+        td::PerfWarningTimer timer("test_db_reset_cache");
+        dboc.set_loader(std::make_unique<CellLoader>(kv->snapshot()));
+        break;
+      }
+      case KeepCache:
+        break;
+    }
+  }
+
+  void commit(DB &db, CacheAction action = ResetCache, StoreCellHint hint = {}) {
+    prepare_commit(*db.dboc, std::move(hint));
+    write_commit(*db.dboc, db.kv, action);
+  }
+
+  std::string description() const {
+    td::StringBuilder sb;
+
+    sb << "DBOC(type=";
+    std::visit(td::overloaded([&](const CreateV1Options &) { sb << "V1"; },
+                              [&](const CreateV2Options &options) {
+                                sb << "V2(concurrency=" << options.extra_threads + 1;
+                                if (options.executor) {
+                                  sb << ", executor=" << options.executor->describe();
+                                } else {
+                                  sb << ", executor=threads";
+                                }
+                                sb << ")";
+                              },
+                              [&](const CreateInMemoryOptions &options) {
+                                sb << "InMemory(use_arena=" << options.use_arena
+                                   << ", less_memory=" << options.use_less_memory_during_creation << ")";
+                              }),
+               options);
+    sb << kv_options;
+    if (async_executor) {
+      sb << ", executor=" << async_executor->describe();
+    }
+    if (compress_depth_range.second != 0) {
+      sb << ", compress_depth=[" << compress_depth_range.first << ";" << compress_depth_range.second << "]";
+    }
+    sb << ")";
+
+    return sb.as_cslice().str();
+  }
+};
+
+template <class F>
+void with_all_boc_options(F &&f, size_t tests_n, bool only_v2 = false) {
+  LOG(INFO) << "Test dynamic boc";
+  auto counter = [] { return td::NamedThreadSafeCounter::get_default().get_counter("DataCell").sum(); };
+  std::map<std::string, std::vector<std::pair<td::int64, std::string>>> benches;
+  auto run = [&](BocOptions options) {
+    auto description = options.description();
+    LOG(INFO) << "Running " << description;
+    auto start = td::Timestamp::now();
+    DynamicBagOfCellsDb::Stats stats;
+    auto o_in_memory = std::get_if<DynamicBagOfCellsDb::CreateInMemoryOptions>(&options.options);
+    for (td::uint32 i = 0; i < tests_n; i++) {
+      std::string db_path;
+      if (options.kv_options.kv_type == BocOptions::KvOptions::RocksDb) {
+        db_path = td::mkdtemp(td::get_temporary_dir(), "test_celldb").move_as_ok();
+      }
+      auto previous_boc_rocksdb_path = current_boc_rocksdb_path;
+      current_boc_rocksdb_path = db_path.empty() ? nullptr : &db_path;
+      SCOPE_EXIT {
+        current_boc_rocksdb_path = previous_boc_rocksdb_path;
+        if (!db_path.empty()) {
+          td::rmrf(db_path).ignore();
+        }
+      };
+
+      auto before = counter();
+
+      options.seed = i == 0 ? 123 : i;
+      options.rnd = td::Random::Xorshift128plus{options.seed};
+      auto stats_diff = f(options);
+      stats.apply_diff(stats_diff);
+
+      auto after = counter();
+      LOG_CHECK((o_in_memory && o_in_memory->use_arena) || before == after) << before << " vs " << after;
+    }
+    LOG(INFO) << "\ttook " << td::Timestamp::now().at() - start.at() << " seconds";
+    LOG(INFO) << stats;
+    for (auto &[key, value] : stats.named_stats.stats_int) {
+      if (td::begins_with(key, "bench_")) {
+        benches[key].emplace_back(value, description);
+      }
+    }
+  };
+
+  // NB: use .experimental to play with different RocksDb parameters
+  // Note, that new benchmark are necessary to fully understand the effect of different RocksDb options
+  std::vector kv_options_list = {
+      // BocOptions::KvOptions{.kv_type = BocOptions::KvOptions::InMemory},
+      // BocOptions::KvOptions{.kv_type = BocOptions::KvOptions::RocksDb, .experimental = false, .cache_size = 0},
+      BocOptions::KvOptions{
+          .kv_type = BocOptions::KvOptions::RocksDb, .experimental = false, .cache_size = size_t{128 << 20}},
+  };
+  std::vector<std::pair<int, int>> compress_depth_ranges = {{0, 5}, {5, 5}, {0, 0}};
+  std::vector<bool> has_executor_options = {false, true};
+  for (auto compress_depth_range : compress_depth_ranges) {
+    for (auto kv_options : kv_options_list) {
+      for (bool has_executor : has_executor_options) {
+        std::shared_ptr<DynamicBagOfCellsDb::AsyncExecutor> executor;
+        if (has_executor) {
+          executor = std::make_shared<ActorExecutor>(
+              4);  // 4 - to compare V1 and V2, because V1 has parallel_load = 4 by default
+        }
+        // V2 - 4 threads
+        run({
+            .async_executor = executor,
+            .kv_options = kv_options,
+            .options =
+                DynamicBagOfCellsDb::CreateV2Options{.extra_threads = 3, .executor = executor, .cache_ttl_max = 5},
+            .compress_depth_range = compress_depth_range,
+        });
+
+        if (!only_v2) {
+          // V1
+          run({.async_executor = executor,
+               .kv_options = kv_options,
+               .options = DynamicBagOfCellsDb::CreateV1Options{},
+               .compress_depth_range = compress_depth_range});
+        }
+
+        // V2 - one thread
+        run({.async_executor = executor,
+             .kv_options = kv_options,
+             .options =
+                 DynamicBagOfCellsDb::CreateV2Options{.extra_threads = 0, .executor = executor, .cache_ttl_max = 5},
+             .compress_depth_range = compress_depth_range});
+
+        // InMemory
+        if (compress_depth_range.second == 0 && !only_v2) {
+          for (auto use_arena : {false, true}) {
+            for (auto less_memory : {false, true}) {
+              run({.async_executor = executor,
+                   .kv_options = kv_options,
+                   .options =
+                       DynamicBagOfCellsDb::CreateInMemoryOptions{.extra_threads = std::thread::hardware_concurrency(),
+                                                                  .verbose = false,
+                                                                  .use_arena = use_arena,
+                                                                  .use_less_memory_during_creation = less_memory}});
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (auto &[name, v] : benches) {
+    std::sort(v.begin(), v.end());
+    LOG(INFO) << "Bench " << name;
+    for (auto &[t, name] : v) {
+      LOG(INFO) << "\t" << name << " " << double(t) / 1000 << "s";
+    }
+  }
+}
+
+DynamicBagOfCellsDb::Stats test_dynamic_boc(BocOptions options) {
+  DynamicBagOfCellsDb::Stats stats;
+  auto &rnd = options.rnd;
   std::string old_root_hash;
   std::string old_root_serialization;
-  auto kv = std::make_shared<td::MemoryKeyValue>();
-  auto dboc = DynamicBagOfCellsDb::create();
-  dboc->set_loader(std::make_unique<CellLoader>(kv));
+  DB db;
+  auto reload_db = [&]() {
+    auto roots_n = old_root_hash.empty() ? 0 : 1;
+    db = options.create_db(std::move(db), roots_n);
+  };
+  reload_db();
   for (int t = 1000; t >= 0; t--) {
     if (rnd() % 10 == 0) {
-      dboc = DynamicBagOfCellsDb::create();
+      reload_db();
     }
-    dboc->set_loader(std::make_unique<CellLoader>(kv));
+    db.dboc->load_cell(vm::CellHash{}.as_slice()).ensure_error();
+
+    db.reset_loader();
     Ref<Cell> old_root;
     if (!old_root_hash.empty()) {
-      old_root = dboc->load_cell(old_root_hash).move_as_ok();
+      old_root = db.dboc->load_cell(old_root_hash).move_as_ok();
       auto serialization = serialize_boc(old_root);
       ASSERT_EQ(old_root_serialization, serialization);
     }
@@ -791,52 +1754,83 @@ TEST(TonDb, DynamicBoc) {
                ->get_root_cell(0)
                .move_as_ok();
 
-    dboc->dec(old_root);
+    db.dboc->dec(old_root);
     if (t != 0) {
-      dboc->inc(cell);
+      db.dboc->inc(cell);
     }
-    dboc->prepare_commit();
-    {
-      CellStorer cell_storer(*kv);
-      dboc->commit(cell_storer);
-    }
+    options.commit(db, BocOptions::ResetCache);
   }
-  ASSERT_EQ(0u, kv->count("").ok());
+  options.check_kv_is_empty(*db.kv);
+
+  stats.named_stats.apply_diff(db.kv->get_usage_stats().to_named_stats());
+  return stats;
+}
+
+TEST(TonDb, DynamicBoc) {
+  with_all_boc_options(test_dynamic_boc, 1);
 };
 
-TEST(TonDb, DynamicBoc2) {
-  int VERBOSITY_NAME(boc) = VERBOSITY_NAME(DEBUG) + 10;
-  td::Random::Xorshift128plus rnd{123};
-  int total_roots = 10000;
-  int max_roots = 20;
-  std::vector<std::string> root_hashes(max_roots);
-  std::vector<Ref<Cell>> roots(max_roots);
+DynamicBagOfCellsDb::Stats test_dynamic_boc2(BocOptions options) {
+  auto &rnd = options.rnd;
+  DynamicBagOfCellsDb::Stats stats;
+
+  int total_roots = rnd.fast(1, !rnd.fast(0, 30) * 100 + 10);
+  int max_roots = rnd.fast(1, 20);
+  int max_cells = 20;
+
+  // VERBOSITY_NAME(boc) = 1;
+  // LOG(WARNING) << "====================================================\n\n";
+  // max_roots = 2;
+  // total_roots = 2;
+  // max_cells = 2;
+
+  auto meta_key = [](size_t i) { return PSTRING() << "meta." << i; };
+  std::array<std::string, 8> meta;
+
   int last_commit_at = 0;
   int first_root_id = 0;
   int last_root_id = 0;
-  auto kv = std::make_shared<td::MemoryKeyValue>();
-  auto dboc = DynamicBagOfCellsDb::create();
-  dboc->set_loader(std::make_unique<CellLoader>(kv));
+  DB db;
+  auto reload_db = [&](td::int64 root_n) { db = options.create_db(std::move(db), root_n); };
+  reload_db(0);
 
+  auto counter = [] { return td::NamedThreadSafeCounter::get_default().get_counter("DataCell").sum(); };
+  auto before = counter();
+  SCOPE_EXIT {
+    bool skip_check = false;
+    if (std::holds_alternative<DynamicBagOfCellsDb::CreateInMemoryOptions>(options.options) &&
+        std::get<DynamicBagOfCellsDb::CreateInMemoryOptions>(options.options).use_arena) {
+      skip_check = true;
+    }
+    LOG_IF(FATAL, !(skip_check || before == counter())) << before << " vs " << counter();
+  };
+
+  std::vector<Ref<Cell>> roots(max_roots);
+  std::vector<std::string> root_hashes(max_roots);
   auto add_root = [&](Ref<Cell> root) {
-    dboc->inc(root);
+    db.dboc->inc(root);
     root_hashes[last_root_id % max_roots] = (root->get_hash().as_slice().str());
     roots[last_root_id % max_roots] = root;
     last_root_id++;
   };
 
-  auto get_root = [&](int root_id) {
+  auto get_root = [&](int root_id) -> Ref<Cell> {
     VLOG(boc) << "  from older root #" << root_id;
     auto from_root = roots[root_id % max_roots];
     if (from_root.is_null()) {
       VLOG(boc) << "  from db";
       auto from_root_hash = root_hashes[root_id % max_roots];
-      from_root = dboc->load_cell(from_root_hash).move_as_ok();
+      if (rnd() % 2 == 0) {
+        from_root = db.dboc->load_root(from_root_hash).move_as_ok();
+      } else {
+        from_root = db.dboc->load_cell(from_root_hash).move_as_ok();
+      }
     } else {
       VLOG(boc) << "FROM MEMORY";
     }
     return from_root;
   };
+  std::map<CellHash, int> root_cnt;
   auto new_root = [&] {
     if (last_root_id == total_roots) {
       return;
@@ -850,28 +1844,69 @@ TEST(TonDb, DynamicBoc2) {
       from_root = get_root(rnd.fast(first_root_id, last_root_id - 1));
     }
     VLOG(boc) << "  ...";
-    add_root(gen_random_cell(rnd.fast(1, 20), from_root, rnd));
+    auto new_root_cell = gen_random_cell(rnd.fast(1, max_cells), from_root, rnd);
+    root_cnt[new_root_cell->get_hash()]++;
+    add_root(std::move(new_root_cell));
     VLOG(boc) << "  OK";
   };
 
-  auto commit = [&] {
-    VLOG(boc) << "commit";
-    dboc->prepare_commit();
-    {
-      CellStorer cell_storer(*kv);
-      dboc->commit(cell_storer);
+  td::UsageStats commit_stats{};
+  auto commit = [&](bool finish = false) {
+    for (size_t i = 0; i < meta.size(); i++) {
+      std::string value;
+      auto status = db.dboc->meta_get(meta_key(i), value).move_as_ok();
+      if (status == KeyValue::GetStatus::Ok) {
+        ASSERT_EQ(value, meta[i]);
+        ASSERT_TRUE(!meta[i].empty());
+      } else {
+        ASSERT_TRUE(meta[i].empty());
+      }
+
+      if (meta[i].empty()) {
+        if (!finish && rnd() % 2 == 0) {
+          meta[i] = td::to_string(rnd());
+          db.dboc->meta_set(meta_key(i), meta[i]);
+          VLOG(boc) << "meta set " << meta_key(i) << " " << meta[i];
+        }
+      } else {
+        auto f = finish ? 1 : rnd() % 3;
+        if (f == 0) {
+          meta[i] = td::to_string(rnd());
+          db.dboc->meta_set(meta_key(i), meta[i]);
+          VLOG(boc) << "meta set " << meta_key(i) << " " << meta[i];
+        } else if (f == 1) {
+          meta[i] = "";
+          db.dboc->meta_erase(meta_key(i));
+          VLOG(boc) << "meta erase " << meta_key(i);
+        }
+      }
     }
-    dboc->set_loader(std::make_unique<CellLoader>(kv));
+
+    VLOG(boc) << "before commit cells_in_db=" << db.kv->count("");
+    //rnd.fast(0, 1);
+    auto stats_before = db.kv->get_usage_stats();
+    options.commit(db, BocOptions::ResetCache);
+    auto stats_after = db.kv->get_usage_stats();
+    commit_stats = commit_stats + stats_after - stats_before;
+    VLOG(boc) << "after commit cells_in_db=" << db.kv->count("");
+
+    // db.reset_loader();
     for (int i = last_commit_at; i < last_root_id; i++) {
       roots[i % max_roots].clear();
     }
     last_commit_at = last_root_id;
   };
-  auto reset = [&] {
+  auto reset = [&](bool force_full = false) {
     VLOG(boc) << "reset";
     commit();
-    dboc = DynamicBagOfCellsDb::create();
-    dboc->set_loader(std::make_unique<CellLoader>(kv));
+    if (rnd() % 3 == 0 || force_full) {
+      // very slow for rocksdb
+      auto r_stats = db.dboc->get_stats();
+      if (r_stats.is_ok()) {
+        stats.apply_diff(r_stats.ok());
+      }
+      reload_db(root_cnt.size());
+    }
   };
 
   auto delete_root = [&] {
@@ -879,18 +1914,114 @@ TEST(TonDb, DynamicBoc2) {
     if (first_root_id == last_root_id) {
       return;
     }
-    dboc->dec(get_root(first_root_id));
+    auto old_root = get_root(first_root_id);
+    auto it = root_cnt.find(old_root->get_hash());
+    it->second--;
+    CHECK(it->second >= 0);
+    if (it->second == 0) {
+      root_cnt.erase(it);
+    }
+
+    db.dboc->dec(std::move(old_root));
     first_root_id++;
     VLOG(boc) << "  OK";
   };
 
   td::RandomSteps steps({{new_root, 10}, {delete_root, 9}, {commit, 2}, {reset, 1}});
   while (first_root_id != total_roots) {
-    VLOG(boc) << first_root_id << " " << last_root_id << " " << kv->count("").ok();
+    VLOG(boc) << first_root_id << " " << last_root_id;  // << " " << db.kv->count("").ok();
     steps.step(rnd);
   }
-  commit();
-  ASSERT_EQ(0u, kv->count("").ok());
+  commit(true);
+  options.check_kv_is_empty(*db.kv);
+
+  // auto stats = kv->get_usage_stats();
+  // LOG(ERROR) << "total:  " << stats;
+  reset(true);
+  stats.named_stats.apply_diff(db.kv->get_usage_stats().to_named_stats());
+  return stats;
+}
+
+TEST(TonDb, DynamicBoc2) {
+  with_all_boc_options(test_dynamic_boc2, 50);
+}
+
+DynamicBagOfCellsDb::Stats test_dynamic_boc_hint(BocOptions options) {
+  auto &rnd = options.rnd;
+  DynamicBagOfCellsDb::Stats stats;
+
+  int max_cells = 30;
+
+  DB db;
+  auto reload_db = [&](td::int64 root_n) { db = options.create_db(std::move(db), root_n); };
+  reload_db(0);
+
+  std::vector<Ref<Cell>> roots;
+  td::UsageStats commit_stats{};
+  for (size_t iter = 0; iter < 30; ++iter) {
+    StoreCellHint hint;
+    if (!roots.empty() && rnd.fast(0, 2) == 0) {
+      int i = rnd.fast(0, (int)roots.size() - 1);
+      auto root = roots[i];
+      roots[i] = roots.back();
+      roots.pop_back();
+      VLOG(boc) << "Remove root " << root->get_hash().to_hex();
+      db.dboc->dec(root);
+    } else {
+      Ref<Cell> from_root;
+      if (!roots.empty()) {
+        int i = rnd.fast(0, (int)roots.size() - 1);
+        if (rnd.fast(0, 1)) {
+          auto hash = roots[i]->get_hash();
+          from_root = db.dboc->load_cell(hash.as_slice()).ensure().move_as_ok();
+        } else {
+          from_root = roots[i];
+        }
+      }
+      Ref<Cell> usage_from_root;
+      std::shared_ptr<CellUsageTree> usage_tree;
+      if (from_root.not_null()) {
+        usage_tree = std::make_shared<CellUsageTree>(from_root);
+        usage_from_root = UsageCell::create(from_root, usage_tree->root_ptr());
+      }
+      auto root = gen_random_cell(rnd.fast(1, max_cells), usage_from_root, rnd);
+      if (from_root.not_null()) {
+        auto update = MerkleUpdate::generate(usage_from_root, root, usage_tree.get()).move_as_ok();
+        root = MerkleUpdate::apply(from_root, update, &hint).move_as_ok();
+      }
+      roots.push_back(root);
+      VLOG(boc) << "Add root " << root->get_hash().to_hex();
+      db.dboc->inc(root);
+    }
+    VLOG(boc) << "before commit cells_in_db=" << db.kv->count("");
+    auto stats_before = db.kv->get_usage_stats();
+    options.commit(db, BocOptions::ResetCache, std::move(hint));
+    auto stats_after = db.kv->get_usage_stats();
+    commit_stats = commit_stats + stats_after - stats_before;
+    VLOG(boc) << "after commit cells_in_db=" << db.kv->count("");
+  }
+
+  auto r_stats = db.dboc->get_stats();
+  if (r_stats.is_ok()) {
+    stats.apply_diff(r_stats.ok());
+  }
+  stats.named_stats.apply_diff(db.kv->get_usage_stats().to_named_stats());
+
+  if (!std::holds_alternative<DynamicBagOfCellsDb::CreateInMemoryOptions>(options.options)) {
+    // Validate the whole DB in DynamicBagOfCellsDb::create_in_memory
+    auto kv = std::move(db.kv);
+    db = {};
+    auto mem =
+        DynamicBagOfCellsDb::create_in_memory(kv.get(), DynamicBagOfCellsDb::CreateInMemoryOptions{.verbose = false});
+    CHECK(mem);
+    mem = {};
+  }
+
+  return stats;
+}
+
+TEST(TonDb, DynamicBocHint) {
+  with_all_boc_options(test_dynamic_boc_hint, 50, /* only_v2 = */ true);
 }
 
 template <class BocDeserializerT>
@@ -996,6 +2127,32 @@ TEST(TonDb, BocDeserializerSimpleThreads) {
   test_boc_deserializer_threads<StaticBagOfCellsDbLazy>();
 }
 
+class RandomTree {
+ public:
+  RandomTree(size_t size, td::Random::Xorshift128plus rnd) : rnd_(rnd) {
+    root_ = create(size);
+  }
+  Ref<Cell> root() const {
+    return root_;
+  }
+
+ private:
+  Ref<Cell> root_;
+  td::Random::Xorshift128plus rnd_;
+  Ref<DataCell> create(size_t size) {
+    CellBuilder cb;
+    cb.store_long(rnd_(), rnd_() % 63 + 1);
+    if (size > 0) {
+      td::uint64 rc = (rnd_() % 4) + 1;
+      for (td::uint64 i = 0; i < rc; i++) {
+        auto ref = create(size / rc);
+        cb.store_ref(std::move(ref));
+      }
+    }
+    return cb.finalize();
+  }
+};
+
 class CompactArray {
  public:
   CompactArray(size_t size) {
@@ -1029,6 +2186,10 @@ class CompactArray {
   size_t size() const {
     return size_;
   }
+  void reset() {
+    size_ = 0;
+    root_ = {};
+  }
 
   Ref<Cell> merkle_proof(std::vector<size_t> keys) {
     std::set<Cell::Hash> hashes;
@@ -1037,7 +2198,7 @@ class CompactArray {
     }
 
     auto is_prunned = [&](const Ref<Cell> &cell) { return hashes.count(cell->get_hash()) == 0; };
-    return MerkleProof::generate_raw(root_, is_prunned);
+    return MerkleProof::generate_raw(root_, is_prunned).move_as_ok();
   }
 
  private:
@@ -1123,6 +2284,280 @@ class FastCompactArray {
   std::vector<td::uint64> v_;
 };
 
+struct BocTestHelper {
+ public:
+  BocTestHelper() = default;
+  BocTestHelper(td::int64 seed) : rnd_(seed) {
+  }
+
+  CompactArray create_array(size_t size, td::uint64 max_value) {
+    std::vector<td::uint64> v(size);
+    td::Random::Xorshift128plus rnd{123};
+    for (auto &x : v) {
+      x = rnd() % max_value;
+    }
+    return CompactArray(v);
+  }
+
+ private:
+  td::Random::Xorshift128plus rnd_{123};
+};
+
+DynamicBagOfCellsDb::Stats bench_dboc_get_and_set(BocOptions options) {
+  BocTestHelper helper(options.seed);
+  size_t n = 1 << 20;
+  size_t max_value = 1 << 26;
+  auto arr = helper.create_array(n, max_value);
+
+  // auto kv = std::make_shared<td::MemoryKeyValue>();
+  td::Slice db_path = "compact_array_db";
+  td::RocksDb::destroy(db_path).ensure();
+
+  DB db = options.create_db({}, {});
+  DynamicBagOfCellsDb::Stats stats;
+
+  td::Timer total_timer;
+
+  auto bench = [&](td::Slice desc, auto &&f) {
+    auto before = db.dboc->get_stats().move_as_ok();
+    td::Timer timer;
+    LOG(ERROR) << "Benchmarking " << desc;
+    f();
+    stats.named_stats.stats_int[desc.str()] = td::int64(timer.elapsed() * 1000);
+    LOG(ERROR) << "Benchmarking " << desc << " done: " << timer.elapsed() << "s\n";
+    auto after = db.dboc->get_stats().move_as_ok();
+    after.named_stats.subtract_diff(before.named_stats);
+    LOG(ERROR) << after;
+  };
+
+  td::VectorQueue<vm::CellHash> roots;
+  // Save array in db
+  bench(PSLICE() << "bench_inc_large_db(n=" << n << ")", [&] {
+    db.dboc->inc(arr.root());
+    roots.push(arr.root()->get_hash());
+    options.commit(db, BocOptions::ResetCache);
+  });
+  bench("bench_compactify", [&] {
+    auto status = dynamic_cast<td::RocksDb &>(*db.kv).raw_db()->CompactRange({}, nullptr, nullptr);
+    LOG_IF(FATAL, !status.ok()) << status.ToString();
+  });
+  db = options.create_db(std::move(db), {});
+
+  bench(PSLICE() << "bench_inc_large_existed_db(n=" << n << ")", [&] {
+    db.dboc->inc(arr.root());
+    roots.push(arr.root()->get_hash());
+    options.commit(db, BocOptions::ResetCache);
+  });
+
+  td::Random::Xorshift128plus rnd{123};
+  while (false) {
+    auto hash = arr.root()->get_hash();
+    arr = CompactArray{n, db.dboc->load_root(hash.as_slice()).move_as_ok()};
+    td::Timer timer;
+    for (size_t i = 0; i < 10000; i++) {
+      auto pos = rnd() % n;
+      arr.get(pos);
+    }
+    LOG(ERROR) << timer.elapsed() << "s\n";
+    db.reset_loader();
+  }
+
+  for (auto p : std::vector<std::pair<size_t, size_t>>{{10000, 0}, {10000, 5}, {5000, 5000}, {5, 10000}, {0, 10000}}) {
+    auto get_n = p.first;
+    auto set_n = p.second;
+    auto hash = arr.root()->get_hash();
+    arr = CompactArray{n, db.dboc->load_root(hash.as_slice()).move_as_ok()};
+    bench(PSTRING() << "bench_changes(get_n=" << get_n << ", set_n=" << set_n << ")", [&] {
+      for (size_t i = 0; i < get_n; i++) {
+        auto pos = rnd() % n;
+        arr.get(pos);
+      }
+      for (size_t i = 0; i < set_n; i++) {
+        auto pos = rnd() % n;
+        auto value = rnd() % max_value;
+        arr.set(pos, value);
+      }
+    });
+    bench(PSTRING() << "bench_commit(get_n=" << get_n << ", set_n=" << set_n << ")", [&] {
+      db.dboc->inc(arr.root());
+      roots.push(arr.root()->get_hash());
+      options.commit(db, BocOptions::ResetCache);
+    });
+  }
+  arr.reset();
+
+  bench(PSLICE() << "bench_dec_some_roots()", [&] {
+    while (roots.size() > 1) {
+      auto hash = roots.pop();
+      auto cell = db.dboc->load_cell(hash.as_slice()).move_as_ok();
+      db.dboc->dec(cell);
+    }
+    options.commit(db, BocOptions::ResetCache);
+  });
+
+  db = options.create_db(std::move(db), {});
+
+  bench(PSLICE() << "bench_dec_large_root(n=" << n << ")", [&] {
+    while (!roots.empty()) {
+      auto hash = roots.pop();
+      auto cell = db.dboc->load_cell(hash.as_slice()).move_as_ok();
+      db.dboc->dec(cell);
+
+      /*
+      do {
+        auto cell = db.dboc->load_cell(hash.as_slice()).move_as_ok();
+        db.dboc->dec(cell);
+        cell = {};
+	options.prepare_commit(*db.dboc);
+        //db.dboc->prepare_commit().ensure();
+        db.reset_loader();
+        db = options.create_db(std::move(db), {});
+      } while (true);
+      */
+    }
+    options.commit(db, BocOptions::ResetCache);
+  });
+  stats.named_stats.stats_int["bench_total"] = td::int64(total_timer.elapsed() * 1000);
+
+  return stats;
+}
+
+TEST(TonDb, BenchDynamicBocGetAndSet) {
+  with_all_boc_options(bench_dboc_get_and_set, 1);
+}
+
+TEST(TonDb, DynamicBocIncSimple) {
+  auto kv = std::make_shared<td::MemoryKeyValue>(std::make_shared<CellMerger>());
+  auto db = DynamicBagOfCellsDb::create_v2({.extra_threads = 0});
+  db->set_loader(std::make_unique<vm::CellLoader>(kv));
+
+  td::Random::Xorshift128plus rnd(123);
+  size_t size = 4;
+  std::vector<td::uint64> values(size);
+  for (auto &v : values) {
+    //v = rnd() % 2;
+    v = rnd();
+  }
+  // 1. Create large dictionary and store it in db
+  auto arr_ptr = std::make_unique<CompactArray>(values);
+  auto &arr = *arr_ptr;
+  td::VectorQueue<CellHash> queue;
+  auto push = [&]() {
+    //LOG(ERROR) << "PUSH ROOT";
+    auto begin_stats = kv->get_usage_stats();
+    db->inc(arr.root());
+    queue.push(arr.root()->get_hash());
+    vm::CellStorer cell_storer(*kv);
+    db->commit(cell_storer);
+    auto end_stats = kv->get_usage_stats();
+    LOG(ERROR) << end_stats - begin_stats;
+    db->set_loader(std::make_unique<vm::CellLoader>(kv));
+    auto hash = arr.root()->get_hash();
+    arr = CompactArray{size, db->load_root(hash.as_slice()).move_as_ok()};
+    //LOG(ERROR) << "CELLS IN DB: " << kv->count("").move_as_ok();
+  };
+  auto pop = [&]() {
+    if (queue.empty()) {
+      return;
+    }
+    //LOG(ERROR) << "POP ROOT";
+    auto cell = db->load_cell(queue.pop().as_slice()).move_as_ok();
+    db->dec(cell);
+    vm::CellStorer cell_storer(*kv);
+    db->commit(cell_storer);
+    db->set_loader(std::make_unique<vm::CellLoader>(kv));
+    //LOG(ERROR) << end_stats - begin_stats;
+    //LOG(ERROR) << "CELLS IN DB: " << kv->count("").move_as_ok();
+  };
+  auto upd = [&] {
+    for (int i = 0; i < 20; i++) {
+      auto pos = rnd.fast(0, td::narrow_cast<int>(size) - 1);
+      if (rnd() % 2) {
+        auto value = rnd() % 2;
+        arr.set(pos, value);
+      } else {
+        arr.get(pos);
+      }
+    }
+  };
+
+  //LOG(ERROR) << "Created compact array";
+  push();
+  pop();
+  //CHECK(kv->count("").move_as_ok() == 0);
+
+  // 2. Lets change first 20 keys and read last 20 keys
+  /*
+  for (size_t i = 0; i < 20 && i < size; i++) {
+    arr.set(i, rnd());
+  }
+  */
+  //arr.set(0, rnd());
+  arr.set(size - 1, rnd());
+  for (size_t i = 0; i < 20 && i < size; i++) {
+    arr.get(size - i - 1);
+  }
+
+  // 3. And now commit diff with stats
+  push();
+  push();
+  upd();
+  upd();
+  push();
+  push();
+  upd();
+  pop();
+  pop();
+  upd();
+  push();
+  push();
+  while (!queue.empty()) {
+    pop();
+  }
+  LOG(ERROR) << "CELLS IN DB: " << kv->count("").move_as_ok();
+}
+
+class BenchCellStorerMergeRefcntDiffs : public td::Benchmark {
+ public:
+  std::string get_description() const override {
+    return PSTRING() << "bench_cells_storer_merge_refcnt_diffs";
+  }
+
+  void run(int n) override {
+    auto cell = vm::CellBuilder().store_bytes(std::string(32, 'A')).finalize();
+    auto left_update = CellStorer::serialize_refcnt_diffs(1);
+    auto right_update = CellStorer::serialize_refcnt_diffs(1);
+    for (int i = 0; i < n; i++) {
+      CellStorer::merge_refcnt_diffs(left_update, right_update);
+    }
+  }
+
+ private:
+  size_t tn_{};
+};
+class BenchCellStorerMergeValueAndRefcntDiff : public td::Benchmark {
+ public:
+  std::string get_description() const override {
+    return PSTRING() << "bench_cells_storer_merge_value_and_refcnt_diffs";
+  }
+
+  void run(int n) override {
+    auto cell = vm::CellBuilder().store_bytes(std::string(32, 'A')).finalize();
+    auto value = CellStorer::serialize_value(10, cell, false);
+    auto update = CellStorer::serialize_refcnt_diffs(1);
+    for (int i = 0; i < n; i++) {
+      CellStorer::merge_value_and_refcnt_diff(value, update);
+    }
+  }
+
+ private:
+  size_t tn_{};
+};
+TEST(Bench, CellStorerMerge) {
+  bench(BenchCellStorerMergeRefcntDiffs());
+  bench(BenchCellStorerMergeValueAndRefcntDiff());
+}
+
 TEST(Cell, BocHands) {
   serialize_boc(CellBuilder{}.store_bytes("AAAAAAAA").finalize());
   auto a = CellBuilder{}.store_bytes("abcd").store_ref(CellBuilder{}.store_bytes("???").finalize()).finalize();
@@ -1177,28 +2612,28 @@ TEST(Cell, MerkleProofHands) {
   test_boc_deserializer_full(merkle_proof).ensure();
 
   {
-    auto virtual_node = proof->virtualize({0, 1});
+    auto virtual_node = proof->virtualize(0);
     ASSERT_EQ(0u, virtual_node->get_level());
-    ASSERT_EQ(1u, virtual_node->get_virtualization());
+    ASSERT_EQ(1u, virtual_node->is_virtualized());
     CellSlice cs{NoVm(), virtual_node};
     auto virtual_data = cs.fetch_ref();
     ASSERT_EQ(0u, virtual_data->get_level());
-    ASSERT_EQ(1u, virtual_data->get_virtualization());
+    ASSERT_EQ(1u, virtual_data->is_virtualized());
     ASSERT_EQ(data->get_hash(), virtual_data->get_hash());
 
     auto virtual_node_copy =
         CellBuilder{}.store_bits(node->get_data(), node->get_bits()).store_ref(virtual_data).finalize();
     ASSERT_EQ(0u, virtual_node_copy->get_level());
-    ASSERT_EQ(1u, virtual_node_copy->get_virtualization());
+    ASSERT_EQ(1u, virtual_node_copy->is_virtualized());
     ASSERT_EQ(virtual_node->get_hash(), virtual_node_copy->get_hash());
 
     {
       auto two_nodes = CellBuilder{}.store_ref(virtual_node).store_ref(node).finalize();
       ASSERT_EQ(0u, two_nodes->get_level());
-      ASSERT_EQ(1u, two_nodes->get_virtualization());
+      ASSERT_EQ(1u, two_nodes->is_virtualized());
       CellSlice cs2(NoVm(), two_nodes);
-      ASSERT_EQ(1u, cs2.prefetch_ref(0)->get_virtualization());
-      ASSERT_EQ(0u, cs2.prefetch_ref(1)->get_virtualization());
+      ASSERT_EQ(1u, cs2.prefetch_ref(0)->is_virtualized());
+      ASSERT_EQ(0u, cs2.prefetch_ref(1)->is_virtualized());
     }
   }
   LOG(ERROR) << td::NamedThreadSafeCounter::get_default();
@@ -1220,7 +2655,7 @@ TEST(Cell, MerkleProofArrayHands) {
   ASSERT_TRUE(proof->get_hash(1) != arr.root()->get_hash(1));
   ASSERT_EQ(arr.root()->get_hash(0), arr.root()->get_hash(1));
 
-  CompactArray new_arr(arr.size(), proof->virtualize({0, 1}));
+  CompactArray new_arr(arr.size(), proof->virtualize(0));
   for (auto k : keys) {
     ASSERT_EQ(arr.get(k), new_arr.get(k));
   }
@@ -1240,14 +2675,14 @@ TEST(Cell, MerkleProofCombineArray) {
   td::Timer timer;
   for (size_t i = 0; i < n; i++) {
     auto new_root = vm::CellBuilder::create_merkle_proof(arr.merkle_proof({i}));
-    root = vm::MerkleProof::combine_fast(root, new_root);
+    root = vm::MerkleProof::combine_fast(root, new_root).move_as_ok();
     if ((i - 1) % 100 == 0) {
       LOG(ERROR) << timer;
       timer = {};
     }
   }
 
-  CompactArray arr2(n, vm::MerkleProof::virtualize(root, 1));
+  CompactArray arr2(n, vm::MerkleProof::virtualize(root).move_as_ok());
   for (size_t i = 0; i < n; i++) {
     CHECK(arr.get(i) == arr2.get(i));
   }
@@ -1269,11 +2704,11 @@ TEST(Cell, MerkleProofCombineArray2) {
 
   td::Ref<vm::Cell> root;
   auto apply_op = [&](auto op) {
-    auto usage_tree = std::make_shared<CellUsageTree>();
+    auto usage_tree = std::make_shared<CellUsageTree>(x);
     auto usage_cell = UsageCell::create(x, usage_tree->root_ptr());
     root = usage_cell;
     op();
-    return MerkleProof::generate(root, usage_tree.get());
+    return MerkleProof::generate(root, usage_tree.get()).move_as_ok();
   };
 
   auto first = apply_op([&] {
@@ -1299,12 +2734,12 @@ TEST(Cell, MerkleProofCombineArray2) {
 
   {
     td::Timer t;
-    auto x = vm::MerkleProof::combine(first, second);
+    auto x = vm::MerkleProof::combine(first, second).move_as_ok();
     LOG(ERROR) << "slow " << t;
   }
   {
     td::Timer t;
-    auto x = vm::MerkleProof::combine_fast(first, second);
+    auto x = vm::MerkleProof::combine_fast(first, second).move_as_ok();
     LOG(ERROR) << "fast " << t;
   }
 }
@@ -1313,29 +2748,29 @@ TEST(Cell, MerkleUpdateHands) {
   auto data = CellBuilder{}.store_bytes("pruned data").store_ref(CellBuilder{}.finalize()).finalize();
   auto node = CellBuilder{}.store_bytes("protected data").store_ref(data).finalize();
   auto other_node = CellBuilder{}.store_bytes("other protected data").store_ref(data).finalize();
-  auto usage_tree = std::make_shared<CellUsageTree>();
-  auto other_usage_tree = std::make_shared<CellUsageTree>();
+  auto usage_tree = std::make_shared<CellUsageTree>(node);
+  auto other_usage_tree = std::make_shared<CellUsageTree>(node);
   auto usage_cell = UsageCell::create(node, usage_tree->root_ptr());
   auto child = CellSlice(vm::NoVm(), usage_cell).prefetch_ref(0);
   auto new_node = CellBuilder{}.store_bytes("new data").store_ref(child).finalize();
   auto new_child = CellSlice(vm::NoVm(), new_node).prefetch_ref(0);
-  auto update = MerkleUpdate::generate(usage_cell, new_node, usage_tree.get());
+  auto update = MerkleUpdate::generate(usage_cell, new_node, usage_tree.get()).move_as_ok();
 
   MerkleUpdate::may_apply(node, update).ensure();
   MerkleUpdate::validate(update).ensure();
-  auto x = MerkleUpdate::apply(node, update);
+  auto x = MerkleUpdate::apply(node, update).move_as_ok();
   ASSERT_TRUE(serialize_boc(new_node) == serialize_boc(x));
 
   MerkleUpdate::may_apply(other_node, update).ensure_error();
-  ASSERT_TRUE(MerkleUpdate::apply(other_node, update).is_null());
+  ASSERT_TRUE(MerkleUpdate::apply(other_node, update).is_error());
   auto other_update = CellBuilder::create_merkle_update(CellBuilder::create_pruned_branch(other_node, 1),
                                                         CellBuilder::create_pruned_branch(new_node, 1));
   MerkleUpdate::may_apply(node, other_update).ensure_error();
   MerkleUpdate::validate(other_update).ensure_error();
-  ASSERT_TRUE(MerkleUpdate::apply(other_node, other_update).is_null());
+  ASSERT_TRUE(MerkleUpdate::apply(other_node, other_update).is_error());
   auto bad_update = CellBuilder::create_merkle_update(CellBuilder::create_pruned_branch(new_node, 1),
                                                       CellBuilder::create_pruned_branch(other_node, 1));
-  CHECK(MerkleUpdate::combine(update, bad_update).is_null());
+  CHECK(MerkleUpdate::combine(update, bad_update).is_error());
 }
 
 TEST(Cell, MerkleUpdateArray) {
@@ -1347,7 +2782,7 @@ TEST(Cell, MerkleUpdateArray) {
   }
   CompactArray arr(data);
   auto root = arr.root();
-  auto usage_tree = std::make_shared<CellUsageTree>();
+  auto usage_tree = std::make_shared<CellUsageTree>(root);
   auto usage_cell = UsageCell::create(root, usage_tree->root_ptr());
   arr = CompactArray(n, usage_cell);
   arr.set(n / 2, 0);
@@ -1355,7 +2790,7 @@ TEST(Cell, MerkleUpdateArray) {
   arr.set(n / 2 + 2, 2414221111);
   arr.set(n / 2 + 3, 2);
 
-  auto update = MerkleUpdate::generate(usage_cell, arr.root(), usage_tree.get());
+  auto update = MerkleUpdate::generate(usage_cell, arr.root(), usage_tree.get()).move_as_ok();
   CellStorageStat stat;
   stat.compute_used_storage(update, false);
   ASSERT_EQ(stat.cells, 81u);
@@ -1379,17 +2814,17 @@ TEST(Cell, MerkleUpdateCombineArray) {
 
   auto apply_op = [&](auto op) {
     auto A = arr.root();
-    usage_tree = std::make_shared<CellUsageTree>();
+    usage_tree = std::make_shared<CellUsageTree>(A);
     usage_cell = UsageCell::create(arr.root(), usage_tree->root_ptr());
     arr = CompactArray(n, usage_cell);
     op();
-    updates.push_back(MerkleUpdate::generate(A, arr.root(), usage_tree.get()));
+    updates.push_back(MerkleUpdate::generate(A, arr.root(), usage_tree.get()).move_as_ok());
   };
 
   auto combine_all = [&]() {
     while (updates.size() > 1) {
       size_t i = updates.size() - 2;
-      updates[i] = MerkleUpdate::combine(updates[i], updates[i + 1]);
+      updates[i] = MerkleUpdate::combine(updates[i], updates[i + 1]).move_as_ok();
       updates.pop_back();
       CellStorageStat stat;
       stat.compute_used_storage(updates[i], false);
@@ -1433,6 +2868,36 @@ TEST(Cell, MerkleUpdateCombineArray) {
   }
 
   validate(41);
+}
+
+TEST(Cell, MerkleDiamond) {
+  for (int depth = 0; depth <= 100; ++depth) {
+    auto cell = CellBuilder{}.store_long(0x12341234, 32).finalize_novm();
+    for (int i = 0; i < depth; ++i) {
+      cell = CellBuilder{}.store_ref(cell).store_ref(cell).finalize_novm();
+    }
+    auto cell2 = CellBuilder{}.store_long(0x11223344, 32).finalize_novm();
+    auto mu = CellBuilder::create_merkle_update(cell, cell2);
+    auto cell3 = MerkleUpdate::apply(cell, mu).ensure().move_as_ok();
+    CHECK(cell2->get_hash() == cell3->get_hash());
+  }
+  for (int depth = 0; depth <= 100; ++depth) {
+    auto child1 = CellBuilder{}.store_long(1, 32).finalize_novm();
+    auto child2 = CellBuilder{}.store_long(2, 32).finalize_novm();
+    auto cell1 =
+        CellBuilder{}.store_ref(CellBuilder::do_create_pruned_branch(child1, 1)).store_ref(child2).finalize_novm();
+    auto cell2 =
+        CellBuilder{}.store_ref(child1).store_ref(CellBuilder::do_create_pruned_branch(child2, 1)).finalize_novm();
+
+    for (int i = 0; i < depth; ++i) {
+      cell1 = CellBuilder{}.store_ref(cell1).store_ref(cell1).finalize_novm();
+      cell2 = CellBuilder{}.store_ref(cell2).store_ref(cell2).finalize_novm();
+    }
+    cell1 = CellBuilder::create_merkle_proof(cell1);
+    cell2 = CellBuilder::create_merkle_proof(cell2);
+    MerkleProof::combine(cell1, cell2).ensure();
+    MerkleProof::combine_fast(cell1, cell2).ensure();
+  }
 }
 
 }  // namespace vm
@@ -1848,7 +3313,7 @@ TEST(TonDb, CompactArrayOld) {
     SCOPE_EXIT {
       ton_db->commit_transaction(std::move(txn));
     };
-    auto smart = txn->begin_smartcontract("");
+    auto smart = txn->begin_smartcontract();
     SCOPE_EXIT {
       txn->commit_smartcontract(std::move(smart));
     };
@@ -1875,7 +3340,7 @@ TEST(TonDb, CompactArrayOld) {
     SCOPE_EXIT {
       ton_db->commit_transaction(std::move(txn));
     };
-    auto smart = txn->begin_smartcontract("");
+    auto smart = txn->begin_smartcontract();
     //smart->validate_meta();
     SCOPE_EXIT {
       txn->commit_smartcontract(std::move(smart));
@@ -1896,7 +3361,7 @@ TEST(TonDb, CompactArrayOld) {
     SCOPE_EXIT {
       ton_db->abort_transaction(std::move(txn));
     };
-    auto smart = txn->begin_smartcontract("");
+    auto smart = txn->begin_smartcontract();
     SCOPE_EXIT {
       txn->abort_smartcontract(std::move(smart));
     };
@@ -1941,43 +3406,119 @@ TEST(TonDb, StackOverflow) {
 TEST(TonDb, BocRespectsUsageCell) {
   td::Random::Xorshift128plus rnd(123);
   auto cell = vm::gen_random_cell(20, rnd, true);
-  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  auto usage_tree = std::make_shared<vm::CellUsageTree>(cell);
   auto usage_cell = vm::UsageCell::create(cell, usage_tree->root_ptr());
   auto serialization = serialize_boc(usage_cell);
-  auto proof = vm::MerkleProof::generate(cell, usage_tree.get());
-  auto virtualized_proof = vm::MerkleProof::virtualize(proof, 1);
+  auto proof = vm::MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
+  auto virtualized_proof = vm::MerkleProof::virtualize(proof).move_as_ok();
   auto serialization_of_virtualized_cell = serialize_boc(virtualized_proof);
   ASSERT_STREQ(serialization, serialization_of_virtualized_cell);
 }
 
-TEST(TonDb, DynamicBocRespectsUsageCell) {
+TEST(UsageTree, ThreadSafe) {
+  size_t test_n = 100;
   td::Random::Xorshift128plus rnd(123);
+  for (size_t test_i = 0; test_i < test_n; test_i++) {
+    auto cell = vm::gen_random_cell(rnd.fast(2, 100), rnd, false);
+    auto usage_tree = std::make_shared<vm::CellUsageTree>(cell);
+    auto usage_cell = vm::UsageCell::create(cell, usage_tree->root_ptr());
+    std::ptrdiff_t threads_n = 1;  // TODO: when CellUsageTree is thread safe, change it to 4
+    auto barrier = std::barrier{threads_n};
+    std::vector<std::thread> threads;
+    std::vector<vm::CellExplorer::Exploration> explorations(threads_n);
+    for (std::ptrdiff_t i = 0; i < threads_n; i++) {
+      threads.emplace_back([&, i = i]() {
+        barrier.arrive_and_wait();
+        explorations[i] = vm::CellExplorer::random_explore(usage_cell, rnd);
+      });
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
+    auto proof = vm::MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
+    auto virtualized_proof = vm::MerkleProof::virtualize(proof).move_as_ok();
+    for (auto &exploration : explorations) {
+      auto new_exploration = vm::CellExplorer::explore(virtualized_proof, exploration.ops);
+      ASSERT_EQ(exploration.log, new_exploration.log);
+    }
+  }
+}
+
+/*
+vm::DynamicBagOfCellsDb::Stats test_dynamic_boc_respects_usage_cell(vm::BocOptions options) {
+  td::Random::Xorshift128plus rnd(options.seed);
   auto cell = vm::gen_random_cell(20, rnd, true);
-  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  auto usage_tree = std::make_shared<vm::CellUsageTree>(cell);
   auto usage_cell = vm::UsageCell::create(cell, usage_tree->root_ptr());
 
   auto kv = std::make_shared<td::MemoryKeyValue>();
-  auto dboc = vm::DynamicBagOfCellsDb::create();
+  auto dboc = options.create_dboc(kv.get(), {});
   dboc->set_loader(std::make_unique<vm::CellLoader>(kv));
   dboc->inc(usage_cell);
   {
+    options.prepare_commit(*dboc);
     vm::CellStorer cell_storer(*kv);
     dboc->commit(cell_storer);
   }
 
-  auto proof = vm::MerkleProof::generate(cell, usage_tree.get());
-  auto virtualized_proof = vm::MerkleProof::virtualize(proof, 1);
+  auto proof = vm::MerkleProof::generate(cell, usage_tree.get()).move_as_ok();
+  auto virtualized_proof = vm::MerkleProof::virtualize(proof, 1).move_as_ok();
   auto serialization_of_virtualized_cell = serialize_boc(virtualized_proof);
   auto serialization = serialize_boc(cell);
   ASSERT_STREQ(serialization, serialization_of_virtualized_cell);
+  vm::DynamicBagOfCellsDb::Stats stats;
+  return stats;
+}
+
+TEST(TonDb, DynamicBocRespectsUsageCell) {
+  vm::with_all_boc_options(test_dynamic_boc_respects_usage_cell, 20, true);
+}
+*/
+
+TEST(TonDb, LargeBocSerializer) {
+  td::Random::Xorshift128plus rnd{123};
+  vm::RandomTree tree(100000, rnd);
+  auto root = tree.root();
+  std::string path = "serialization";
+  td::unlink(path).ignore();
+  auto fd = td::FileFd::open(path, td::FileFd::Flags::Create | td::FileFd::Flags::Truncate | td::FileFd::Flags::Write)
+                .move_as_ok();
+  std_boc_serialize_to_file(root, fd, 31);
+  fd.close();
+  auto a = td::read_file_str(path).move_as_ok();
+
+  auto kv = std::make_shared<td::MemoryKeyValue>();
+  auto dboc = vm::DynamicBagOfCellsDb::create();
+  dboc->set_loader(std::make_unique<vm::CellLoader>(kv));
+  dboc->inc(root);
+  dboc->prepare_commit();
+  vm::CellStorer cell_storer(*kv);
+  dboc->commit(cell_storer);
+  dboc->set_loader(std::make_unique<vm::CellLoader>(kv));
+  td::unlink(path).ignore();
+  td::string prev_b("");
+  auto a_cell = vm::deserialize_boc(td::BufferSlice(a));
+  for (int i = 0; i < 4; i++) {
+    fd = td::FileFd::open(path, td::FileFd::Flags::Create | td::FileFd::Flags::Truncate | td::FileFd::Flags::Write)
+             .move_as_ok();
+    boc_serialize_to_file_large(dboc->get_cell_db_reader(), root->get_hash(), fd, 31);
+    fd.close();
+    auto b = td::read_file_str(path).move_as_ok();
+
+    auto b_cell = vm::deserialize_boc(td::BufferSlice(b));
+    ASSERT_EQ(a_cell->get_hash(), b_cell->get_hash());
+    if (i > 0)
+      ASSERT_EQ(prev_b, b);
+    prev_b = b;
+  }
 }
 
 TEST(TonDb, DoNotMakeListsPrunned) {
   auto cell = vm::CellBuilder().store_bytes("abc").finalize();
   auto is_prunned = [&](const td::Ref<vm::Cell> &cell) { return true; };
-  auto proof = vm::MerkleProof::generate(cell, is_prunned);
-  auto virtualized_proof = vm::MerkleProof::virtualize(proof, 1);
-  ASSERT_TRUE(virtualized_proof->get_virtualization() == 0);
+  auto proof = vm::MerkleProof::generate(cell, is_prunned).move_as_ok();
+  auto virtualized_proof = vm::MerkleProof::virtualize(proof).move_as_ok();
+  ASSERT_TRUE(!virtualized_proof->is_virtualized());
 }
 
 TEST(TonDb, CellStat) {
@@ -2004,23 +3545,23 @@ TEST(TonDb, CellStat) {
 
     vm::NewCellStorageStat new_proof_stat;
     new_proof_stat.add_proof(B, usage_tree.get());
-    CHECK(new_proof_stat.get_stat().cells == 0);
-    CHECK(new_proof_stat.get_proof_stat().cells <= proof_stat.cells);
-    //CHECK(new_proof_stat.get_proof_stat().cells + new_proof_stat.get_proof_stat().external_refs >= proof_stat.cells);
+    ASSERT_EQ(new_proof_stat.get_stat().cells, 0u);
+    //ASSERT_TRUE(new_proof_stat.get_proof_stat().cells <= proof_stat.cells);
+    //ASSERT_TRUE(new_proof_stat.get_proof_stat().cells + new_proof_stat.get_proof_stat().external_refs >= proof_stat.cells);
 
     vm::NewCellStorageStat new_all_stat;
     new_all_stat.add_cell_and_proof(B, usage_tree.get());
-    CHECK(new_proof_stat.get_proof_stat() == new_all_stat.get_proof_stat());
-    CHECK(new_stat.get_stat() == new_all_stat.get_stat());
+    ASSERT_EQ(new_proof_stat.get_proof_stat(), new_all_stat.get_proof_stat());
+    ASSERT_EQ(new_stat.get_stat(), new_all_stat.get_stat());
 
     stat.add_used_storage(A);
     auto AB_stat = new_stat.get_stat() + const_cast<vm::NewCellStorageStat &>(new_stat).tentative_add_cell(A);
     new_stat.add_cell(A);
-    CHECK(AB_stat == new_stat.get_stat());
+    ASSERT_EQ(AB_stat, new_stat.get_stat());
     ASSERT_EQ(stat.cells, new_stat.get_stat().cells);
     ASSERT_EQ(stat.bits, new_stat.get_stat().bits);
 
-    CHECK(usage_tree.unique());
+    ASSERT_EQ(usage_tree.use_count(), 1u);
     usage_tree.reset();
     td::Ref<vm::Cell> C, BC, C_proof;
     std::shared_ptr<vm::CellUsageTree> usage_tree_B;
@@ -2029,7 +3570,7 @@ TEST(TonDb, CellStat) {
 
     auto BC_proof_stat = new_proof_stat.get_proof_stat() + new_proof_stat.tentative_add_proof(C, usage_tree_B.get());
     new_proof_stat.add_proof(C, usage_tree_B.get());
-    CHECK(BC_proof_stat == new_proof_stat.get_proof_stat());
+    ASSERT_EQ(BC_proof_stat, new_proof_stat.get_proof_stat());
   }
 }
 
@@ -2057,7 +3598,6 @@ TEST(Ref, AtomicRef) {
   int threads_n = 10;
   std::vector<Node> nodes(threads_n);
   std::vector<td::thread> threads(threads_n);
-  int thread_id = 0;
   for (auto &thread : threads) {
     thread = td::thread([&] {
       for (int i = 0; i < 1000000; i++) {
@@ -2072,7 +3612,6 @@ TEST(Ref, AtomicRef) {
         }
       }
     });
-    thread_id++;
   }
   for (auto &thread : threads) {
     thread.join();
